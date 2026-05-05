@@ -1,0 +1,1 @@
+"""mYrA API application."""
