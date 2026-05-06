@@ -6,6 +6,8 @@
     "dev": "next dev",
     "build": "next build --webpack",
     "start": "next start",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
@@ -26,6 +28,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.3.5",
     "jsdom": "^25.0.1",
+    "prettier": "^3.9.9",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^2.1.9"

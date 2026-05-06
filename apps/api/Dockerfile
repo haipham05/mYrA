@@ -2,8 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir fastapi "uvicorn[standard]"
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY app ./app
 

@@ -1,7 +1,17 @@
-AGENTS.md
-DEVELOPMENT_MILESTONES.md
-SYSTEM_DESIGN.md
 .env
+.env.*
+!.env.example
+
+# Local AI assistant instructions, at any directory depth or letter case
+[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
+[Cc][Ll][Aa][Uu][Dd][Ee][Ss].[Mm][Dd]
+
+# Local design, milestone, and planning documents (any directory or letter case)
+*[Ss][Yy][Ss][Tt][Ee][Mm]*[Dd][Ee][Ss][Ii][Gg][Nn]*.[Mm][Dd]
+*[Dd][Ee][Ss][Ii][Gg][Nn]*[Ss][Yy][Ss][Tt][Ee][Mm]*.[Mm][Dd]
+*[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*.[Mm][Dd]
+*[Pp][Ll][Aa][Nn].[Mm][Dd]
 
 # Python / FastAPI
 __pycache__/
