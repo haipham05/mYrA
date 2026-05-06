@@ -12,10 +12,15 @@
 *[Dd][Ee][Ss][Ii][Gg][Nn]*[Ss][Yy][Ss][Tt][Ee][Mm]*.[Mm][Dd]
 *[Mm][Ii][Ll][Ee][Ss][Tt][Oo][Nn][Ee]*.[Mm][Dd]
 *[Pp][Ll][Aa][Nn].[Mm][Dd]
+DEVELOPMENT_STATUS.md
 
 # Python / FastAPI
 __pycache__/
 *.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+data/
 .ruff_cache/
 .pytest_cache/
 .coverage*

@@ -4,7 +4,14 @@ version = "0.1.0"
 description = "FastAPI service for mYrA"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.13,<2.0",
     "fastapi>=0.115,<1.0",
+    "google-cloud-storage>=2.14,<3.0",
+    "httpx>=0.27",
+    "psycopg2-binary>=2.9.9",
+    "pypdf>=4.0,<6.0",
+    "python-multipart>=0.0.9",
+    "sqlalchemy>=2.0,<3.0",
     "uvicorn[standard]>=0.30,<1.0",
 ]
 
@@ -25,6 +32,7 @@ addopts = "--cov=app --cov-report=term-missing"
 target-version = "py312"
 line-length = 100
 src = ["app", "tests"]
+extend-exclude = ["alembic"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

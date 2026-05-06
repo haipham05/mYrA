@@ -1,0 +1,88 @@
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from app.db.models import Paper, PaperElement, PaperPage
+
+
+def create_paper(
+    db: Session,
+    project_id: UUID,
+    filename: str,
+    storage_path: str,
+    document_sha256: str | None = None,
+    status: str = "PROCESSING",
+) -> Paper:
+    paper = Paper(
+        project_id=project_id,
+        filename=filename,
+        storage_path=storage_path,
+        document_sha256=document_sha256,
+        status=status,
+    )
+    db.add(paper)
+    db.commit()
+    db.refresh(paper)
+    return paper
+
+
+def get_paper(db: Session, paper_id: UUID | str) -> Paper | None:
+    if isinstance(paper_id, str):
+        paper_id = UUID(paper_id)
+    return db.query(Paper).filter(Paper.id == paper_id).first()
+
+
+def list_papers_by_project(
+    db: Session,
+    project_id: UUID,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[Paper], int]:
+    query = db.query(Paper).filter(Paper.project_id == project_id).order_by(Paper.created_at.desc())
+    total = query.count()
+    items = query.offset(offset).limit(limit).all()
+    return items, total
+
+
+def update_paper_status(
+    db: Session,
+    paper_id: UUID | str,
+    status: str,
+    page_count: int | None = None,
+    error_message: str | None = None,
+) -> Paper | None:
+    if isinstance(paper_id, str):
+        paper_id = UUID(paper_id)
+    paper = get_paper(db, paper_id)
+    if not paper:
+        return None
+    paper.status = status
+    if page_count is not None:
+        paper.page_count = page_count
+    if error_message is not None:
+        paper.error_message = error_message
+    db.commit()
+    db.refresh(paper)
+    return paper
+
+
+def get_paper_elements(db: Session, paper_id: UUID | str) -> list[PaperElement]:
+    if isinstance(paper_id, str):
+        paper_id = UUID(paper_id)
+    return (
+        db.query(PaperElement)
+        .filter(PaperElement.paper_id == paper_id)
+        .order_by(PaperElement.page_number.asc(), PaperElement.element_index.asc())
+        .all()
+    )
+
+
+def get_paper_pages(db: Session, paper_id: UUID | str) -> list[PaperPage]:
+    if isinstance(paper_id, str):
+        paper_id = UUID(paper_id)
+    return (
+        db.query(PaperPage)
+        .filter(PaperPage.paper_id == paper_id)
+        .order_by(PaperPage.page_number.asc())
+        .all()
+    )
