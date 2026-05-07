@@ -133,8 +133,8 @@ class IngestionPipeline:
                     token_count=c_spec.token_count,
                     embedding=emb,
                     embedding_vec=emb,
-                    embedding_model="bge-m3",
-                    embedding_version="v1",
+                    embedding_model=embed_provider.model_name,
+                    embedding_version=embed_provider.model_version,
                 )
                 db.add(db_chunk)
                 db.flush()
@@ -163,12 +163,20 @@ class IngestionPipeline:
         except Exception as err:
             db.rollback()
             err_msg = str(err)
-            update_paper_status(db, paper_id, status=PaperStatus.FAILED, error_message=err_msg)
-            update_job_progress(
-                db,
-                job_id,
-                stage=JobStage.FAILED,
-                progress=1.0,
-                status=JobStatus.FAILED,
-                error_message=err_msg,
-            )
+            current_job = get_job(db, job_id)
+            if current_job and current_job.retry_count < current_job.max_retries:
+                current_job.retry_count += 1
+                current_job.status = JobStatus.PENDING
+                current_job.stage = JobStage.QUEUED
+                current_job.error_message = f"Transient failure, retry queued: {err_msg}"
+                db.commit()
+            else:
+                update_paper_status(db, paper_id, status=PaperStatus.FAILED, error_message=err_msg)
+                update_job_progress(
+                    db,
+                    job_id,
+                    stage=JobStage.FAILED,
+                    progress=1.0,
+                    status=JobStatus.FAILED,
+                    error_message=err_msg,
+                )

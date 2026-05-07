@@ -44,8 +44,12 @@ class DocumentChunker:
 
         for elem in elements:
             elem_tokens = estimate_tokens(elem.text)
+            page_changed = (
+                current_child_elements
+                and elem.page_number != current_child_elements[-1].page_number
+            )
             exceeds_tokens = current_child_tokens + elem_tokens > self.child_max_tokens
-            if exceeds_tokens and current_child_elements:
+            if (exceeds_tokens or page_changed) and current_child_elements:
                 # Flush child chunk
                 child_text = "\n\n".join(e.text for e in current_child_elements)
                 child = ChunkSpec(

@@ -84,3 +84,15 @@ def update_job_progress(
     db.commit()
     db.refresh(job)
     return job
+
+
+def renew_job_lease(db: Session, job_id: UUID | str) -> bool:
+    """Heartbeat to renew claimed_at timestamp on an actively processing job."""
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    job = db.query(Job).filter(Job.id == job_id, Job.status == "PROCESSING").first()
+    if job:
+        job.claimed_at = datetime.now(tz=UTC)
+        db.commit()
+        return True
+    return False

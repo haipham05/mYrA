@@ -199,6 +199,16 @@ export default function Home() {
     }
   };
 
+  // Handle project selection with immediate state clearing
+  const handleSelectProject = (project: Project | null) => {
+    setSelectedProject(project);
+    setSelectedPaper(null);
+    setActiveCitation(null);
+    setPapers([]);
+    setConversation(null);
+    setMessages([]);
+  };
+
   const hasReadyPaper = papers.some((p) => p.status === "READY");
 
   return (
@@ -219,7 +229,7 @@ export default function Home() {
             <ProjectSelector
               projects={projects}
               selectedProject={selectedProject}
-              onSelectProject={setSelectedProject}
+              onSelectProject={handleSelectProject}
               onCreateProject={handleCreateProject}
             />
 

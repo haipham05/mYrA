@@ -8,8 +8,7 @@ from pypdf import PdfReader
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.crud.job import create_job
-from app.crud.paper import create_paper, list_papers_by_project
+from app.crud.paper import create_paper_with_job, list_papers_by_project
 from app.crud.project import create_project, get_project, list_projects
 from app.db.models import Paper
 from app.db.session import get_db
@@ -150,9 +149,9 @@ async def upload_paper(
             detail="Failed to store PDF document",
         ) from err
 
-    # 5. Create paper & job transactionally; compensate storage on DB failure
+    # 5. Create paper & job transactionally in a single DB commit; compensate storage on DB failure
     try:
-        paper = create_paper(
+        paper, job = create_paper_with_job(
             db,
             project_id=project_id,
             filename=filename,
@@ -160,7 +159,6 @@ async def upload_paper(
             document_sha256=document_sha256,
             status=PaperStatus.PROCESSING,
         )
-        job = create_job(db, paper_id=paper.id)
     except Exception as err:
         db.rollback()
         try:

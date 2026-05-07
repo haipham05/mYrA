@@ -93,6 +93,7 @@ class EvidenceItem(BaseModel):
     paper_title: str | None = None
     chunk_id: UUID
     quote: str
+    parent_context: str | None = None
     page_number: int
     bounding_boxes: list[BoundingBox] = Field(default_factory=list)
     source_element_ids: list[UUID] = Field(default_factory=list)
@@ -119,9 +120,7 @@ class Citation(BaseModel):
         if isinstance(data, dict):
             # Backward-compatibility: if anchor_status not explicitly provided
             if "anchor_status" not in data:
-                if data.get("anchors"):
-                    data["anchor_status"] = AnchorStatus.VERIFIED
-                elif data.get("bounding_boxes"):
+                if data.get("bounding_boxes") and not data.get("anchors"):
                     data["anchor_status"] = AnchorStatus.LEGACY
                 else:
                     data["anchor_status"] = AnchorStatus.UNRESOLVED

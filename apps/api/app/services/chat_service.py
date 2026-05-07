@@ -65,6 +65,9 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
         "your",
         "based",
         "according",
+        "also",
+        "furthermore",
+        "however",
     }
     claim_words = {
         w for w in re.findall(r"\w+", claim_text.lower()) if len(w) > 2 and w not in stop_words
@@ -74,11 +77,12 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
     }
 
     if not claim_words or not quote_words:
-        return True  # Bounded fallback if no distinctive words
+        return False
 
     overlap = claim_words.intersection(quote_words)
-    # Require at least one non-trivial keyword overlap
-    return len(overlap) > 0
+    overlap_ratio = len(overlap) / len(claim_words)
+    # Require at least two distinct content keywords OR >= 25% overlap
+    return len(overlap) >= 2 or overlap_ratio >= 0.25
 
 
 class ChatService:
@@ -131,8 +135,12 @@ class ChatService:
         evidence_text_parts = []
         for e in evidence_items:
             title = e.paper_title or "Paper"
+            # Pass parent context to LLM for comprehension while atomic quote stays child
+            context = e.parent_context if e.parent_context else e.quote
             evidence_text_parts.append(
-                f'[{e.id}] (From: {title}, Page {e.page_number}):\n"{e.quote}"'
+                f"[{e.id}] (From: {title}, Page {e.page_number}):\n"
+                f'Evidence quote: "{e.quote}"\n'
+                f'Context: "{context}"'
             )
 
         evidence_block = (
@@ -146,63 +154,88 @@ class ChatService:
         llm = get_llm_provider()
         raw_answer = await llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
 
-        # 5. Citation validation and claim support checking
-        # Match pattern [E1], [E2], etc.
-        citation_matches = list(re.finditer(r"\[E(\d+)\]", raw_answer))
+        # 5. Sentence-level citation validation and claim support checking
+        raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_answer) if s.strip()]
 
         validated_citations: list[Citation] = []
         citation_to_display_index: dict[str, int] = {}
         display_idx = 1
+        retained_sentences: list[str] = []
 
-        for match in citation_matches:
-            e_id = f"E{match.group(1)}"
-            if e_id in evidence_map and e_id not in citation_to_display_index:
+        for sentence in raw_sentences:
+            cite_matches = list(re.finditer(r"\[E(\d+)\]", sentence))
+            if not cite_matches:
+                if not evidence_items:
+                    retained_sentences.append(sentence)
+                continue
+
+            # Verify all citation IDs exist in evidence
+            all_valid_ids = True
+            for m in cite_matches:
+                e_id = f"E{m.group(1)}"
+                if e_id not in evidence_map:
+                    all_valid_ids = False
+                    break
+
+            if not all_valid_ids:
+                # Hallucinated unknown citation: discard entire sentence
+                continue
+
+            # Verify claim support against cited evidence
+            sentence_supported = True
+            for m in cite_matches:
+                e_id = f"E{m.group(1)}"
                 evidence = evidence_map[e_id]
+                clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
+                if not check_claim_support(clean_claim, evidence.quote):
+                    sentence_supported = False
+                    break
 
-                # Extract surrounding sentence as the claim
-                match_start = match.start()
-                sentence_start = max(0, raw_answer.rfind(".", 0, match_start) + 1)
-                sentence_end = raw_answer.find(".", match.end())
-                if sentence_end == -1:
-                    sentence_end = len(raw_answer)
-                claim_text = raw_answer[sentence_start:sentence_end].strip()
+            if not sentence_supported:
+                # Unsupported claim: discard entire sentence
+                continue
 
-                is_supported = check_claim_support(claim_text, evidence.quote)
-
-                # Status reflects whether claim is supported and anchor has bounding boxes
-                if not is_supported:
-                    status = AnchorStatus.UNRESOLVED
-                elif evidence.bounding_boxes or evidence.anchors:
-                    status = AnchorStatus.VERIFIED
-                else:
-                    status = AnchorStatus.UNRESOLVED
-
-                citation_to_display_index[e_id] = display_idx
-                validated_citations.append(
-                    Citation(
-                        citation_index=display_idx,
-                        evidence_id=e_id,
-                        paper_id=evidence.paper_id,
-                        page_number=evidence.page_number,
-                        bounding_boxes=evidence.bounding_boxes,
-                        quote=evidence.quote,
-                        document_sha256=evidence.document_sha256,
-                        parser_version=evidence.parser_version,
-                        anchor_status=status,
-                        anchors=evidence.anchors,
+            # Register verified citations for supported sentence
+            for m in cite_matches:
+                e_id = f"E{m.group(1)}"
+                if e_id not in citation_to_display_index:
+                    evidence = evidence_map[e_id]
+                    citation_to_display_index[e_id] = display_idx
+                    anchor_status = (
+                        AnchorStatus.VERIFIED
+                        if evidence.anchors
+                        and any(a.anchor_status == AnchorStatus.VERIFIED for a in evidence.anchors)
+                        else AnchorStatus.UNRESOLVED
                     )
-                )
-                display_idx += 1
+                    validated_citations.append(
+                        Citation(
+                            citation_index=display_idx,
+                            evidence_id=e_id,
+                            paper_id=evidence.paper_id,
+                            page_number=evidence.page_number,
+                            bounding_boxes=evidence.bounding_boxes,
+                            quote=evidence.quote,
+                            document_sha256=evidence.document_sha256,
+                            parser_version=evidence.parser_version,
+                            anchor_status=anchor_status,
+                            anchors=evidence.anchors,
+                        )
+                    )
+                    display_idx += 1
 
-        # Replace [E1] with [1], and strip invalid hallucinated citations [EX]
-        def replace_citation(m: re.Match) -> str:
-            e_id = f"E{m.group(1)}"
-            if e_id in citation_to_display_index:
-                return f"[{citation_to_display_index[e_id]}]"
-            # Unsupported / hallucinated citation removed
-            return ""
+            def replace_cite(m: re.Match) -> str:
+                eid = f"E{m.group(1)}"
+                return f"[{citation_to_display_index[eid]}]"
 
-        formatted_answer = re.sub(r"\[E(\d+)\]", replace_citation, raw_answer).strip()
+            retained_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
+
+        if retained_sentences and validated_citations:
+            formatted_answer = " ".join(retained_sentences)
+        else:
+            formatted_answer = (
+                "Insufficient evidence available in the uploaded papers to answer this question."
+            )
+            validated_citations = []
 
         latency_ms = (time.perf_counter() - start_time) * 1000
         logger.info(

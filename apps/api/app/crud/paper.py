@@ -2,7 +2,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Paper, PaperElement, PaperPage
+from app.db.models import Job, Paper, PaperElement, PaperPage
 
 
 def create_paper(
@@ -24,6 +24,37 @@ def create_paper(
     db.commit()
     db.refresh(paper)
     return paper
+
+
+def create_paper_with_job(
+    db: Session,
+    project_id: UUID,
+    filename: str,
+    storage_path: str,
+    document_sha256: str | None = None,
+    status: str = "PROCESSING",
+) -> tuple[Paper, Job]:
+    """Atomically create paper and job within a single database transaction."""
+    paper = Paper(
+        project_id=project_id,
+        filename=filename,
+        storage_path=storage_path,
+        document_sha256=document_sha256,
+        status=status,
+    )
+    db.add(paper)
+    db.flush()
+    job = Job(
+        paper_id=paper.id,
+        status="PENDING",
+        stage="QUEUED",
+        progress=0.0,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(paper)
+    db.refresh(job)
+    return paper, job
 
 
 def get_paper(db: Session, paper_id: UUID | str) -> Paper | None:

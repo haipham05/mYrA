@@ -1,0 +1,116 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R 11 0 R 13 0 R] /Count 6 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 15 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 275 >>
+stream
+BT
+/F1 12 Tf
+72 700 Td
+(We introduce a new language representation model called BERT, which stands for Bidirectional Encoder Representations from Transformers. Unlike recent models, BERT is designed to pre-train deep bidirectional representations from unlabeled text.) Tj
+ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 15 0 R >> >> >>
+endobj
+6 0 obj
+<< /Length 211 >>
+stream
+BT
+/F1 12 Tf
+72 700 Td
+(The Masked Language Model \(MLM\): In order to train a deep bidirectional representation, we randomly mask 15% of the input tokens at random, and then predict those masked tokens.) Tj
+ET
+
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources << /Font << /F1 15 0 R >> >> >>
+endobj
+8 0 obj
+<< /Length 282 >>
+stream
+BT
+/F1 12 Tf
+72 700 Td
+(Next Sentence Prediction \(NSP\): Many important downstream tasks such as Question Answering and Natural Language Inference are based on understanding the relationship between two sentences. We pre-train for a binarized next sentence prediction task.) Tj
+ET
+
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R /Resources << /Font << /F1 15 0 R >> >> >>
+endobj
+10 0 obj
+<< /Length 177 >>
+stream
+BT
+/F1 12 Tf
+72 700 Td
+(BERT architecture is a multi-layer bidirectional Transformer encoder based on the original Transformer implementation described in Vaswani et al.) Tj
+ET
+
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 12 0 R /Resources << /Font << /F1 15 0 R >> >> >>
+endobj
+12 0 obj
+<< /Length 195 >>
+stream
+BT
+/F1 12 Tf
+72 700 Td
+(On the GLUE benchmark, BERT achieves an overall score of 80.5%, obtaining substantial improvements across all nine individual tasks including MNLI, QQP, and SST-2.) Tj
+ET
+
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 14 0 R /Resources << /Font << /F1 15 0 R >> >> >>
+endobj
+14 0 obj
+<< /Length 155 >>
+stream
+BT
+/F1 12 Tf
+72 700 Td
+(Fine-tuning BERT on SQuAD v1.1 question answering achieves 93.2 F1 score, outperforming human performance on the benchmark.) Tj
+ET
+
+endstream
+endobj
+15 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000147 00000 n 
+0000000274 00000 n 
+0000000600 00000 n 
+0000000727 00000 n 
+0000000989 00000 n 
+0000001116 00000 n 
+0000001449 00000 n 
+0000001577 00000 n 
+0000001806 00000 n 
+0000001935 00000 n 
+0000002182 00000 n 
+0000002311 00000 n 
+0000002518 00000 n 
+trailer << /Size 16 /Root 1 0 R >>
+startxref
+2589
+%%EOF

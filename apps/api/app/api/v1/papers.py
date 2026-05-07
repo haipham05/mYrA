@@ -1,4 +1,4 @@
-import io
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,6 +11,7 @@ from app.schemas.evidence import BoundingBox, CoordinateOrigin, SourceElement
 from app.schemas.paper import PaperResponse
 from app.storage.factory import get_storage
 
+logger = logging.getLogger("myra.api.papers")
 router = APIRouter(prefix="/papers", tags=["papers"])
 
 
@@ -52,25 +53,32 @@ async def get_paper_document(
     try:
         data = await storage.get(key)
     except FileNotFoundError:
-        # Also try direct storage_path as key
         try:
             data = await storage.get(paper.storage_path)
         except Exception as err:
+            logger.warning("Paper file not found in storage", exc_info=err)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Document file not found in storage: {err}",
+                detail="Document file not found in storage",
             ) from err
     except Exception as err:
+        logger.error("Failed to retrieve paper document", exc_info=err)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve document: {err}",
+            detail="Failed to retrieve document",
         ) from err
 
     headers = {
         "Content-Disposition": f'inline; filename="{paper.filename}"',
         "Content-Type": "application/pdf",
     }
-    return StreamingResponse(io.BytesIO(data), media_type="application/pdf", headers=headers)
+
+    async def iterfile():
+        chunk_size = 64 * 1024  # 64KB chunks
+        for i in range(0, len(data), chunk_size):
+            yield data[i : i + chunk_size]
+
+    return StreamingResponse(iterfile(), media_type="application/pdf", headers=headers)
 
 
 @router.get("/{paper_id}/elements", response_model=list[SourceElement])

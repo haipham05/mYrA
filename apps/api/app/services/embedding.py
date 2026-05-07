@@ -4,6 +4,16 @@ from abc import ABC, abstractmethod
 
 
 class EmbeddingProvider(ABC):
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        pass
+
+    @property
+    @abstractmethod
+    def model_version(self) -> str:
+        pass
+
     @abstractmethod
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         pass
@@ -18,6 +28,14 @@ class DeterministicEmbeddingProvider(EmbeddingProvider):
 
     def __init__(self, dimension: int = 1024) -> None:
         self.dimension = dimension
+
+    @property
+    def model_name(self) -> str:
+        return "deterministic-fake"
+
+    @property
+    def model_version(self) -> str:
+        return "v1"
 
     def _hash_to_vector(self, text: str) -> list[float]:
         if not text:
@@ -47,9 +65,18 @@ class DeterministicEmbeddingProvider(EmbeddingProvider):
 class BGEM3EmbeddingProvider(EmbeddingProvider):
     """BGE-M3 local embedding provider."""
 
-    def __init__(self, model_name: str = "BAAI/bge-m3") -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str = "BAAI/bge-m3", model_version: str = "v1") -> None:
+        self._model_name = model_name
+        self._model_version = model_version
         self._model = None
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def model_version(self) -> str:
+        return self._model_version
 
     def _load_model(self):
         if self._model is None:
@@ -58,7 +85,10 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
 
                 self._model = SentenceTransformer(self.model_name)
             except Exception as err:
-                raise RuntimeError(f"Could not load BGE-M3 model {self.model_name}: {err}") from err
+                raise RuntimeError(
+                    f"Production embedding provider {self.model_name} requested "
+                    f"but could not be loaded: {err}"
+                ) from err
         return self._model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -78,7 +108,13 @@ _default_embedding_provider: EmbeddingProvider | None = None
 def get_embedding_provider() -> EmbeddingProvider:
     global _default_embedding_provider
     if _default_embedding_provider is None:
-        _default_embedding_provider = DeterministicEmbeddingProvider()
+        import os
+
+        provider_type = os.getenv("MYRA_EMBEDDING_PROVIDER", "deterministic").lower()
+        if provider_type in ("bge-m3", "bge", "production"):
+            _default_embedding_provider = BGEM3EmbeddingProvider()
+        else:
+            _default_embedding_provider = DeterministicEmbeddingProvider()
     return _default_embedding_provider
 
 

@@ -6,7 +6,7 @@ import signal
 from uuid import uuid4
 
 from app.config import Settings
-from app.crud.job import claim_next_job
+from app.crud.job import claim_next_job, renew_job_lease
 from app.db.session import SessionLocal
 from app.logging import configure_logging
 from app.services.ingestion import IngestionPipeline
@@ -32,6 +32,15 @@ async def run_worker(poll_interval: float = 2.0, once: bool = False) -> None:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
+    async def _heartbeat(job_id, interval: float = 60.0):
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                with SessionLocal() as h_db:
+                    renew_job_lease(h_db, job_id)
+            except Exception:
+                pass
+
     while running:
         db = SessionLocal()
         try:
@@ -41,7 +50,15 @@ async def run_worker(poll_interval: float = 2.0, once: bool = False) -> None:
                     "claimed_job",
                     extra={"job_id": str(job.id), "paper_id": str(job.paper_id)},
                 )
-                await pipeline.process_paper(db, paper_id=job.paper_id, job_id=job.id)
+                heartbeat_task = asyncio.create_task(_heartbeat(job.id))
+                try:
+                    await pipeline.process_paper(db, paper_id=job.paper_id, job_id=job.id)
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
                 logger.info("finished_job", extra={"job_id": str(job.id)})
                 if once:
                     break

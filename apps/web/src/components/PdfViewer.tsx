@@ -1,12 +1,143 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import type { BoundingBox, Citation, Paper } from "@/types";
+import { useEffect, useRef, useState, useCallback } from "react";
+import type { Citation, Paper } from "@/types";
 
 interface PdfViewerProps {
   paper: Paper | null;
   activeCitation: Citation | null;
   apiUrl: string;
+}
+
+export interface HighlightRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Searches the DOM text nodes of a container (e.g. PDF.js text layer) for the target quote,
+ * supporting exact and whitespace-normalized substring matching, and returns a DOM Range.
+ */
+export function findRangeForQuote(
+  container: HTMLElement,
+  targetQuote: string,
+  options?: {
+    preferredCharStart?: number | null;
+    approximateY?: number | null;
+    occurrenceIndex?: number;
+  },
+): Range | null {
+  if (!targetQuote || !targetQuote.trim()) return null;
+
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  const textNodes: { node: Text; start: number; end: number }[] = [];
+  let fullText = "";
+  let currentNode: Node | null;
+
+  while ((currentNode = walker.nextNode())) {
+    const textNode = currentNode as Text;
+    const text = textNode.nodeValue || "";
+    if (text.length > 0) {
+      textNodes.push({
+        node: textNode,
+        start: fullText.length,
+        end: fullText.length + text.length,
+      });
+      fullText += text;
+    }
+  }
+
+  if (textNodes.length === 0 || !fullText) return null;
+
+  const candidateSpans: { matchStart: number; matchEnd: number }[] = [];
+
+  // 1. Direct search for all occurrences
+  let searchIdx = fullText.indexOf(targetQuote);
+  while (searchIdx !== -1) {
+    candidateSpans.push({
+      matchStart: searchIdx,
+      matchEnd: searchIdx + targetQuote.length,
+    });
+    searchIdx = fullText.indexOf(targetQuote, searchIdx + 1);
+  }
+
+  // 2. Whitespace-normalized search if direct search yielded no results
+  if (candidateSpans.length === 0) {
+    const rawToNormMap: number[] = [];
+    let normFullText = "";
+    let inWhitespace = false;
+
+    for (let i = 0; i < fullText.length; i++) {
+      const ch = fullText[i];
+      if (/\s/.test(ch)) {
+        if (!inWhitespace) {
+          rawToNormMap.push(i);
+          normFullText += " ";
+          inWhitespace = true;
+        }
+      } else {
+        rawToNormMap.push(i);
+        normFullText += ch;
+        inWhitespace = false;
+      }
+    }
+
+    const normQuote = targetQuote.trim().replace(/\s+/g, " ");
+    let normIndex = normFullText.indexOf(normQuote);
+
+    while (normIndex !== -1) {
+      const matchStart = rawToNormMap[normIndex];
+      const normEndIndex = normIndex + normQuote.length - 1;
+      const matchEnd =
+        (rawToNormMap[normEndIndex] ?? matchStart + normQuote.length) + 1;
+      candidateSpans.push({ matchStart, matchEnd });
+      normIndex = normFullText.indexOf(normQuote, normIndex + 1);
+    }
+  }
+
+  if (candidateSpans.length === 0) return null;
+
+  // Disambiguate if multiple occurrences found
+  let chosenSpan = candidateSpans[0];
+  if (candidateSpans.length > 1) {
+    if (options?.preferredCharStart != null) {
+      let minDiff = Infinity;
+      for (const span of candidateSpans) {
+        const diff = Math.abs(span.matchStart - options.preferredCharStart);
+        if (diff < minDiff) {
+          minDiff = diff;
+          chosenSpan = span;
+        }
+      }
+    } else if (
+      options?.occurrenceIndex != null &&
+      options.occurrenceIndex < candidateSpans.length
+    ) {
+      chosenSpan = candidateSpans[options.occurrenceIndex];
+    }
+  }
+
+  const { matchStart, matchEnd } = chosenSpan;
+
+  const startEntry = textNodes.find(
+    (tn) => matchStart >= tn.start && matchStart < tn.end,
+  );
+  const endEntry = textNodes.find(
+    (tn) => matchEnd > tn.start && matchEnd <= tn.end,
+  );
+
+  if (!startEntry || !endEntry) return null;
+
+  try {
+    const range = document.createRange();
+    range.setStart(startEntry.node, matchStart - startEntry.start);
+    range.setEnd(endEntry.node, matchEnd - endEntry.start);
+    return range;
+  } catch {
+    return null;
+  }
 }
 
 export default function PdfViewer({
@@ -18,6 +149,10 @@ export default function PdfViewer({
   const [scale, setScale] = useState<number>(1.2);
   const [rotation, setRotation] = useState<number>(0);
   const [prevCitation, setPrevCitation] = useState<Citation | null>(null);
+
+  const [highlightRects, setHighlightRects] = useState<HighlightRect[]>([]);
+  const [isExactMatch, setIsExactMatch] = useState<boolean>(false);
+  const [textLayerReady, setTextLayerReady] = useState<number>(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -35,7 +170,7 @@ export default function PdfViewer({
       : 1;
   const currentPage = userPage ?? citationPage;
 
-  // Handle PDF document rendering with PDF.js if available in browser
+  // Handle PDF document rendering with PDF.js
   useEffect(() => {
     let cancelled = false;
 
@@ -43,13 +178,9 @@ export default function PdfViewer({
       if (!paper) return;
 
       try {
-        // Dynamic import to avoid SSR issues
         const pdfjsLib = await import("pdfjs-dist");
-        if (
-          pdfjsLib.GlobalWorkerOptions &&
-          !pdfjsLib.GlobalWorkerOptions.workerSrc
-        ) {
-          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+        if (pdfjsLib.GlobalWorkerOptions) {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
         }
 
         const docUrl = `${apiUrl}/api/v1/papers/${paper.id}/document`;
@@ -65,18 +196,24 @@ export default function PdfViewer({
         const canvas = canvasRef.current;
         if (!canvas) return;
 
-        const context = canvas.getContext("2d");
-        if (!context) return;
+        let context: CanvasRenderingContext2D | null = null;
+        try {
+          context = canvas.getContext("2d");
+        } catch {
+          // JSDOM does not implement getContext
+        }
 
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
+        if (context) {
+          canvas.height = viewport.height;
+          canvas.width = viewport.width;
 
-        const renderContext = {
-          canvasContext: context,
-          viewport,
-        };
+          const renderContext = {
+            canvasContext: context,
+            viewport,
+          };
 
-        await page.render(renderContext).promise;
+          await page.render(renderContext).promise;
+        }
 
         // Render text layer for text matching
         const textContent = await page.getTextContent();
@@ -88,13 +225,24 @@ export default function PdfViewer({
           textLayerDiv.style.width = `${viewport.width}px`;
           textLayerDiv.style.height = `${viewport.height}px`;
 
-          // Populate text spans
-          for (const item of textContent.items) {
-            if ("str" in item) {
-              const span = document.createElement("span");
-              span.textContent = item.str;
-              textLayerDiv.appendChild(span);
+          if (pdfjsLib.TextLayer) {
+            const textLayer = new pdfjsLib.TextLayer({
+              textContentSource: textContent,
+              container: textLayerDiv,
+              viewport,
+            });
+            await textLayer.render();
+          } else {
+            for (const item of textContent.items) {
+              if ("str" in item) {
+                const span = document.createElement("span");
+                span.textContent = item.str;
+                textLayerDiv.appendChild(span);
+              }
             }
+          }
+          if (!cancelled) {
+            setTextLayerReady((c) => c + 1);
           }
         }
       } catch {
@@ -109,22 +257,112 @@ export default function PdfViewer({
     };
   }, [paper, currentPage, scale, rotation, apiUrl]);
 
-  // Derive highlight status purely during render
-  let highlightStatus: "exact" | "approximate" | "unavailable" = "unavailable";
-  if (activeCitation && activeCitation.paper_id === paper?.id) {
-    if (activeCitation.anchor_status === "unresolved") {
-      highlightStatus = "unavailable";
-    } else if (
-      activeCitation.anchor_status === "verified" ||
-      (activeCitation.anchors && activeCitation.anchors.length > 0)
+  // Compute exact character highlights using DOM Range.getClientRects()
+  const recomputeHighlights = useCallback(() => {
+    const isCurrentPageCited = Boolean(
+      activeCitation &&
+      activeCitation.paper_id === paper?.id &&
+      activeCitation.page_number === currentPage,
+    );
+
+    if (
+      !isCurrentPageCited ||
+      !activeCitation ||
+      activeCitation.anchor_status === "unresolved" ||
+      !activeCitation.quote ||
+      !textLayerRef.current
     ) {
-      highlightStatus = "exact";
-    } else if (activeCitation.bounding_boxes.length > 0) {
-      highlightStatus = "approximate";
-    } else {
-      highlightStatus = "unavailable";
+      setHighlightRects([]);
+      setIsExactMatch(false);
+      return;
     }
-  }
+
+    const matchingAnchor = activeCitation.anchors?.find(
+      (a) => a.page_number === currentPage,
+    );
+    const preferredStart = matchingAnchor?.source_char_start ?? null;
+    const approxY = matchingAnchor?.bounding_boxes?.[0]?.y_min ?? null;
+
+    const range = findRangeForQuote(
+      textLayerRef.current,
+      activeCitation.quote,
+      {
+        preferredCharStart: preferredStart,
+        approximateY: approxY,
+      },
+    );
+    if (!range) {
+      setHighlightRects([]);
+      setIsExactMatch(false);
+      return;
+    }
+
+    const containerRect = textLayerRef.current.getBoundingClientRect();
+    const clientRects = range.getClientRects();
+    const rects: HighlightRect[] = [];
+
+    if (clientRects && clientRects.length > 0) {
+      for (let i = 0; i < clientRects.length; i++) {
+        const r = clientRects[i];
+        if (r.width > 0 && r.height > 0) {
+          rects.push({
+            left: r.left - containerRect.left,
+            top: r.top - containerRect.top,
+            width: r.width,
+            height: r.height,
+          });
+        }
+      }
+    }
+
+    if (rects.length === 0) {
+      const bbox = range.getBoundingClientRect();
+      if (bbox && bbox.width > 0 && bbox.height > 0) {
+        rects.push({
+          left: bbox.left - containerRect.left,
+          top: bbox.top - containerRect.top,
+          width: bbox.width,
+          height: bbox.height,
+        });
+      }
+    }
+
+    if (rects.length > 0) {
+      setHighlightRects(rects);
+      setIsExactMatch(true);
+    } else {
+      setHighlightRects([]);
+      setIsExactMatch(false);
+    }
+  }, [activeCitation, paper?.id, currentPage]);
+
+  useEffect(() => {
+    const frameId = requestAnimationFrame(() => {
+      recomputeHighlights();
+    });
+    return () => {
+      cancelAnimationFrame(frameId);
+    };
+  }, [recomputeHighlights, textLayerReady, scale, rotation]);
+
+  // Recompute on window/container resize
+  useEffect(() => {
+    window.addEventListener("resize", recomputeHighlights);
+    return () => {
+      window.removeEventListener("resize", recomputeHighlights);
+    };
+  }, [recomputeHighlights]);
+
+  const isCurrentPageCited = Boolean(
+    activeCitation &&
+    activeCitation.paper_id === paper?.id &&
+    activeCitation.page_number === currentPage,
+  );
+
+  const highlightStatus: "exact" | "unavailable" =
+    isCurrentPageCited && isExactMatch && highlightRects.length > 0
+      ? "exact"
+      : "unavailable";
 
   if (!paper) {
     return (
@@ -136,11 +374,6 @@ export default function PdfViewer({
       </div>
     );
   }
-
-  const isCurrentPageCited =
-    activeCitation &&
-    activeCitation.paper_id === paper.id &&
-    activeCitation.page_number === currentPage;
 
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
@@ -250,9 +483,7 @@ export default function PdfViewer({
               >
                 {highlightStatus === "unavailable"
                   ? "Exact highlight unavailable"
-                  : highlightStatus === "exact"
-                    ? "Verbatim match"
-                    : "Evidence span"}
+                  : "Verbatim match"}
               </span>
             )}
           </div>
@@ -271,49 +502,32 @@ export default function PdfViewer({
           {/* Selectable transparent text layer */}
           <div
             ref={textLayerRef}
+            data-testid="pdf-text-layer"
             className="absolute inset-0 select-text overflow-hidden opacity-0 pointer-events-auto"
           />
 
-          {/* High-precision overlay highlights for cited page */}
+          {/* Exact Range.getClientRects() highlights for cited page */}
           {isCurrentPageCited &&
-            highlightStatus !== "unavailable" &&
-            activeCitation.bounding_boxes.map(
-              (box: BoundingBox, idx: number) => {
-                const isBottomLeft = box.origin === "BOTTOM_LEFT";
-                const leftPct = (box.x_min / (box.page_width || 612)) * 100;
-                const widthPct =
-                  ((box.x_max - box.x_min || 100) / (box.page_width || 612)) *
-                  100;
-                const topPct = isBottomLeft
-                  ? (((box.page_height || 792) - box.y_max) /
-                      (box.page_height || 792)) *
-                    100
-                  : (box.y_min / (box.page_height || 792)) * 100;
-                const heightPct =
-                  ((box.y_max - box.y_min || 20) / (box.page_height || 792)) *
-                  100;
-
-                return (
-                  <div
-                    key={`bbox-${idx}`}
-                    data-testid="evidence-highlight"
-                    style={{
-                      position: "absolute",
-                      left: `${Math.max(0, leftPct)}%`,
-                      top: `${Math.max(0, topPct)}%`,
-                      width: `${Math.min(100, widthPct)}%`,
-                      height: `${Math.min(100, heightPct)}%`,
-                      backgroundColor: "rgba(245, 158, 11, 0.35)",
-                      border: "2px solid #d97706",
-                      boxShadow: "0 0 6px rgba(245, 158, 11, 0.4)",
-                      borderRadius: "2px",
-                      pointerEvents: "none",
-                      zIndex: 20,
-                    }}
-                  />
-                );
-              },
-            )}
+            highlightStatus === "exact" &&
+            highlightRects.map((rect, idx) => (
+              <div
+                key={`exact-highlight-${idx}`}
+                data-testid="evidence-highlight"
+                style={{
+                  position: "absolute",
+                  left: `${rect.left}px`,
+                  top: `${rect.top}px`,
+                  width: `${rect.width}px`,
+                  height: `${rect.height}px`,
+                  backgroundColor: "rgba(245, 158, 11, 0.35)",
+                  border: "2px solid #d97706",
+                  boxShadow: "0 0 6px rgba(245, 158, 11, 0.4)",
+                  borderRadius: "2px",
+                  pointerEvents: "none",
+                  zIndex: 20,
+                }}
+              />
+            ))}
         </div>
       </div>
     </div>

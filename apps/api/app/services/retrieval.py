@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement
+from app.ingestion.parser import find_verbatim_span
 from app.schemas.evidence import (
     AnchorStatus,
     BoundingBox,
@@ -29,6 +30,11 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
 
 
 class RerankerProvider(ABC):
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        pass
+
     @abstractmethod
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
         """Return list of (document_index, score) sorted in descending order of relevance."""
@@ -37,6 +43,10 @@ class RerankerProvider(ABC):
 
 class SimpleLexicalReranker(RerankerProvider):
     """Fast lexical overlap and length-normalized reranker for testing and CPU fallback."""
+
+    @property
+    def model_name(self) -> str:
+        return "simple-lexical"
 
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
         query_words = set(query.lower().split())
@@ -57,17 +67,24 @@ class BGERerankerProvider(RerankerProvider):
     """BGE multilingual cross-encoder reranker with lazy initialization."""
 
     def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3") -> None:
-        self.model_name = model_name
+        self._model_name = model_name
         self._model = None
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
 
     def _load_model(self):
         if self._model is None:
             try:
                 from sentence_transformers import CrossEncoder
 
-                self._model = CrossEncoder(self.model_name)
+                self._model = CrossEncoder(self._model_name)
             except Exception as err:
-                raise RuntimeError(f"Could not load BGE reranker {self.model_name}: {err}") from err
+                raise RuntimeError(
+                    f"Production reranker {self._model_name} requested "
+                    f"but could not be loaded: {err}"
+                ) from err
         return self._model
 
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
@@ -292,16 +309,45 @@ class HybridRetriever:
                 else []
             )
 
-            # Map page-specific bboxes and anchors
+            # Parent context expansion: fetch parent chunk if available
+            parent_chunk = (
+                db.query(PaperChunk)
+                .join(ChunkElement, ChunkElement.chunk_id == PaperChunk.id)
+                .filter(
+                    PaperChunk.paper_id == chunk.paper_id,
+                    PaperChunk.chunk_type == "parent",
+                    ChunkElement.element_id.in_(elem_ids),
+                )
+                .first()
+                if elem_ids
+                else None
+            )
+            parent_context = parent_chunk.text if parent_chunk else chunk.text
+
+            # Map page-specific bboxes and anchors with verbatim text span verification
             bboxes: list[BoundingBox] = []
             anchors: list[CitationAnchor] = []
             page_number = 1
             exact_quote = chunk.text[:250].strip()
             parser_ver = None
+
             if source_elements:
-                page_number = source_elements[0].page_number
-                exact_quote = source_elements[0].text
-                parser_ver = source_elements[0].parser_version
+                # Find best matching source element for the query
+                best_elem = source_elements[0]
+                best_score = -1.0
+                query_words = set(query.lower().split())
+
+                for elem in source_elements:
+                    elem_words = set(elem.text.lower().split())
+                    score = len(query_words.intersection(elem_words))
+                    if score > best_score:
+                        best_score = score
+                        best_elem = elem
+
+                page_number = best_elem.page_number
+                exact_quote = best_elem.text
+                parser_ver = best_elem.parser_version
+
                 for elem in source_elements:
                     elem_boxes: list[BoundingBox] = []
                     if elem.bbox_x_min is not None and elem.page_width and elem.page_height:
@@ -316,21 +362,43 @@ class HybridRetriever:
                             rotation=elem.rotation,
                         )
                         elem_boxes.append(box)
-                        # STRICT: Only include bboxes on main page_number
-                        if elem.page_number == page_number:
-                            bboxes.append(box)
+
+                    # Reconstruct page text to verify verbatim span
+                    page_elems = (
+                        db.query(PaperElement)
+                        .filter(
+                            PaperElement.paper_id == chunk.paper_id,
+                            PaperElement.page_number == elem.page_number,
+                        )
+                        .order_by(PaperElement.element_index.asc())
+                        .all()
+                    )
+                    page_text = " ".join(pe.text for pe in page_elems)
+                    span = find_verbatim_span(page_text, elem.text)
+
+                    if span is not None and elem.text.strip():
+                        start_char, end_char = span
+                        anchor_status = AnchorStatus.VERIFIED
+                        verified_boxes = elem_boxes
+                    else:
+                        start_char, end_char = None, None
+                        anchor_status = AnchorStatus.UNRESOLVED
+                        verified_boxes = []
+
+                    if anchor_status == AnchorStatus.VERIFIED and elem.page_number == page_number:
+                        bboxes.extend(verified_boxes)
 
                     anchors.append(
                         CitationAnchor(
                             page_number=elem.page_number,
                             source_element_id=elem.id,
                             exact_quote=elem.text,
+                            source_char_start=start_char,
+                            source_char_end=end_char,
                             document_sha256=paper.document_sha256 if paper else None,
                             parser_version=elem.parser_version,
-                            anchor_status=AnchorStatus.VERIFIED
-                            if elem_boxes
-                            else AnchorStatus.UNRESOLVED,
-                            bounding_boxes=elem_boxes,
+                            anchor_status=anchor_status,
+                            bounding_boxes=verified_boxes,
                         )
                     )
 
@@ -341,6 +409,7 @@ class HybridRetriever:
                     paper_title=paper.filename if paper else None,
                     chunk_id=chunk.id,
                     quote=exact_quote,
+                    parent_context=parent_context,
                     page_number=page_number,
                     bounding_boxes=bboxes,
                     source_element_ids=elem_ids,

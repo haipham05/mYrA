@@ -201,10 +201,12 @@ async def test_chat_grounding_and_unsupported_citation():
     service = ChatService()
     resp = await service.answer_question(db, conv.id, "How do qubit operations work?")
 
-    # E99 must have been stripped from content
+    # E99 and its unsupported claim must have been completely stripped from content
     assert "[E99]" not in resp.content
     assert "[99]" not in resp.content
+    assert "unicorns exist" not in resp.content
     assert "[1]" in resp.content
+    assert "Superconducting circuits enable fast qubit operations [1]." in resp.content
 
     # Only 1 validated citation should exist
     assert len(resp.citations) == 1
