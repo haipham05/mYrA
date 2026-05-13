@@ -21,6 +21,11 @@ async def test_run_worker_once():
     create_tables()
 
     db = SessionLocal()
+    from app.db.models import Job
+
+    db.query(Job).delete()
+    db.commit()
+
     proj = create_project(db, ProjectCreate(name="Worker Test Project"))
 
     pdf_bytes = b"""%PDF-1.4

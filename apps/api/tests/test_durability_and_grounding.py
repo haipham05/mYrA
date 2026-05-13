@@ -160,6 +160,7 @@ async def test_chat_grounding_and_unsupported_citation():
 
     paper = create_paper(db, proj.id, "ground.pdf", "ground.pdf")
     paper.status = PaperStatus.READY
+    paper.document_sha256 = "mock_hash_for_test"
     elem = PaperElement(
         paper_id=paper.id,
         page_number=1,
@@ -172,6 +173,7 @@ async def test_chat_grounding_and_unsupported_citation():
         bbox_y_max=20.0,
         page_width=612.0,
         page_height=792.0,
+        parser_version="docling-2.130.0",
     )
     db.add(elem)
     db.flush()

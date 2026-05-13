@@ -40,6 +40,51 @@ def test_find_verbatim_span_missing_returns_none():
     assert span is None
 
 
+def test_find_verbatim_span_reversible_mapping_ligatures():
+    # Page text with ligatures, multiple spaces, and newlines
+    page_text = "Here is the \ufb01nal   result.\nIt was verified."
+    quote = "final result."
+
+    span = find_verbatim_span(page_text, quote)
+    assert span is not None
+    start, end = span
+    # Slicing the raw text must recover the exact raw characters
+    assert page_text[start:end] == "\ufb01nal   result."
+
+
+def test_find_verbatim_span_repeated_text_ambiguity_returns_none():
+    # Repeated sentence on the same page without disambiguating signal
+    page_text = (
+        "Section 1: The model achieves state-of-the-art results. "
+        "Section 5: The model achieves state-of-the-art results."
+    )
+    quote = "The model achieves state-of-the-art results."
+
+    span = find_verbatim_span(page_text, quote)
+    # Must return None (UNRESOLVED) to prevent false exact highlight
+    assert span is None
+
+
+def test_find_verbatim_span_repeated_text_disambiguation_with_preferred_offset():
+    page_text = (
+        "Section 1: The model achieves state-of-the-art results. "
+        "Section 5: The model achieves state-of-the-art results."
+    )
+    quote = "The model achieves state-of-the-art results."
+
+    # Disambiguate towards second occurrence
+    span_second = find_verbatim_span(page_text, quote, preferred_char_start=60)
+    assert span_second is not None
+    assert span_second[0] >= 50
+    assert page_text[span_second[0] : span_second[1]] == quote
+
+    # Disambiguate towards first occurrence
+    span_first = find_verbatim_span(page_text, quote, preferred_char_start=10)
+    assert span_first is not None
+    assert span_first[0] < 30
+    assert page_text[span_first[0] : span_first[1]] == quote
+
+
 def test_parser_never_invents_fallback_50_50_boxes():
     # PDF with plain text
     pdf_bytes = b"""%PDF-1.4

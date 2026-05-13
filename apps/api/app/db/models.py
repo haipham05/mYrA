@@ -6,6 +6,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    FetchedValue,
     Float,
     ForeignKey,
     Index,
@@ -95,6 +96,7 @@ class PaperPage(Base):
     height: Mapped[float] = mapped_column(Float, nullable=False)
     rotation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     crop_box: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -148,7 +150,9 @@ class PaperChunk(Base):
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     embedding: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
     embedding_vec: Mapped[list[float] | None] = mapped_column(PGVector(1024), nullable=True)
-    tsv_content: Mapped[str | None] = mapped_column(TSVector, nullable=True)
+    tsv_content: Mapped[str | None] = mapped_column(
+        TSVector, server_default=FetchedValue(), nullable=True
+    )
     embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     embedding_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -181,9 +181,12 @@ async def test_adversarial_hallucination_and_abstention(test_db_session):
 
 def test_production_mode_deepseek_fail_clearly():
     """Test that DeepSeek provider fails clearly when API key is missing in production mode."""
+    from app.config import Settings
+
     set_llm_provider(None)
+    settings_no_key = Settings(deepseek_api_key=None)
     with pytest.raises(RuntimeError, match="Production mode requires DeepSeek API key"):
-        get_llm_provider(mode="production")
+        get_llm_provider(settings=settings_no_key, mode="production")
 
 
 def test_worker_lease_heartbeat_renewal(test_db_session):

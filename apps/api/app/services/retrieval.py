@@ -6,7 +6,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement
+from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
 from app.ingestion.parser import find_verbatim_span
 from app.schemas.evidence import (
     AnchorStatus,
@@ -363,23 +363,54 @@ class HybridRetriever:
                         )
                         elem_boxes.append(box)
 
-                    # Reconstruct page text to verify verbatim span
-                    page_elems = (
-                        db.query(PaperElement)
+                    # Retrieve canonical page text to verify verbatim span
+                    page_record = (
+                        db.query(PaperPage)
                         .filter(
-                            PaperElement.paper_id == chunk.paper_id,
-                            PaperElement.page_number == elem.page_number,
+                            PaperPage.paper_id == chunk.paper_id,
+                            PaperPage.page_number == elem.page_number,
                         )
-                        .order_by(PaperElement.element_index.asc())
-                        .all()
+                        .first()
                     )
-                    page_text = " ".join(pe.text for pe in page_elems)
-                    span = find_verbatim_span(page_text, elem.text)
+                    page_text = (
+                        page_record.raw_text if page_record and page_record.raw_text else None
+                    )
+                    if not page_text:
+                        # Fallback for legacy rows
+                        page_elems = (
+                            db.query(PaperElement)
+                            .filter(
+                                PaperElement.paper_id == chunk.paper_id,
+                                PaperElement.page_number == elem.page_number,
+                            )
+                            .order_by(PaperElement.element_index.asc())
+                            .all()
+                        )
+                        page_text = " ".join(pe.text for pe in page_elems)
+
+                    # Require valid document SHA-256 and parser version
+                    is_valid_provenance = bool(
+                        paper and paper.document_sha256 and elem.parser_version
+                    )
+
+                    span = (
+                        find_verbatim_span(page_text, elem.text, context=chunk.text)
+                        if is_valid_provenance
+                        else None
+                    )
 
                     if span is not None and elem.text.strip():
                         start_char, end_char = span
                         anchor_status = AnchorStatus.VERIFIED
                         verified_boxes = elem_boxes
+                    elif not is_valid_provenance:
+                        start_char, end_char = None, None
+                        anchor_status = (
+                            AnchorStatus.LEGACY
+                            if (paper and not paper.document_sha256)
+                            else AnchorStatus.UNRESOLVED
+                        )
+                        verified_boxes = []
                     else:
                         start_char, end_char = None, None
                         anchor_status = AnchorStatus.UNRESOLVED

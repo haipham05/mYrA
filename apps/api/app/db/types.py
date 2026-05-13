@@ -6,6 +6,8 @@ from sqlalchemy.types import UserDefinedType
 class PGVector(UserDefinedType):
     """PostgreSQL pgvector / halfvec type with fallback for SQLite tests."""
 
+    cache_ok = True
+
     def __init__(self, dim: int = 1024) -> None:
         self.dim = dim
 
@@ -37,6 +39,8 @@ class PGVector(UserDefinedType):
 
 class TSVector(UserDefinedType):
     """PostgreSQL tsvector type with fallback for SQLite tests."""
+
+    cache_ok = True
 
     def get_col_spec(self, **kw: Any) -> str:
         return "tsvector"

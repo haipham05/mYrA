@@ -68,6 +68,7 @@ class IngestionPipeline:
                     height=p.height,
                     rotation=p.rotation,
                     crop_box=p.crop_box,
+                    raw_text=p.raw_text,
                 )
                 db.add(db_page)
 
