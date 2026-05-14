@@ -16,11 +16,87 @@ logger = logging.getLogger("myra.chat")
 
 
 def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
-    """Validate claim-to-cite support via lexical keyword overlap."""
+    """Validate factual claim-to-cite support.
+
+    Enforces:
+    1. Numeric consistency: All numbers in the claim must exist in the atomic quote.
+    2. Negation consistency: Polarity must match; reject positive claims on negated
+       quotes or vice-versa.
+    3. Directional / relational consistency: Reject opposing antonym pairs (e.g.
+       increase vs decrease).
+    4. Lexical grounding: Core content words must be substantiated by the atomic quote.
+    """
     if not claim_text.strip() or not evidence_quote.strip():
         return False
 
-    # Normalized content words (excluding common stop words)
+    # 1. Numeric consistency
+    def extract_numbers(text: str) -> set[float]:
+        nums: set[float] = set()
+        for token in re.findall(r"\b\d+(?:\.\d+)?%?\b", text):
+            try:
+                nums.add(float(token.rstrip("%")))
+            except ValueError:
+                pass
+        return nums
+
+    claim_nums = extract_numbers(claim_text)
+    quote_nums = extract_numbers(evidence_quote)
+    if claim_nums and not claim_nums.issubset(quote_nums):
+        return False
+
+    # 2. Negation consistency
+    negation_patterns = [
+        r"\bnot\b",
+        r"\bno\b",
+        r"\bnever\b",
+        r"\bneither\b",
+        r"\bnor\b",
+        r"\bcannot\b",
+        r"\bcan't\b",
+        r"\bdid\s+not\b",
+        r"\bdidn't\b",
+        r"\bdoes\s+not\b",
+        r"\bdoesn't\b",
+        r"\bwas\s+not\b",
+        r"\bwasn't\b",
+        r"\bwithout\b",
+        r"\bfailed\b",
+        r"\bfails\b",
+        r"\bfailure\b",
+    ]
+
+    def has_negation(text: str) -> bool:
+        t = text.lower()
+        return any(re.search(pat, t) is not None for pat in negation_patterns)
+
+    claim_neg = has_negation(claim_text)
+    quote_neg = has_negation(evidence_quote)
+    if claim_neg != quote_neg:
+        return False
+
+    # 3. Directional / antonym opposition
+    opposites = [
+        (
+            {"increase", "increased", "increasing", "higher", "gain"},
+            {"decrease", "decreased", "decreasing", "lower", "loss"},
+        ),
+        (
+            {"improve", "improved", "improving", "better"},
+            {"worsen", "worsened", "worsening", "worse"},
+        ),
+        ({"positive"}, {"negative"}),
+        ({"above", "exceed", "exceeds"}, {"below", "under"}),
+    ]
+    claim_words = set(re.findall(r"\w+", claim_text.lower()))
+    quote_words = set(re.findall(r"\w+", evidence_quote.lower()))
+
+    for group_a, group_b in opposites:
+        if (claim_words & group_a and quote_words & group_b) or (
+            claim_words & group_b and quote_words & group_a
+        ):
+            return False
+
+    # 4. Lexical content overlap
     stop_words = {
         "the",
         "a",
@@ -69,20 +145,16 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
         "furthermore",
         "however",
     }
-    claim_words = {
-        w for w in re.findall(r"\w+", claim_text.lower()) if len(w) > 2 and w not in stop_words
-    }
-    quote_words = {
-        w for w in re.findall(r"\w+", evidence_quote.lower()) if len(w) > 2 and w not in stop_words
-    }
+    claim_content = {w for w in claim_words if len(w) > 2 and w not in stop_words}
+    quote_content = {w for w in quote_words if len(w) > 2 and w not in stop_words}
 
-    if not claim_words or not quote_words:
+    if not claim_content or not quote_content:
         return False
 
-    overlap = claim_words.intersection(quote_words)
-    overlap_ratio = len(overlap) / len(claim_words)
-    # Require at least two distinct content keywords OR >= 25% overlap
-    return len(overlap) >= 2 or overlap_ratio >= 0.25
+    overlap = claim_content.intersection(quote_content)
+    overlap_ratio = len(overlap) / len(claim_content)
+
+    return overlap_ratio >= 0.5 or (len(claim_content) <= 3 and len(overlap) >= 2)
 
 
 class ChatService:
@@ -201,10 +273,22 @@ class ChatService:
                 if e_id not in citation_to_display_index:
                     evidence = evidence_map[e_id]
                     citation_to_display_index[e_id] = display_idx
+                    # Determine anchor status specifically for the displayed quote and page
+                    matching_anchor = None
+                    if evidence.anchors:
+                        for a in evidence.anchors:
+                            if (
+                                a.page_number == evidence.page_number
+                                and a.exact_quote == evidence.quote
+                            ):
+                                matching_anchor = a
+                                break
+                        if not matching_anchor:
+                            matching_anchor = evidence.anchors[0]
+
                     anchor_status = (
-                        AnchorStatus.VERIFIED
-                        if evidence.anchors
-                        and any(a.anchor_status == AnchorStatus.VERIFIED for a in evidence.anchors)
+                        matching_anchor.anchor_status
+                        if matching_anchor
                         else AnchorStatus.UNRESOLVED
                     )
                     validated_citations.append(

@@ -154,6 +154,8 @@ export default function PdfViewer({
   const [isExactMatch, setIsExactMatch] = useState<boolean>(false);
   const [textLayerReady, setTextLayerReady] = useState<number>(0);
 
+  const [renderError, setRenderError] = useState<string | null>(null);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
@@ -176,6 +178,7 @@ export default function PdfViewer({
 
     async function renderPage() {
       if (!paper) return;
+      setRenderError(null);
 
       try {
         const pdfjsLib = await import("pdfjs-dist");
@@ -233,20 +236,18 @@ export default function PdfViewer({
             });
             await textLayer.render();
           } else {
-            for (const item of textContent.items) {
-              if ("str" in item) {
-                const span = document.createElement("span");
-                span.textContent = item.str;
-                textLayerDiv.appendChild(span);
-              }
-            }
+            textLayerDiv.innerHTML = "";
           }
           if (!cancelled) {
             setTextLayerReady((c) => c + 1);
           }
         }
-      } catch {
-        // Fallback gracefully in testing / non-canvas environments
+      } catch (err) {
+        if (!cancelled) {
+          setRenderError(
+            err instanceof Error ? err.message : "Failed to render PDF page",
+          );
+        }
       }
     }
 
@@ -265,21 +266,33 @@ export default function PdfViewer({
       activeCitation.page_number === currentPage,
     );
 
+    const matchingAnchor = activeCitation?.anchors?.find(
+      (a) => a.page_number === currentPage,
+    );
+
+    const isVerified =
+      activeCitation?.anchor_status === "verified" ||
+      matchingAnchor?.anchor_status === "verified";
+
+    const isHashMatched =
+      !paper?.document_sha256 ||
+      !activeCitation?.document_sha256 ||
+      paper.document_sha256 === activeCitation.document_sha256;
+
     if (
       !isCurrentPageCited ||
       !activeCitation ||
-      activeCitation.anchor_status === "unresolved" ||
+      !isVerified ||
+      !isHashMatched ||
       !activeCitation.quote ||
-      !textLayerRef.current
+      !textLayerRef.current ||
+      renderError
     ) {
       setHighlightRects([]);
       setIsExactMatch(false);
       return;
     }
 
-    const matchingAnchor = activeCitation.anchors?.find(
-      (a) => a.page_number === currentPage,
-    );
     const preferredStart = matchingAnchor?.source_char_start ?? null;
     const approxY = matchingAnchor?.bounding_boxes?.[0]?.y_min ?? null;
 
@@ -305,25 +318,26 @@ export default function PdfViewer({
       for (let i = 0; i < clientRects.length; i++) {
         const r = clientRects[i];
         if (r.width > 0 && r.height > 0) {
-          rects.push({
-            left: r.left - containerRect.left,
-            top: r.top - containerRect.top,
-            width: r.width,
-            height: r.height,
-          });
-        }
-      }
-    }
+          const left = r.left - containerRect.left;
+          const top = r.top - containerRect.top;
+          const hasContainerBounds =
+            containerRect.width > 0 && containerRect.height > 0;
+          const isWithinBounds =
+            !hasContainerBounds ||
+            (left >= -2 &&
+              top >= -2 &&
+              left + r.width <= containerRect.width + 5 &&
+              top + r.height <= containerRect.height + 5);
 
-    if (rects.length === 0) {
-      const bbox = range.getBoundingClientRect();
-      if (bbox && bbox.width > 0 && bbox.height > 0) {
-        rects.push({
-          left: bbox.left - containerRect.left,
-          top: bbox.top - containerRect.top,
-          width: bbox.width,
-          height: bbox.height,
-        });
+          if (isWithinBounds) {
+            rects.push({
+              left: Math.max(0, left),
+              top: Math.max(0, top),
+              width: r.width,
+              height: r.height,
+            });
+          }
+        }
       }
     }
 
@@ -334,7 +348,7 @@ export default function PdfViewer({
       setHighlightRects([]);
       setIsExactMatch(false);
     }
-  }, [activeCitation, paper?.id, currentPage]);
+  }, [activeCitation, paper, currentPage, renderError]);
 
   useEffect(() => {
     const frameId = requestAnimationFrame(() => {

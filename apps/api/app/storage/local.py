@@ -32,12 +32,26 @@ class LocalStorage(ObjectStorage):
         if file_path.exists():
             os.remove(file_path)
 
+    async def exists(self, key: str) -> bool:
+        return self._resolve_path(key).exists()
+
+    async def open_stream(self, key: str, chunk_size: int = 64 * 1024):
+        file_path = self._resolve_path(key)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Key not found in local storage: {key}")
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                yield chunk
+
 
 class MemoryStorage(ObjectStorage):
     """In-memory storage for unit testing without disk I/O."""
 
     def __init__(self) -> None:
         self._store: dict[str, bytes] = {}
+
+    async def exists(self, key: str) -> bool:
+        return key in self._store
 
     async def put(self, key: str, data: bytes, content_type: str = "application/pdf") -> str:
         self._store[key] = data

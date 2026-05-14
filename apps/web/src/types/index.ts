@@ -15,6 +15,7 @@ export interface Paper {
   status: PaperStatus;
   page_count?: number | null;
   error_message?: string | null;
+  document_sha256?: string | null;
   created_at: string;
   updated_at: string;
 }

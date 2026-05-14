@@ -76,6 +76,30 @@ const mockCitation: Citation = {
 
 describe("PdfViewer & Exact Range Matching", () => {
   beforeEach(() => {
+    // Mock HTMLCanvasElement.getContext to eliminate jsdom warning
+    HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({
+      fillRect: vi.fn(),
+      clearRect: vi.fn(),
+      getImageData: vi.fn(),
+      putImageData: vi.fn(),
+      createImageData: vi.fn(),
+      setTransform: vi.fn(),
+      drawImage: vi.fn(),
+      save: vi.fn(),
+      fillText: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      closePath: vi.fn(),
+      stroke: vi.fn(),
+      translate: vi.fn(),
+      scale: vi.fn(),
+      rotate: vi.fn(),
+      arc: vi.fn(),
+      fill: vi.fn(),
+    });
+
     // Default DOMRect implementation for JSDOM
     Range.prototype.getClientRects = function () {
       return [
@@ -318,6 +342,29 @@ describe("PdfViewer & Exact Range Matching", () => {
 
     expect(screen.getByText(/Page 3 of 5/)).toBeInTheDocument();
     // Highlight must NOT appear on page 3
+    expect(screen.queryByTestId("evidence-highlight")).not.toBeInTheDocument();
+  });
+
+  it("rejects highlight when paper SHA-256 and citation SHA-256 mismatch", () => {
+    const paperWithHash: Paper = {
+      ...mockPaper,
+      document_sha256: "hash_version_A",
+    };
+    const citationWithDifferentHash: Citation = {
+      ...mockCitation,
+      document_sha256: "hash_version_B",
+    };
+
+    render(
+      <PdfViewer
+        paper={paperWithHash}
+        activeCitation={citationWithDifferentHash}
+        apiUrl="http://localhost:8000"
+      />,
+    );
+
+    // Shows explicit unavailable state and does not draw highlight
+    expect(screen.getByText("Exact highlight unavailable")).toBeInTheDocument();
     expect(screen.queryByTestId("evidence-highlight")).not.toBeInTheDocument();
   });
 });

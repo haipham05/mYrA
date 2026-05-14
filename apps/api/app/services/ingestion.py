@@ -14,6 +14,24 @@ from app.services.embedding import get_embedding_provider
 from app.storage.factory import get_storage
 
 
+def is_transient_error(err: Exception) -> bool:
+    """Classify whether an exception is transient (retryable) or permanent (fatal)."""
+    if isinstance(err, (ValueError, TypeError, KeyError, AttributeError, IndexError)):
+        return False
+    err_str = str(err).lower()
+    if any(
+        k in err_str
+        for k in ("no extractable text", "unsupported", "invalid pdf", "corrupt", "not a pdf")
+    ):
+        return False
+    if isinstance(err, (TimeoutError, ConnectionError, OSError)):
+        return True
+    err_cls_name = err.__class__.__name__
+    if any(k in err_cls_name for k in ("OperationalError", "Timeout", "Connection", "Transient")):
+        return True
+    return False
+
+
 class IngestionPipeline:
     """End-to-end ingestion pipeline: storage -> parser -> chunker -> embedding -> db."""
 
@@ -165,12 +183,17 @@ class IngestionPipeline:
             db.rollback()
             err_msg = str(err)
             current_job = get_job(db, job_id)
-            if current_job and current_job.retry_count < current_job.max_retries:
+            transient = is_transient_error(err)
+            if current_job and transient and current_job.retry_count < current_job.max_retries:
                 current_job.retry_count += 1
                 current_job.status = JobStatus.PENDING
                 current_job.stage = JobStage.QUEUED
-                current_job.error_message = f"Transient failure, retry queued: {err_msg}"
+                retries = f"{current_job.retry_count}/{current_job.max_retries}"
+                msg = f"Transient failure ({retries}): {err_msg}"
+                current_job.error_message = msg[:500]
+                current_job.is_retryable = True
                 db.commit()
+
             else:
                 update_paper_status(db, paper_id, status=PaperStatus.FAILED, error_message=err_msg)
                 update_job_progress(
@@ -180,4 +203,5 @@ class IngestionPipeline:
                     progress=1.0,
                     status=JobStatus.FAILED,
                     error_message=err_msg,
+                    is_retryable=False,
                 )

@@ -1,6 +1,7 @@
 import hashlib
 import io
 import logging
+import tempfile
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -83,29 +84,44 @@ async def upload_paper(
             detail="Only PDF files are supported",
         )
 
-    # 1. Bounded streamed upload reading
+    # 1. Bounded streamed upload reading via spooled temporary file
     chunk_size = 1024 * 1024  # 1MB chunks
-    chunks = []
     total_bytes = 0
-    while chunk := await file.read(chunk_size):
-        total_bytes += len(chunk)
-        if total_bytes > settings.max_upload_size_bytes:
+    hasher = hashlib.sha256()
+    spooled = tempfile.SpooledTemporaryFile(max_size=5 * 1024 * 1024, mode="w+b")
+    first_chunk = True
+
+    try:
+        while chunk := await file.read(chunk_size):
+            total_bytes += len(chunk)
+            if total_bytes > settings.max_upload_size_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"File exceeds maximum size of {settings.max_upload_size_bytes} bytes",
+                )
+            if first_chunk:
+                if not chunk.startswith(b"%PDF"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid PDF file signature",
+                    )
+                first_chunk = False
+            hasher.update(chunk)
+            spooled.write(chunk)
+
+        if total_bytes == 0:
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File exceeds maximum size of {settings.max_upload_size_bytes} bytes",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Empty file uploaded",
             )
-        chunks.append(chunk)
 
-    content = b"".join(chunks)
-
-    if not content.startswith(b"%PDF"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid PDF file signature",
-        )
+        document_sha256 = hasher.hexdigest()
+        spooled.seek(0)
+        content = spooled.read()
+    finally:
+        spooled.close()
 
     # 2. Check for duplicate upload within project
-    document_sha256 = hashlib.sha256(content).hexdigest()
     existing_paper = (
         db.query(Paper)
         .filter(Paper.project_id == project_id, Paper.document_sha256 == document_sha256)

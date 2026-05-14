@@ -50,35 +50,25 @@ async def get_paper_document(
     elif key.startswith("memory://"):
         key = key.replace("memory://", "")
 
-    try:
-        data = await storage.get(key)
-    except FileNotFoundError:
-        try:
-            data = await storage.get(paper.storage_path)
-        except Exception as err:
-            logger.warning("Paper file not found in storage", exc_info=err)
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document file not found in storage",
-            ) from err
-    except Exception as err:
-        logger.error("Failed to retrieve paper document", exc_info=err)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve document",
-        ) from err
+    resolved_key = None
+    if await storage.exists(key):
+        resolved_key = key
+    elif await storage.exists(paper.storage_path):
+        resolved_key = paper.storage_path
 
+    if resolved_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document file not found in storage",
+        )
+
+    stream = storage.open_stream(resolved_key)
     headers = {
         "Content-Disposition": f'inline; filename="{paper.filename}"',
         "Content-Type": "application/pdf",
     }
 
-    async def iterfile():
-        chunk_size = 64 * 1024  # 64KB chunks
-        for i in range(0, len(data), chunk_size):
-            yield data[i : i + chunk_size]
-
-    return StreamingResponse(iterfile(), media_type="application/pdf", headers=headers)
+    return StreamingResponse(stream, media_type="application/pdf", headers=headers)
 
 
 @router.get("/{paper_id}/elements", response_model=list[SourceElement])

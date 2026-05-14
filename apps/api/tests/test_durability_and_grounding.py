@@ -216,3 +216,206 @@ async def test_chat_grounding_and_unsupported_citation():
     assert resp.citations[0].anchor_status == AnchorStatus.VERIFIED
 
     db.close()
+
+
+def test_adversarial_claim_grounding_direct():
+    """Adversarial validation tests specifically required by Milestone 1 review:
+
+    1. Numeric contradiction: 28.4 vs 14.2
+    2. Reversed conclusion / negation: 'did not improve' vs 'improved'
+    3. Reversed conclusion / positive-on-negative: 'improved' vs 'did not improve'
+    4. Directional opposition: 'increased' vs 'decreased'
+    5. Valid grounded claim
+    """
+    from app.services.chat_service import check_claim_support
+
+    # 1. Numeric contradiction must return False
+    assert check_claim_support("The BLEU score was 28.4.", "The BLEU score was 14.2.") is False
+
+    # 2. Negation contradiction must return False
+    assert (
+        check_claim_support(
+            "The treatment did not improve survival.",
+            "The treatment improved survival.",
+        )
+        is False
+    )
+
+    # 3. Positive claim on negated quote must return False
+    assert (
+        check_claim_support(
+            "The treatment improved survival.",
+            "The treatment did not improve survival.",
+        )
+        is False
+    )
+
+    # 4. Directional opposition must return False
+    assert (
+        check_claim_support(
+            "The model increased error rate.",
+            "The model decreased error rate.",
+        )
+        is False
+    )
+
+    # 5. Grounded valid claim must return True
+    quote_text = (
+        "The Transformer model achieves a state-of-the-art BLEU score of 28.4 "
+        "on the English-to-German task."
+    )
+    assert check_claim_support("The Transformer achieves a BLEU score of 28.4.", quote_text) is True
+
+
+@pytest.mark.anyio
+async def test_claim_grounding_rejects_parent_only_claims():
+    """Ensure claims supported only by parent context (not atomic quote) are rejected."""
+    create_tables()
+    db = SessionLocal()
+    proj = create_project(db, ProjectCreate(name="Parent Context Test"))
+    conv = create_conversation(db, proj.id, title="Parent Test")
+
+    paper = create_paper(db, proj.id, "parent_test.pdf", "parent_test.pdf")
+    paper.status = PaperStatus.READY
+    paper.document_sha256 = "mock_hash_parent"
+
+    # Child atomic element
+    child_elem = PaperElement(
+        paper_id=paper.id,
+        page_number=1,
+        element_index=0,
+        element_type="text",
+        text="The learning rate was set to 0.001.",
+        page_width=612.0,
+        page_height=792.0,
+        parser_version="docling-2.130.0",
+    )
+    db.add(child_elem)
+    db.flush()
+
+    # Chunk with broader parent text (mentioning accuracy) but atomic quote only has learning rate
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text=(
+            "Parent context: Accuracy reached 95.5%. "
+            "Atomic quote: The learning rate was set to 0.001."
+        ),
+        token_count=15,
+        embedding=[0.1] * 1024,
+        embedding_vec=[0.1] * 1024,
+    )
+    db.add(chunk)
+    db.flush()
+    db.add(ChunkElement(chunk_id=chunk.id, element_id=child_elem.id, order_index=0))
+    db.commit()
+
+    # LLM hallucinates claim from parent context not supported by child quote
+    fake_llm = FakeLLMProvider(fixed_response="The model achieved an accuracy of 95.5% [E1].")
+    set_llm_provider(fake_llm)
+
+    service = ChatService()
+    resp = await service.answer_question(db, conv.id, "What was the accuracy?")
+
+    # Unsupported claim must be rejected and system abstains
+    assert "95.5%" not in resp.content
+    assert len(resp.citations) == 0
+    assert "Insufficient evidence" in resp.content
+
+    db.close()
+
+
+def test_worker_lease_fencing():
+    from app.crud.job import claim_next_job, create_job, renew_job_lease
+
+    create_tables()
+    db = SessionLocal()
+    db.query(Job).delete()
+    db.commit()
+    proj = create_project(db, ProjectCreate(name="Fence Test"))
+    paper = create_paper(db, proj.id, "fence.pdf", "fence.pdf")
+    job = create_job(db, paper.id)
+
+    # Worker 1 claims job
+    claimed_1 = claim_next_job(db, worker_id="worker-1", lease_timeout_seconds=0)
+    assert claimed_1 is not None
+    assert claimed_1.worker_id == "worker-1"
+
+    # With timeout=0, cutoff is now, so worker 2 reclaims expired job
+    claimed_2 = claim_next_job(db, worker_id="worker-2", lease_timeout_seconds=0)
+    assert claimed_2 is not None
+    assert claimed_2.id == job.id
+    assert claimed_2.worker_id == "worker-2"
+
+    # Worker 1 heartbeat must be rejected (fenced out)
+    assert renew_job_lease(db, job.id, worker_id="worker-1") is False
+
+    # Worker 2 heartbeat succeeds
+    assert renew_job_lease(db, job.id, worker_id="worker-2") is True
+    db.close()
+
+
+def test_job_retry_exponential_backoff():
+    from datetime import UTC, datetime, timedelta
+
+    from app.crud.job import claim_next_job, create_job
+
+    create_tables()
+    db = SessionLocal()
+    db.query(Job).delete()
+    db.commit()
+    proj = create_project(db, ProjectCreate(name="Backoff Test"))
+    paper = create_paper(db, proj.id, "backoff.pdf", "backoff.pdf")
+    job = create_job(db, paper.id)
+
+    # Simulate retried job with recent updated_at (retry_count=2, backoff = 20s)
+    job.retry_count = 2
+    job.updated_at = datetime.now(tz=UTC)
+    db.commit()
+
+    # Should not be claimed yet because backoff hasn't elapsed
+    assert claim_next_job(db, worker_id="worker-1") is None
+
+    # Simulate updated_at in the past (> 20s ago)
+    job.updated_at = datetime.now(tz=UTC) - timedelta(seconds=25)
+    db.commit()
+
+    # Now it should be claimed
+    claimed = claim_next_job(db, worker_id="worker-1")
+    assert claimed is not None
+    assert claimed.id == job.id
+    db.close()
+
+
+def test_is_transient_error_classification():
+    from app.services.ingestion import is_transient_error
+
+    # Fatal errors
+    assert is_transient_error(ValueError("Invalid PDF signature")) is False
+    assert is_transient_error(KeyError("missing_field")) is False
+    assert is_transient_error(TypeError("bad type")) is False
+    assert is_transient_error(Exception("PDF has no extractable text")) is False
+
+    # Transient errors
+    assert is_transient_error(TimeoutError("Connection timed out")) is True
+    assert is_transient_error(ConnectionError("Socket closed")) is True
+    assert is_transient_error(OSError("Resource temporarily unavailable")) is True
+
+
+@pytest.mark.anyio
+async def test_storage_open_stream():
+    from app.storage.local import MemoryStorage
+
+    storage = MemoryStorage()
+    await storage.put("stream_test.pdf", b"1234567890" * 100)
+
+    assert await storage.exists("stream_test.pdf") is True
+    assert await storage.exists("non_existent.pdf") is False
+
+    chunks = []
+    async for chunk in storage.open_stream("stream_test.pdf", chunk_size=50):
+        chunks.append(chunk)
+
+    assert b"".join(chunks) == b"1234567890" * 100
+    assert len(chunks) == 20

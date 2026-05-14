@@ -43,6 +43,14 @@ class GCSStorage(ObjectStorage):
 
         return await asyncio.to_thread(_download)
 
+    async def exists(self, key: str) -> bool:
+        def _check() -> bool:
+            bucket = self._get_bucket()
+            blob = bucket.blob(key)
+            return blob.exists()
+
+        return await asyncio.to_thread(_check)
+
     async def delete(self, key: str) -> None:
         def _delete() -> None:
             bucket = self._get_bucket()

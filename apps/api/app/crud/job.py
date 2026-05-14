@@ -27,12 +27,29 @@ def claim_next_job(db: Session, worker_id: str, lease_timeout_seconds: int = 300
     now = datetime.now(tz=UTC)
     cutoff = datetime.fromtimestamp(now.timestamp() - lease_timeout_seconds, tz=UTC)
 
-    # 1. Prioritize PENDING jobs
+    # 1. Prioritize PENDING jobs (honoring backoff for retried jobs)
     query = db.query(Job).filter(Job.status == "PENDING").order_by(Job.created_at.asc())
     if not is_sqlite:
         query = query.with_for_update(skip_locked=True)
 
-    job = query.first()
+    pending_jobs = query.all()
+    job = None
+    for candidate in pending_jobs:
+        if candidate.retry_count == 0:
+            job = candidate
+            break
+        backoff_seconds = min(300, (2**candidate.retry_count) * 5)
+        if candidate.updated_at:
+            cand_time = candidate.updated_at
+            if cand_time.tzinfo is None:
+                cand_time = cand_time.replace(tzinfo=UTC)
+            elapsed = (now - cand_time).total_seconds()
+            if elapsed >= backoff_seconds:
+                job = candidate
+                break
+        else:
+            job = candidate
+            break
 
     # 2. Recover abandoned PROCESSING jobs whose worker lease has expired
     if not job:
@@ -86,11 +103,14 @@ def update_job_progress(
     return job
 
 
-def renew_job_lease(db: Session, job_id: UUID | str) -> bool:
+def renew_job_lease(db: Session, job_id: UUID | str, worker_id: str | None = None) -> bool:
     """Heartbeat to renew claimed_at timestamp on an actively processing job."""
     if isinstance(job_id, str):
         job_id = UUID(job_id)
-    job = db.query(Job).filter(Job.id == job_id, Job.status == "PROCESSING").first()
+    query = db.query(Job).filter(Job.id == job_id, Job.status == "PROCESSING")
+    if worker_id is not None:
+        query = query.filter(Job.worker_id == worker_id)
+    job = query.first()
     if job:
         job.claimed_at = datetime.now(tz=UTC)
         db.commit()
