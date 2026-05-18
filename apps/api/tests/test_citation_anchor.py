@@ -9,7 +9,9 @@ from app.schemas.evidence import (
     Citation,
     CitationAnchor,
     CoordinateOrigin,
+    EvidenceItem,
 )
+from app.services.chat_service import matching_verified_anchor
 
 
 def test_valid_citation_anchor():
@@ -111,3 +113,44 @@ def test_citation_verified_with_anchors():
     assert citation.anchor_status == AnchorStatus.VERIFIED
     assert len(citation.anchors) == 1
     assert citation.anchors[0].page_number == 3
+
+
+@pytest.mark.parametrize(
+    ("change", "value"),
+    [
+        ("anchor_status", AnchorStatus.UNRESOLVED),
+        ("page_number", 2),
+        ("exact_quote", "Other quote"),
+        ("document_sha256", "other-hash"),
+        ("parser_version", "other-parser"),
+        ("source_element_id", None),
+        ("source_char_start", None),
+        ("source_char_end", None),
+        ("source_char_end", 1),
+    ],
+)
+def test_only_matching_verified_span_can_support_citation(change, value):
+    paper_id = uuid4()
+    anchor = CitationAnchor(
+        page_number=1,
+        source_element_id=uuid4(),
+        exact_quote="Alice outperformed Bob.",
+        source_char_start=1,
+        source_char_end=24,
+        document_sha256="paper-hash",
+        parser_version="docling-2",
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        quote=anchor.exact_quote,
+        page_number=1,
+        document_sha256=anchor.document_sha256,
+        parser_version=anchor.parser_version,
+        anchors=[anchor],
+    )
+    assert matching_verified_anchor(evidence) == anchor
+    bad_anchor = anchor.model_copy(update={change: value})
+    assert matching_verified_anchor(evidence.model_copy(update={"anchors": [bad_anchor]})) is None

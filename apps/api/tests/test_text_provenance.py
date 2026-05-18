@@ -148,3 +148,19 @@ startxref
     parser = DocumentParser()
     with pytest.raises(ValueError, match="no selectable text layer"):
         parser.parse(pdf_bytes)
+
+
+def test_docling_failure_does_not_silently_use_pypdf(monkeypatch):
+    parser = DocumentParser(use_docling=True)
+
+    def fail_docling(_pdf_bytes):
+        raise RuntimeError("Docling assets unavailable")
+
+    def unexpected_fallback(_pdf_bytes):
+        raise AssertionError("pypdf fallback must not run")
+
+    monkeypatch.setattr(parser, "_parse_with_docling", fail_docling)
+    monkeypatch.setattr(parser, "_parse_with_pypdf", unexpected_fallback)
+
+    with pytest.raises(RuntimeError, match="Docling assets unavailable"):
+        parser.parse(b"%PDF")

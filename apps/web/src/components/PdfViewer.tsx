@@ -40,6 +40,9 @@ export function findRangeForQuote(
     const textNode = currentNode as Text;
     const text = textNode.nodeValue || "";
     if (text.length > 0) {
+      if (fullText.length > 0 && !/\s$/.test(fullText) && !/^\s/.test(text)) {
+        fullText += " ";
+      }
       textNodes.push({
         node: textNode,
         start: fullText.length,
@@ -121,19 +124,27 @@ export function findRangeForQuote(
 
   const { matchStart, matchEnd } = chosenSpan;
 
-  const startEntry = textNodes.find(
-    (tn) => matchStart >= tn.start && matchStart < tn.end,
-  );
-  const endEntry = textNodes.find(
-    (tn) => matchEnd > tn.start && matchEnd <= tn.end,
-  );
+  const startEntry =
+    textNodes.find((tn) => matchStart >= tn.start && matchStart < tn.end) ||
+    textNodes.find((tn) => matchStart <= tn.end);
+  const endEntry =
+    textNodes.find((tn) => matchEnd > tn.start && matchEnd <= tn.end) ||
+    [...textNodes].reverse().find((tn) => matchEnd >= tn.start);
 
   if (!startEntry || !endEntry) return null;
 
   try {
     const range = document.createRange();
-    range.setStart(startEntry.node, matchStart - startEntry.start);
-    range.setEnd(endEntry.node, matchEnd - endEntry.start);
+    const sOffset = Math.max(
+      0,
+      Math.min(startEntry.node.length, matchStart - startEntry.start),
+    );
+    const eOffset = Math.max(
+      0,
+      Math.min(endEntry.node.length, matchEnd - endEntry.start),
+    );
+    range.setStart(startEntry.node, sOffset);
+    range.setEnd(endEntry.node, eOffset);
     return range;
   } catch {
     return null;
@@ -227,6 +238,10 @@ export default function PdfViewer({
           textLayerDiv.innerHTML = "";
           textLayerDiv.style.width = `${viewport.width}px`;
           textLayerDiv.style.height = `${viewport.height}px`;
+          textLayerDiv.style.setProperty(
+            "--scale-factor",
+            String(viewport.scale),
+          );
 
           if (pdfjsLib.TextLayer) {
             const textLayer = new pdfjsLib.TextLayer({
@@ -304,6 +319,7 @@ export default function PdfViewer({
         approximateY: approxY,
       },
     );
+
     if (!range) {
       setHighlightRects([]);
       setIsExactMatch(false);
@@ -348,7 +364,7 @@ export default function PdfViewer({
       setHighlightRects([]);
       setIsExactMatch(false);
     }
-  }, [activeCitation, paper, currentPage, renderError]);
+  }, [activeCitation, paper, currentPage, renderError, scale, rotation]);
 
   useEffect(() => {
     const frameId = requestAnimationFrame(() => {
@@ -517,7 +533,7 @@ export default function PdfViewer({
           <div
             ref={textLayerRef}
             data-testid="pdf-text-layer"
-            className="absolute inset-0 select-text overflow-hidden opacity-0 pointer-events-auto"
+            className="textLayer absolute inset-0 select-text overflow-hidden opacity-0 pointer-events-auto"
           />
 
           {/* Exact Range.getClientRects() highlights for cited page */}

@@ -6,6 +6,24 @@ from pathlib import Path
 from gold_corpus import GOLD_PAPERS
 
 
+def wrap_text(text: str, max_chars: int = 65) -> list[str]:
+    words = text.split()
+    lines = []
+    cur: list[str] = []
+    cur_len = 0
+    for w in words:
+        if cur_len + len(w) + 1 > max_chars and cur:
+            lines.append(" ".join(cur))
+            cur = [w]
+            cur_len = len(w)
+        else:
+            cur.append(w)
+            cur_len += len(w) + 1
+    if cur:
+        lines.append(" ".join(cur))
+    return lines
+
+
 def generate_pdf_from_pages(pages_text: list[str]) -> bytes:
     """Generate a valid multi-page PDF 1.4 document containing selectable text per page."""
     num_pages = len(pages_text)
@@ -29,9 +47,16 @@ def generate_pdf_from_pages(pages_text: list[str]) -> bytes:
     for i, text in enumerate(pages_text):
         pid = page_obj_ids[i]
         cid = pid + 1
-        # Escape parenthesis in PDF text string
-        escaped_text = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        stream = f"BT\n/F1 12 Tf\n72 700 Td\n({escaped_text}) Tj\nET\n".encode("utf-8")
+        lines = wrap_text(text, max_chars=65)
+        stream_parts = ["BT", "/F1 12 Tf", "16 TL", "72 700 Td"]
+        for line_idx, line in enumerate(lines):
+            esc = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            if line_idx == 0:
+                stream_parts.append(f"({esc}) Tj")
+            else:
+                stream_parts.append(f"T* ({esc}) Tj")
+        stream_parts.append("ET")
+        stream = ("\n".join(stream_parts) + "\n").encode("utf-8")
         write_obj(
             pid,
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
@@ -41,6 +66,7 @@ def generate_pdf_from_pages(pages_text: list[str]) -> bytes:
             cid,
             f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream",
         )
+
 
     write_obj(font_id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 

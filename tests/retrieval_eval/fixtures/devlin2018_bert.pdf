@@ -9,12 +9,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 4 0 obj
-<< /Length 275 >>
+<< /Length 305 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(We introduce a new language representation model called BERT, which stands for Bidirectional Encoder Representations from Transformers. Unlike recent models, BERT is designed to pre-train deep bidirectional representations from unlabeled text.) Tj
+(We introduce a new language representation model called BERT,) Tj
+T* (which stands for Bidirectional Encoder Representations from) Tj
+T* (Transformers. Unlike recent models, BERT is designed to pre-train) Tj
+T* (deep bidirectional representations from unlabeled text.) Tj
 ET
 
 endstream
@@ -23,12 +27,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 6 0 obj
-<< /Length 211 >>
+<< /Length 233 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(The Masked Language Model \(MLM\): In order to train a deep bidirectional representation, we randomly mask 15% of the input tokens at random, and then predict those masked tokens.) Tj
+(The Masked Language Model \(MLM\): In order to train a deep) Tj
+T* (bidirectional representation, we randomly mask 15% of the input) Tj
+T* (tokens at random, and then predict those masked tokens.) Tj
 ET
 
 endstream
@@ -37,12 +44,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 8 0 obj
-<< /Length 282 >>
+<< /Length 312 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Next Sentence Prediction \(NSP\): Many important downstream tasks such as Question Answering and Natural Language Inference are based on understanding the relationship between two sentences. We pre-train for a binarized next sentence prediction task.) Tj
+(Next Sentence Prediction \(NSP\): Many important downstream tasks) Tj
+T* (such as Question Answering and Natural Language Inference are) Tj
+T* (based on understanding the relationship between two sentences. We) Tj
+T* (pre-train for a binarized next sentence prediction task.) Tj
 ET
 
 endstream
@@ -51,12 +62,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 10 0 obj
-<< /Length 177 >>
+<< /Length 199 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(BERT architecture is a multi-layer bidirectional Transformer encoder based on the original Transformer implementation described in Vaswani et al.) Tj
+(BERT architecture is a multi-layer bidirectional Transformer) Tj
+T* (encoder based on the original Transformer implementation) Tj
+T* (described in Vaswani et al.) Tj
 ET
 
 endstream
@@ -65,12 +79,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 12 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 12 0 obj
-<< /Length 195 >>
+<< /Length 217 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(On the GLUE benchmark, BERT achieves an overall score of 80.5%, obtaining substantial improvements across all nine individual tasks including MNLI, QQP, and SST-2.) Tj
+(On the GLUE benchmark, BERT achieves an overall score of 80.5%,) Tj
+T* (obtaining substantial improvements across all nine individual) Tj
+T* (tasks including MNLI, QQP, and SST-2.) Tj
 ET
 
 endstream
@@ -79,12 +96,14 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 14 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 14 0 obj
-<< /Length 155 >>
+<< /Length 169 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Fine-tuning BERT on SQuAD v1.1 question answering achieves 93.2 F1 score, outperforming human performance on the benchmark.) Tj
+(Fine-tuning BERT on SQuAD v1.1 question answering achieves 93.2) Tj
+T* (F1 score, outperforming human performance on the benchmark.) Tj
 ET
 
 endstream
@@ -99,18 +118,18 @@ xref
 0000000058 00000 n 
 0000000147 00000 n 
 0000000274 00000 n 
-0000000600 00000 n 
-0000000727 00000 n 
-0000000989 00000 n 
-0000001116 00000 n 
-0000001449 00000 n 
-0000001577 00000 n 
-0000001806 00000 n 
-0000001935 00000 n 
-0000002182 00000 n 
-0000002311 00000 n 
-0000002518 00000 n 
+0000000630 00000 n 
+0000000757 00000 n 
+0000001041 00000 n 
+0000001168 00000 n 
+0000001531 00000 n 
+0000001659 00000 n 
+0000001910 00000 n 
+0000002039 00000 n 
+0000002308 00000 n 
+0000002437 00000 n 
+0000002658 00000 n 
 trailer << /Size 16 /Root 1 0 R >>
 startxref
-2589
+2729
 %%EOF

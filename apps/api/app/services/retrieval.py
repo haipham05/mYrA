@@ -304,7 +304,10 @@ class HybridRetriever:
             )
             elem_ids = [ce.element_id for ce in chunk_elements]
             source_elements = (
-                db.query(PaperElement).filter(PaperElement.id.in_(elem_ids)).all()
+                db.query(PaperElement)
+                .filter(PaperElement.id.in_(elem_ids))
+                .order_by(PaperElement.element_index.asc())
+                .all()
                 if elem_ids
                 else []
             )
@@ -345,8 +348,15 @@ class HybridRetriever:
                         best_elem = elem
 
                 page_number = best_elem.page_number
-                exact_quote = best_elem.text
+                page_source_elems = [e for e in source_elements if e.page_number == page_number]
+                if len(page_source_elems) > 1:
+                    exact_quote = " ".join(e.text for e in page_source_elems)
+                else:
+                    exact_quote = best_elem.text
                 parser_ver = best_elem.parser_version
+
+                primary_page_text: str | None = None
+                is_valid_provenance = bool(paper and paper.document_sha256 and parser_ver)
 
                 for elem in source_elements:
                     elem_boxes: list[BoundingBox] = []
@@ -388,14 +398,15 @@ class HybridRetriever:
                         )
                         page_text = " ".join(pe.text for pe in page_elems)
 
+                    if elem.page_number == page_number:
+                        primary_page_text = page_text
+
                     # Require valid document SHA-256 and parser version
-                    is_valid_provenance = bool(
-                        paper and paper.document_sha256 and elem.parser_version
-                    )
+                    elem_provenance = bool(paper and paper.document_sha256 and elem.parser_version)
 
                     span = (
                         find_verbatim_span(page_text, elem.text, context=chunk.text)
-                        if is_valid_provenance
+                        if elem_provenance
                         else None
                     )
 
@@ -403,7 +414,7 @@ class HybridRetriever:
                         start_char, end_char = span
                         anchor_status = AnchorStatus.VERIFIED
                         verified_boxes = elem_boxes
-                    elif not is_valid_provenance:
+                    elif not elem_provenance:
                         start_char, end_char = None, None
                         anchor_status = (
                             AnchorStatus.LEGACY
@@ -432,6 +443,25 @@ class HybridRetriever:
                             bounding_boxes=verified_boxes,
                         )
                     )
+
+                if len(page_source_elems) > 1 and is_valid_provenance and primary_page_text:
+                    comb_span = find_verbatim_span(
+                        primary_page_text, exact_quote, context=chunk.text
+                    )
+                    if comb_span is not None:
+                        anchors.append(
+                            CitationAnchor(
+                                page_number=page_number,
+                                source_element_id=best_elem.id,
+                                exact_quote=exact_quote,
+                                source_char_start=comb_span[0],
+                                source_char_end=comb_span[1],
+                                document_sha256=paper.document_sha256 if paper else None,
+                                parser_version=parser_ver,
+                                anchor_status=AnchorStatus.VERIFIED,
+                                bounding_boxes=list(bboxes),
+                            )
+                        )
 
             evidence_items.append(
                 EvidenceItem(

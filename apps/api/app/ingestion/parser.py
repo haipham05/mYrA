@@ -180,7 +180,7 @@ class ParseResult:
 class DocumentParser:
     """PDF parser extracting canonical pages and elements with true bounding coordinates.
 
-    Uses Docling canonical document representation when available, falling back to pypdf.
+    Docling is required by default. pypdf is an explicitly selected demo/test parser.
     """
 
     def __init__(self, use_docling: bool | None = None) -> None:
@@ -193,10 +193,7 @@ class DocumentParser:
 
     def parse(self, pdf_bytes: bytes) -> ParseResult:
         if self.use_docling:
-            try:
-                return self._parse_with_docling(pdf_bytes)
-            except Exception:
-                return self._parse_with_pypdf(pdf_bytes)
+            return self._parse_with_docling(pdf_bytes)
         return self._parse_with_pypdf(pdf_bytes)
 
     def _parse_with_docling(self, pdf_bytes: bytes) -> ParseResult:

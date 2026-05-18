@@ -135,11 +135,7 @@ async def test_full_provenance_roundtrip(test_db_session):
     assert verified_anchor.document_sha256 == paper.document_sha256
 
     # Verify claim support and chat generation
-    fake_llm = FakeLLMProvider(
-        fixed_response=(
-            "The model utilizes Scaled Dot-Product Attention to compute inner products [E1]."
-        )
-    )
+    fake_llm = FakeLLMProvider()
     set_llm_provider(fake_llm)
 
     conv = create_conversation(db, project_id=project.id, title="QA")

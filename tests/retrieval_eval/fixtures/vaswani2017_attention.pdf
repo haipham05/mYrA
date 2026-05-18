@@ -9,12 +9,17 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 4 0 obj
-<< /Length 309 >>
+<< /Length 347 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(The dominant sequence transduction models are based on complex recurrent or convolutional neural networks. We propose the Transformer, a model architecture eschewing recurrence and entirely relying on an attention mechanism to draw global dependencies between input and output.) Tj
+(The dominant sequence transduction models are based on complex) Tj
+T* (recurrent or convolutional neural networks. We propose the) Tj
+T* (Transformer, a model architecture eschewing recurrence and) Tj
+T* (entirely relying on an attention mechanism to draw global) Tj
+T* (dependencies between input and output.) Tj
 ET
 
 endstream
@@ -23,12 +28,17 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 6 0 obj
-<< /Length 309 >>
+<< /Length 347 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(An attention function can be described as mapping a query and a set of key-value pairs to an output. The output is computed as a weighted sum of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key.) Tj
+(An attention function can be described as mapping a query and a) Tj
+T* (set of key-value pairs to an output. The output is computed as a) Tj
+T* (weighted sum of the values, where the weight assigned to each) Tj
+T* (value is computed by a compatibility function of the query with) Tj
+T* (the corresponding key.) Tj
 ET
 
 endstream
@@ -37,12 +47,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 8 0 obj
-<< /Length 291 >>
+<< /Length 321 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Scaled Dot-Product Attention: We compute the attention function on a set of queries simultaneously, packed together into a matrix Q. The keys and values are also packed into matrices K and V. We compute the matrix of outputs as softmax\(QK^T / sqrt\(d_k\)\)V.) Tj
+(Scaled Dot-Product Attention: We compute the attention function) Tj
+T* (on a set of queries simultaneously, packed together into a matrix) Tj
+T* (Q. The keys and values are also packed into matrices K and V. We) Tj
+T* (compute the matrix of outputs as softmax\(QK^T / sqrt\(d_k\)\)V.) Tj
 ET
 
 endstream
@@ -51,12 +65,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 10 0 obj
-<< /Length 278 >>
+<< /Length 308 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Multi-Head Attention: Instead of performing a single attention function with d_model-dimensional keys, values and queries, we found it beneficial to linearly project the queries, keys and values h times with different, learned linear projections.) Tj
+(Multi-Head Attention: Instead of performing a single attention) Tj
+T* (function with d_model-dimensional keys, values and queries, we) Tj
+T* (found it beneficial to linearly project the queries, keys and) Tj
+T* (values h times with different, learned linear projections.) Tj
 ET
 
 endstream
@@ -65,12 +83,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 12 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 12 0 obj
-<< /Length 263 >>
+<< /Length 293 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Positional Encoding: Since our model contains no recurrence and no convolution, in order for the model to make use of the order of the sequence, we must inject some information about the relative or absolute position of the tokens.) Tj
+(Positional Encoding: Since our model contains no recurrence and) Tj
+T* (no convolution, in order for the model to make use of the order) Tj
+T* (of the sequence, we must inject some information about the) Tj
+T* (relative or absolute position of the tokens.) Tj
 ET
 
 endstream
@@ -79,12 +101,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 14 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 14 0 obj
-<< /Length 217 >>
+<< /Length 239 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(On the WMT 2014 English-to-German translation task, the big transformer model achieves a state-of-the-art BLEU score of 28.4, outperforming the best existing models including ensembles.) Tj
+(On the WMT 2014 English-to-German translation task, the big) Tj
+T* (transformer model achieves a state-of-the-art BLEU score of 28.4,) Tj
+T* (outperforming the best existing models including ensembles.) Tj
 ET
 
 endstream
@@ -99,18 +124,18 @@ xref
 0000000058 00000 n 
 0000000147 00000 n 
 0000000274 00000 n 
-0000000634 00000 n 
-0000000761 00000 n 
-0000001121 00000 n 
-0000001248 00000 n 
-0000001590 00000 n 
-0000001718 00000 n 
-0000002048 00000 n 
-0000002177 00000 n 
-0000002492 00000 n 
-0000002621 00000 n 
-0000002890 00000 n 
+0000000672 00000 n 
+0000000799 00000 n 
+0000001197 00000 n 
+0000001324 00000 n 
+0000001696 00000 n 
+0000001824 00000 n 
+0000002184 00000 n 
+0000002313 00000 n 
+0000002658 00000 n 
+0000002787 00000 n 
+0000003078 00000 n 
 trailer << /Size 16 /Root 1 0 R >>
 startxref
-2961
+3149
 %%EOF

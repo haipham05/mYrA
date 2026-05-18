@@ -74,10 +74,9 @@ class FakeLLMProvider(LLMProvider):
                 m = re.search(r'\[E1\][^\n]*\n"([^"]+)"', user_prompt)
             if m:
                 quote_text = m.group(1).strip()
-                words = [w for w in re.findall(r"\w+", quote_text) if len(w) > 3]
-                snippet = " ".join(words[:4]) if words else "the cited evidence"
-                return f"The research demonstrates {snippet} [E1]."
-            return "Based on the provided research papers, significant results were found [E1]."
+                if quote_text:
+                    return f"{quote_text.rstrip('.')} [E1]."
+            return "Insufficient evidence available in the uploaded papers to answer this question."
         return "Insufficient evidence available in the uploaded papers to answer this question."
 
 
@@ -91,7 +90,7 @@ def get_llm_provider(settings: Settings | None = None, mode: str | None = None) 
 
     import os
 
-    effective_mode = mode or os.getenv("MYRA_LLM_MODE", "auto").lower()
+    effective_mode = (mode or os.getenv("MYRA_LLM_MODE", "deepseek")).lower()
 
     if settings is None:
         settings = Settings.from_environment()
@@ -106,13 +105,10 @@ def get_llm_provider(settings: Settings | None = None, mode: str | None = None) 
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
         )
-    elif settings.deepseek_api_key:
-        _llm_instance = DeepSeekLLMProvider(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-        )
-    else:
+    elif effective_mode in ("test", "demo"):
         _llm_instance = FakeLLMProvider()
+    else:
+        raise ValueError(f"Unknown MYRA_LLM_MODE: {effective_mode}")
 
     return _llm_instance
 

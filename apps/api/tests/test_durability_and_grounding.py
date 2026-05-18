@@ -20,11 +20,14 @@ from app.services.llm import FakeLLMProvider, set_llm_provider
 client = TestClient(app)
 
 
-def test_claim_support_overlap_function():
-    # Valid overlap
+def test_claim_support_requires_ordered_extract():
+    # Shared vocabulary alone cannot establish a claim's relationship.
     claim = "The Transformer model uses self-attention mechanisms."
     quote = "We introduce the Transformer, architecture relying entirely on self-attention."
-    assert check_claim_support(claim, quote) is True
+    assert check_claim_support(claim, quote) is False
+    assert check_claim_support(
+        "Transformer architecture relying entirely on self-attention.", quote
+    )
 
     # Complete mismatch / hallucination
     unrelated_quote = "Baking cookies requires sugar, flour, and butter at 350 degrees."
@@ -265,6 +268,17 @@ def test_adversarial_claim_grounding_direct():
         "on the English-to-German task."
     )
     assert check_claim_support("The Transformer achieves a BLEU score of 28.4.", quote_text) is True
+
+    assert check_claim_support("Alice outperformed Bob.", "Bob outperformed Alice.") is False
+    assert (
+        check_claim_support(
+            "Model A scored 90 and Model B scored 80.",
+            "Model A scored 80 and Model B scored 90.",
+        )
+        is False
+    )
+    assert check_claim_support("The dose was 90 mg.", "The dose was 90 kg.") is False
+    assert check_claim_support("The accuracy was 90%.", "The accuracy was 90.") is False
 
 
 @pytest.mark.anyio

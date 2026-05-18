@@ -9,12 +9,17 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 4 0 obj
-<< /Length 288 >>
+<< /Length 326 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(The promise of quantum computers is that certain computational tasks might be executed exponentially faster on a quantum processor than on a classical computer. We demonstrate quantum supremacy using a programmable superconducting processor named Sycamore.) Tj
+(The promise of quantum computers is that certain computational) Tj
+T* (tasks might be executed exponentially faster on a quantum) Tj
+T* (processor than on a classical computer. We demonstrate quantum) Tj
+T* (supremacy using a programmable superconducting processor named) Tj
+T* (Sycamore.) Tj
 ET
 
 endstream
@@ -23,12 +28,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 6 0 obj
-<< /Length 210 >>
+<< /Length 232 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Our Sycamore processor consists of a two-dimensional array of 54 transmon qubits, where each qubit is capacitively coupled to four nearest neighbors in a square lattice geometry.) Tj
+(Our Sycamore processor consists of a two-dimensional array of 54) Tj
+T* (transmon qubits, where each qubit is capacitively coupled to four) Tj
+T* (nearest neighbors in a square lattice geometry.) Tj
 ET
 
 endstream
@@ -37,12 +45,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 8 0 obj
-<< /Length 224 >>
+<< /Length 246 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Cross-entropy benchmarking fidelity: We assess the fidelity of our quantum circuits by comparing the probability distribution of measured bitstrings with the simulated classical probabilities.) Tj
+(Cross-entropy benchmarking fidelity: We assess the fidelity of) Tj
+T* (our quantum circuits by comparing the probability distribution of) Tj
+T* (measured bitstrings with the simulated classical probabilities.) Tj
 ET
 
 endstream
@@ -51,12 +62,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 10 0 obj
-<< /Length 243 >>
+<< /Length 273 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(The Sycamore processor took approximately 200 seconds to sample one instance of a quantum circuit a million times, whereas a state-of-the-art classical supercomputer would require 10,000 years for the same task.) Tj
+(The Sycamore processor took approximately 200 seconds to sample) Tj
+T* (one instance of a quantum circuit a million times, whereas a) Tj
+T* (state-of-the-art classical supercomputer would require 10,000) Tj
+T* (years for the same task.) Tj
 ET
 
 endstream
@@ -65,12 +80,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 12 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 12 0 obj
-<< /Length 208 >>
+<< /Length 230 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Quantum error correction will be required to achieve fault-tolerant general-purpose quantum computing. Surface codes with physical error rates below threshold are demonstrated.) Tj
+(Quantum error correction will be required to achieve) Tj
+T* (fault-tolerant general-purpose quantum computing. Surface codes) Tj
+T* (with physical error rates below threshold are demonstrated.) Tj
 ET
 
 endstream
@@ -79,12 +97,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 14 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 14 0 obj
-<< /Length 187 >>
+<< /Length 209 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Calibration of single-qubit microwave drive pulses and two-qubit couplers is performed using randomized benchmarking and continuous parameter optimization.) Tj
+(Calibration of single-qubit microwave drive pulses and two-qubit) Tj
+T* (couplers is performed using randomized benchmarking and) Tj
+T* (continuous parameter optimization.) Tj
 ET
 
 endstream
@@ -99,18 +120,18 @@ xref
 0000000058 00000 n 
 0000000147 00000 n 
 0000000274 00000 n 
-0000000613 00000 n 
-0000000740 00000 n 
-0000001001 00000 n 
-0000001128 00000 n 
-0000001403 00000 n 
-0000001531 00000 n 
-0000001826 00000 n 
-0000001955 00000 n 
-0000002215 00000 n 
-0000002344 00000 n 
-0000002583 00000 n 
+0000000651 00000 n 
+0000000778 00000 n 
+0000001061 00000 n 
+0000001188 00000 n 
+0000001485 00000 n 
+0000001613 00000 n 
+0000001938 00000 n 
+0000002067 00000 n 
+0000002349 00000 n 
+0000002478 00000 n 
+0000002739 00000 n 
 trailer << /Size 16 /Root 1 0 R >>
 startxref
-2654
+2810
 %%EOF

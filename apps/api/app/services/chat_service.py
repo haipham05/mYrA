@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.crud.chat import add_message, get_conversation
 from app.db.models import Message
 from app.schemas.chat import MessageResponse, MessageRole
-from app.schemas.evidence import AnchorStatus, Citation, EvidenceItem
+from app.schemas.evidence import AnchorStatus, Citation, CitationAnchor, EvidenceItem
 from app.services.llm import get_llm_provider
 from app.services.retrieval import HybridRetriever
 
@@ -16,32 +16,20 @@ logger = logging.getLogger("myra.chat")
 
 
 def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
-    """Validate factual claim-to-cite support.
+    """Accept only extractive claims whose tokens retain the quote's order.
 
-    Enforces:
-    1. Numeric consistency: All numbers in the claim must exist in the atomic quote.
-    2. Negation consistency: Polarity must match; reject positive claims on negated
-       quotes or vice-versa.
-    3. Directional / relational consistency: Reject opposing antonym pairs (e.g.
-       increase vs decrease).
-    4. Lexical grounding: Core content words must be substantiated by the atomic quote.
+    Word-set overlap is not evidence of a relationship: it accepts reversed actors
+    and swapped measurements. This intentionally rejects many valid paraphrases;
+    uncertain model output must abstain rather than invent a supported claim.
     """
     if not claim_text.strip() or not evidence_quote.strip():
         return False
 
-    # 1. Numeric consistency
-    def extract_numbers(text: str) -> set[float]:
-        nums: set[float] = set()
-        for token in re.findall(r"\b\d+(?:\.\d+)?%?\b", text):
-            try:
-                nums.add(float(token.rstrip("%")))
-            except ValueError:
-                pass
-        return nums
-
-    claim_nums = extract_numbers(claim_text)
-    quote_nums = extract_numbers(evidence_quote)
-    if claim_nums and not claim_nums.issubset(quote_nums):
+    # Keep number/unit tokens intact: 90%, 90, and 90 mg are not interchangeable.
+    token_pattern = r"\d+(?:\.\d+)?%?|[a-zA-Z]+"
+    claim_tokens = re.findall(token_pattern, claim_text.lower())
+    quote_tokens = re.findall(token_pattern, evidence_quote.lower())
+    if len(claim_tokens) < 3 or not quote_tokens:
         return False
 
     # 2. Negation consistency
@@ -96,65 +84,37 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
         ):
             return False
 
-    # 4. Lexical content overlap
-    stop_words = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "in",
-        "on",
-        "at",
-        "to",
-        "for",
-        "with",
-        "of",
-        "by",
-        "from",
-        "as",
-        "is",
-        "was",
-        "are",
-        "were",
-        "be",
-        "been",
-        "being",
-        "have",
-        "has",
-        "had",
-        "do",
-        "does",
-        "did",
-        "this",
-        "that",
-        "these",
-        "those",
-        "it",
-        "its",
-        "they",
-        "their",
-        "we",
-        "our",
-        "you",
-        "your",
-        "based",
-        "according",
-        "also",
-        "furthermore",
-        "however",
-    }
-    claim_content = {w for w in claim_words if len(w) > 2 and w not in stop_words}
-    quote_content = {w for w in quote_words if len(w) > 2 and w not in stop_words}
+    # A monotonic subsequence allows small descriptive insertions in the source,
+    # but cannot swap actors, values, negation scope, or comparison direction.
+    position = 0
+    for token in claim_tokens:
+        while position < len(quote_tokens) and quote_tokens[position] != token:
+            position += 1
+        if position == len(quote_tokens):
+            return False
+        position += 1
+    return True
 
-    if not claim_content or not quote_content:
-        return False
 
-    overlap = claim_content.intersection(quote_content)
-    overlap_ratio = len(overlap) / len(claim_content)
-
-    return overlap_ratio >= 0.5 or (len(claim_content) <= 3 and len(overlap) >= 2)
+def matching_verified_anchor(evidence: EvidenceItem) -> CitationAnchor | None:
+    if not evidence.document_sha256 or not evidence.parser_version:
+        return None
+    return next(
+        (
+            anchor
+            for anchor in evidence.anchors
+            if anchor.anchor_status == AnchorStatus.VERIFIED
+            and anchor.page_number == evidence.page_number
+            and anchor.exact_quote == evidence.quote
+            and anchor.document_sha256 == evidence.document_sha256
+            and anchor.parser_version == evidence.parser_version
+            and anchor.source_element_id is not None
+            and anchor.source_char_start is not None
+            and anchor.source_char_end is not None
+            and anchor.source_char_end > anchor.source_char_start
+        ),
+        None,
+    )
 
 
 class ChatService:
@@ -259,7 +219,9 @@ class ChatService:
                 e_id = f"E{m.group(1)}"
                 evidence = evidence_map[e_id]
                 clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
-                if not check_claim_support(clean_claim, evidence.quote):
+                if not matching_verified_anchor(evidence) or not check_claim_support(
+                    clean_claim, evidence.quote
+                ):
                     sentence_supported = False
                     break
 
@@ -274,18 +236,7 @@ class ChatService:
                     evidence = evidence_map[e_id]
                     citation_to_display_index[e_id] = display_idx
                     # Determine anchor status specifically for the displayed quote and page
-                    matching_anchor = None
-                    if evidence.anchors:
-                        for a in evidence.anchors:
-                            if (
-                                a.page_number == evidence.page_number
-                                and a.exact_quote == evidence.quote
-                            ):
-                                matching_anchor = a
-                                break
-                        if not matching_anchor:
-                            matching_anchor = evidence.anchors[0]
-
+                    matching_anchor = matching_verified_anchor(evidence)
                     anchor_status = (
                         matching_anchor.anchor_status
                         if matching_anchor

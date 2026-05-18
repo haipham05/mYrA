@@ -9,12 +9,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 4 0 obj
-<< /Length 206 >>
+<< /Length 228 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Retrieval-augmented generation often suffers from hallucinations and misattributed citations where generated text points to incorrect document pages or fabricated statements.) Tj
+(Retrieval-augmented generation often suffers from hallucinations) Tj
+T* (and misattributed citations where generated text points to) Tj
+T* (incorrect document pages or fabricated statements.) Tj
 ET
 
 endstream
@@ -23,12 +26,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 6 0 obj
-<< /Length 212 >>
+<< /Length 242 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Verbatim text span alignment maps retrieved chunk elements directly to PDF selectable text layer character spans, eliminating arbitrary percentage overlays and fake bounding boxes.) Tj
+(Verbatim text span alignment maps retrieved chunk elements) Tj
+T* (directly to PDF selectable text layer character spans,) Tj
+T* (eliminating arbitrary percentage overlays and fake bounding) Tj
+T* (boxes.) Tj
 ET
 
 endstream
@@ -37,12 +44,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 8 0 obj
-<< /Length 183 >>
+<< /Length 205 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Hybrid retrieval combines dense vector embeddings with PostgreSQL tsvector full-text search, merged through reciprocal rank fusion with parameter k=60.) Tj
+(Hybrid retrieval combines dense vector embeddings with) Tj
+T* (PostgreSQL tsvector full-text search, merged through reciprocal) Tj
+T* (rank fusion with parameter k=60.) Tj
 ET
 
 endstream
@@ -51,12 +61,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 10 0 obj
-<< /Length 171 >>
+<< /Length 193 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Multilingual cross-encoder reranking re-evaluates top 40 candidate chunks to distill the top 6 evidence items with minimal positional bias.) Tj
+(Multilingual cross-encoder reranking re-evaluates top 40) Tj
+T* (candidate chunks to distill the top 6 evidence items with minimal) Tj
+T* (positional bias.) Tj
 ET
 
 endstream
@@ -65,12 +78,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 12 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 12 0 obj
-<< /Length 178 >>
+<< /Length 200 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Bounding box origin normalization converts PDF bottom-left points into standard top-left DOM coordinates for synchronized PDF.js viewer rendering.) Tj
+(Bounding box origin normalization converts PDF bottom-left) Tj
+T* (points into standard top-left DOM coordinates for synchronized) Tj
+T* (PDF.js viewer rendering.) Tj
 ET
 
 endstream
@@ -79,12 +95,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 14 0 R /Resources << /Font << /F1 15 0 R >> >> >>
 endobj
 14 0 obj
-<< /Length 198 >>
+<< /Length 220 >>
 stream
 BT
 /F1 12 Tf
+16 TL
 72 700 Td
-(Claim-to-citation validation checks semantic support between the generated assertion and the referenced source span, demoting unsupported claims to unresolved status.) Tj
+(Claim-to-citation validation checks semantic support between the) Tj
+T* (generated assertion and the referenced source span, demoting) Tj
+T* (unsupported claims to unresolved status.) Tj
 ET
 
 endstream
@@ -99,18 +118,18 @@ xref
 0000000058 00000 n 
 0000000147 00000 n 
 0000000274 00000 n 
-0000000531 00000 n 
-0000000658 00000 n 
-0000000921 00000 n 
-0000001048 00000 n 
-0000001282 00000 n 
-0000001410 00000 n 
-0000001633 00000 n 
-0000001762 00000 n 
-0000001992 00000 n 
-0000002121 00000 n 
-0000002371 00000 n 
+0000000553 00000 n 
+0000000680 00000 n 
+0000000973 00000 n 
+0000001100 00000 n 
+0000001356 00000 n 
+0000001484 00000 n 
+0000001729 00000 n 
+0000001858 00000 n 
+0000002110 00000 n 
+0000002239 00000 n 
+0000002511 00000 n 
 trailer << /Size 16 /Root 1 0 R >>
 startxref
-2442
+2582
 %%EOF

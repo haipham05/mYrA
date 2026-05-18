@@ -18,7 +18,8 @@ export default function Home() {
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [isAsking, setIsAsking] = useState(false);
 
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+  const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+  const apiUrl = rawApiUrl.replace("localhost", "127.0.0.1");
 
   // 1. Health check
   useEffect(() => {
