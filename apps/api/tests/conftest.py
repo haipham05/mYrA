@@ -11,7 +11,7 @@ os.environ["GCS_BUCKET_NAME"] = ""
 os.environ["DEEPSEEK_API_KEY"] = ""
 os.environ["MYRA_LLM_MODE"] = "test"
 os.environ["MYRA_EMBEDDING_PROVIDER"] = "deterministic"
-os.environ["MYRA_USE_BGE_RERANKER"] = "false"
+os.environ["MYRA_RERANKER_PROVIDER"] = "simple-lexical"
 os.environ["MYRA_USE_DOCLING"] = "false"
 
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { Citation, Paper } from "@/types";
 
 interface PdfViewerProps {
@@ -23,11 +24,6 @@ export interface HighlightRect {
 export function findRangeForQuote(
   container: HTMLElement,
   targetQuote: string,
-  options?: {
-    preferredCharStart?: number | null;
-    approximateY?: number | null;
-    occurrenceIndex?: number;
-  },
 ): Range | null {
   if (!targetQuote || !targetQuote.trim()) return null;
 
@@ -100,29 +96,10 @@ export function findRangeForQuote(
     }
   }
 
-  if (candidateSpans.length === 0) return null;
-
-  // Disambiguate if multiple occurrences found
-  let chosenSpan = candidateSpans[0];
-  if (candidateSpans.length > 1) {
-    if (options?.preferredCharStart != null) {
-      let minDiff = Infinity;
-      for (const span of candidateSpans) {
-        const diff = Math.abs(span.matchStart - options.preferredCharStart);
-        if (diff < minDiff) {
-          minDiff = diff;
-          chosenSpan = span;
-        }
-      }
-    } else if (
-      options?.occurrenceIndex != null &&
-      options.occurrenceIndex < candidateSpans.length
-    ) {
-      chosenSpan = candidateSpans[options.occurrenceIndex];
-    }
-  }
-
-  const { matchStart, matchEnd } = chosenSpan;
+  // Parser offsets and PDF.js text-item offsets are not the same coordinate
+  // system. A duplicate phrase has no safe occurrence identity yet.
+  if (candidateSpans.length !== 1) return null;
+  const { matchStart, matchEnd } = candidateSpans[0];
 
   const startEntry =
     textNodes.find((tn) => matchStart >= tn.start && matchStart < tn.end) ||
@@ -166,10 +143,18 @@ export default function PdfViewer({
   const [textLayerReady, setTextLayerReady] = useState<number>(0);
 
   const [renderError, setRenderError] = useState<string | null>(null);
+  const [servedDocument, setServedDocument] = useState<{
+    paperId: string;
+    sha256: string;
+  } | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
+  const documentRef = useRef<{
+    key: string;
+    promise: Promise<{ pdfDoc: PDFDocumentProxy; sha256: string }>;
+  } | null>(null);
 
   // Sync active citation page
   if (activeCitation !== prevCitation) {
@@ -182,6 +167,8 @@ export default function PdfViewer({
       ? activeCitation.page_number
       : 1;
   const currentPage = userPage ?? citationPage;
+  const paperId = paper?.id;
+  const paperHash = paper?.document_sha256;
 
   // Handle PDF document rendering with PDF.js
   useEffect(() => {
@@ -198,10 +185,27 @@ export default function PdfViewer({
         }
 
         const docUrl = `${apiUrl}/api/v1/papers/${paper.id}/document`;
-        const loadingTask = pdfjsLib.getDocument({ url: docUrl });
-        const pdfDoc = await loadingTask.promise;
+        const documentKey = `${docUrl}:${paper.document_sha256 ?? "unversioned"}`;
+        if (documentRef.current?.key !== documentKey) {
+          const promise = (async () => {
+            const response = await fetch(docUrl, { cache: "no-store" });
+            if (!response.ok) throw new Error("Failed to load the source PDF");
+            const data = await response.arrayBuffer();
+            const digest = await crypto.subtle.digest("SHA-256", data);
+            const sha256 = Array.from(new Uint8Array(digest), (byte) =>
+              byte.toString(16).padStart(2, "0"),
+            ).join("");
+            const pdfDoc = await pdfjsLib.getDocument({
+              data: new Uint8Array(data),
+            }).promise;
+            return { pdfDoc, sha256 };
+          })();
+          documentRef.current = { key: documentKey, promise };
+        }
+        const { pdfDoc, sha256 } = await documentRef.current.promise;
 
         if (cancelled) return;
+        setServedDocument({ paperId: paper.id, sha256 });
 
         const page = await pdfDoc.getPage(currentPage);
         if (cancelled) return;
@@ -259,6 +263,7 @@ export default function PdfViewer({
         }
       } catch (err) {
         if (!cancelled) {
+          documentRef.current = null;
           setRenderError(
             err instanceof Error ? err.message : "Failed to render PDF page",
           );
@@ -273,6 +278,21 @@ export default function PdfViewer({
     };
   }, [paper, currentPage, scale, rotation, apiUrl]);
 
+  useEffect(() => {
+    const key = paperId
+      ? `${apiUrl}/api/v1/papers/${paperId}/document:${paperHash ?? "unversioned"}`
+      : null;
+    return () => {
+      const cached = documentRef.current;
+      if (cached && cached.key === key) {
+        documentRef.current = null;
+        void cached.promise
+          .then(({ pdfDoc }) => pdfDoc.destroy())
+          .catch(() => {});
+      }
+    };
+  }, [paperId, paperHash, apiUrl]);
+
   // Compute exact character highlights using DOM Range.getClientRects()
   const recomputeHighlights = useCallback(() => {
     const isCurrentPageCited = Boolean(
@@ -281,23 +301,32 @@ export default function PdfViewer({
       activeCitation.page_number === currentPage,
     );
 
-    const matchingAnchor = activeCitation?.anchors?.find(
-      (a) => a.page_number === currentPage,
+    const matchingAnchors = activeCitation?.anchors?.filter(
+      (a) =>
+        a.page_number === currentPage &&
+        a.exact_quote === activeCitation.quote &&
+        a.anchor_status === "verified" &&
+        a.document_sha256 === activeCitation.document_sha256 &&
+        a.parser_version === activeCitation.parser_version &&
+        a.source_element_id &&
+        a.source_char_start != null &&
+        a.source_char_end != null &&
+        a.source_char_end > a.source_char_start,
     );
-
-    const isVerified =
-      activeCitation?.anchor_status === "verified" ||
-      matchingAnchor?.anchor_status === "verified";
-
-    const isHashMatched =
-      !paper?.document_sha256 ||
-      !activeCitation?.document_sha256 ||
-      paper.document_sha256 === activeCitation.document_sha256;
+    const hasOneMatchingAnchor = matchingAnchors?.length === 1;
+    const isHashMatched = Boolean(
+      paper?.document_sha256 &&
+      activeCitation?.document_sha256 &&
+      paper.document_sha256 === activeCitation.document_sha256 &&
+      servedDocument?.paperId === paper.id &&
+      servedDocument.sha256 === paper.document_sha256,
+    );
 
     if (
       !isCurrentPageCited ||
       !activeCitation ||
-      !isVerified ||
+      activeCitation.anchor_status !== "verified" ||
+      !hasOneMatchingAnchor ||
       !isHashMatched ||
       !activeCitation.quote ||
       !textLayerRef.current ||
@@ -308,17 +337,7 @@ export default function PdfViewer({
       return;
     }
 
-    const preferredStart = matchingAnchor?.source_char_start ?? null;
-    const approxY = matchingAnchor?.bounding_boxes?.[0]?.y_min ?? null;
-
-    const range = findRangeForQuote(
-      textLayerRef.current,
-      activeCitation.quote,
-      {
-        preferredCharStart: preferredStart,
-        approximateY: approxY,
-      },
-    );
+    const range = findRangeForQuote(textLayerRef.current, activeCitation.quote);
 
     if (!range) {
       setHighlightRects([]);
@@ -364,7 +383,7 @@ export default function PdfViewer({
       setHighlightRects([]);
       setIsExactMatch(false);
     }
-  }, [activeCitation, paper, currentPage, renderError, scale, rotation]);
+  }, [activeCitation, paper, currentPage, renderError, servedDocument]);
 
   useEffect(() => {
     const frameId = requestAnimationFrame(() => {

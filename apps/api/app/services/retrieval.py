@@ -66,8 +66,13 @@ class SimpleLexicalReranker(RerankerProvider):
 class BGERerankerProvider(RerankerProvider):
     """BGE multilingual cross-encoder reranker with lazy initialization."""
 
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3") -> None:
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-reranker-v2-m3",
+        model_version: str = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+    ) -> None:
         self._model_name = model_name
+        self.model_version = model_version
         self._model = None
 
     @property
@@ -79,11 +84,13 @@ class BGERerankerProvider(RerankerProvider):
             try:
                 from sentence_transformers import CrossEncoder
 
-                self._model = CrossEncoder(self._model_name)
+                self._model = CrossEncoder(
+                    self._model_name, revision=self.model_version, local_files_only=True
+                )
             except Exception as err:
                 raise RuntimeError(
-                    f"Production reranker {self._model_name} requested "
-                    f"but could not be loaded: {err}"
+                    f"Pinned reranker {self._model_name}@{self.model_version} is not "
+                    "available locally. Provision the approved model cache before retrieval."
                 ) from err
         return self._model
 
@@ -104,11 +111,13 @@ _reranker_instance: RerankerProvider | None = None
 def get_reranker() -> RerankerProvider:
     global _reranker_instance
     if _reranker_instance is None:
-        use_bge = os.getenv("MYRA_USE_BGE_RERANKER", "false").lower() in ("true", "1")
-        if use_bge:
+        provider_type = os.getenv("MYRA_RERANKER_PROVIDER", "bge").lower()
+        if provider_type == "bge":
             _reranker_instance = BGERerankerProvider()
-        else:
+        elif provider_type in ("test", "demo", "simple-lexical"):
             _reranker_instance = SimpleLexicalReranker()
+        else:
+            raise ValueError(f"Unknown MYRA_RERANKER_PROVIDER: {provider_type}")
     return _reranker_instance
 
 
@@ -136,6 +145,8 @@ class HybridRetriever:
         project_id: UUID,
         query: str,
         query_vec: list[float],
+        embedding_model: str,
+        embedding_version: str,
     ) -> list[PaperChunk]:
         """Execute database-native pgvector cosine distance and PostgreSQL full-text search."""
         vec_str = "[" + ",".join(str(float(x)) for x in query_vec) + "]"
@@ -149,6 +160,8 @@ class HybridRetriever:
               AND p.status = 'READY'
               AND pc.chunk_type = 'child'
               AND pc.embedding_vec IS NOT NULL
+              AND pc.embedding_model = :embedding_model
+              AND pc.embedding_version = :embedding_version
             ORDER BY pc.embedding_vec <=> :query_vec ASC
             LIMIT :limit;
         """)
@@ -157,6 +170,8 @@ class HybridRetriever:
             {
                 "project_id": project_id,
                 "query_vec": vec_str,
+                "embedding_model": embedding_model,
+                "embedding_version": embedding_version,
                 "limit": self.top_candidates,
             },
         ).fetchall()
@@ -210,6 +225,8 @@ class HybridRetriever:
         project_id: UUID,
         query: str,
         query_vec: list[float],
+        embedding_model: str,
+        embedding_version: str,
     ) -> list[PaperChunk]:
         """In-memory scoring fallback for SQLite / test environments."""
         chunks = (
@@ -227,6 +244,11 @@ class HybridRetriever:
 
         dense_scores = []
         for chunk in chunks:
+            if (
+                chunk.embedding_model != embedding_model
+                or chunk.embedding_version != embedding_version
+            ):
+                continue
             vec = chunk.embedding_vec or chunk.embedding or []
             sim = cosine_similarity(query_vec, vec)
             dense_scores.append((chunk, sim))
@@ -272,11 +294,21 @@ class HybridRetriever:
 
         if is_postgres:
             candidate_chunks = self._retrieve_postgres(
-                db=db, project_id=project_id, query=query, query_vec=query_vec
+                db=db,
+                project_id=project_id,
+                query=query,
+                query_vec=query_vec,
+                embedding_model=embed_provider.model_name,
+                embedding_version=embed_provider.model_version,
             )
         else:
             candidate_chunks = self._retrieve_fallback(
-                db=db, project_id=project_id, query=query, query_vec=query_vec
+                db=db,
+                project_id=project_id,
+                query=query,
+                query_vec=query_vec,
+                embedding_model=embed_provider.model_name,
+                embedding_version=embed_provider.model_version,
             )
 
         if not candidate_chunks:
@@ -348,15 +380,8 @@ class HybridRetriever:
                         best_elem = elem
 
                 page_number = best_elem.page_number
-                page_source_elems = [e for e in source_elements if e.page_number == page_number]
-                if len(page_source_elems) > 1:
-                    exact_quote = " ".join(e.text for e in page_source_elems)
-                else:
-                    exact_quote = best_elem.text
+                exact_quote = best_elem.text
                 parser_ver = best_elem.parser_version
-
-                primary_page_text: str | None = None
-                is_valid_provenance = bool(paper and paper.document_sha256 and parser_ver)
 
                 for elem in source_elements:
                     elem_boxes: list[BoundingBox] = []
@@ -385,30 +410,12 @@ class HybridRetriever:
                     page_text = (
                         page_record.raw_text if page_record and page_record.raw_text else None
                     )
-                    if not page_text:
-                        # Fallback for legacy rows
-                        page_elems = (
-                            db.query(PaperElement)
-                            .filter(
-                                PaperElement.paper_id == chunk.paper_id,
-                                PaperElement.page_number == elem.page_number,
-                            )
-                            .order_by(PaperElement.element_index.asc())
-                            .all()
-                        )
-                        page_text = " ".join(pe.text for pe in page_elems)
-
-                    if elem.page_number == page_number:
-                        primary_page_text = page_text
-
                     # Require valid document SHA-256 and parser version
-                    elem_provenance = bool(paper and paper.document_sha256 and elem.parser_version)
-
-                    span = (
-                        find_verbatim_span(page_text, elem.text, context=chunk.text)
-                        if elem_provenance
-                        else None
+                    elem_provenance = bool(
+                        paper and paper.document_sha256 and elem.parser_version and page_text
                     )
+
+                    span = find_verbatim_span(page_text, elem.text) if elem_provenance else None
 
                     if span is not None and elem.text.strip():
                         start_char, end_char = span
@@ -417,9 +424,7 @@ class HybridRetriever:
                     elif not elem_provenance:
                         start_char, end_char = None, None
                         anchor_status = (
-                            AnchorStatus.LEGACY
-                            if (paper and not paper.document_sha256)
-                            else AnchorStatus.UNRESOLVED
+                            AnchorStatus.LEGACY if not page_text else AnchorStatus.UNRESOLVED
                         )
                         verified_boxes = []
                     else:
@@ -443,25 +448,6 @@ class HybridRetriever:
                             bounding_boxes=verified_boxes,
                         )
                     )
-
-                if len(page_source_elems) > 1 and is_valid_provenance and primary_page_text:
-                    comb_span = find_verbatim_span(
-                        primary_page_text, exact_quote, context=chunk.text
-                    )
-                    if comb_span is not None:
-                        anchors.append(
-                            CitationAnchor(
-                                page_number=page_number,
-                                source_element_id=best_elem.id,
-                                exact_quote=exact_quote,
-                                source_char_start=comb_span[0],
-                                source_char_end=comb_span[1],
-                                document_sha256=paper.document_sha256 if paper else None,
-                                parser_version=parser_ver,
-                                anchor_status=AnchorStatus.VERIFIED,
-                                bounding_boxes=list(bboxes),
-                            )
-                        )
 
             evidence_items.append(
                 EvidenceItem(

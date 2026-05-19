@@ -8,7 +8,7 @@ from app.crud.chat import create_conversation
 from app.crud.job import claim_next_job, create_job
 from app.crud.paper import create_paper
 from app.crud.project import create_project
-from app.db.models import ChunkElement, Job, PaperChunk, PaperElement
+from app.db.models import ChunkElement, Job, PaperChunk, PaperElement, PaperPage
 from app.db.session import SessionLocal, create_tables
 from app.main import app
 from app.schemas.evidence import AnchorStatus
@@ -204,6 +204,20 @@ async def test_chat_grounding_and_unsupported_citation():
     set_llm_provider(fake_llm)
 
     service = ChatService()
+    missing_page_response = await service.answer_question(
+        db, conv.id, "How do qubit operations work?"
+    )
+    assert missing_page_response.citations == []
+    db.add(
+        PaperPage(
+            paper_id=paper.id,
+            page_number=1,
+            width=612.0,
+            height=792.0,
+            raw_text=elem.text,
+        )
+    )
+    db.commit()
     resp = await service.answer_question(db, conv.id, "How do qubit operations work?")
 
     # E99 and its unsupported claim must have been completely stripped from content

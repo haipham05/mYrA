@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import PdfViewer, { findRangeForQuote } from "./PdfViewer";
 import type { Citation, Paper } from "@/types";
@@ -25,6 +25,7 @@ vi.mock("pdfjs-dist", () => {
     },
     getDocument: () => ({
       promise: Promise.resolve({
+        destroy: () => Promise.resolve(),
         getPage: () =>
           Promise.resolve({
             getViewport: () => ({ width: 612, height: 792 }),
@@ -48,6 +49,7 @@ const mockPaper: Paper = {
   project_id: "proj-123",
   filename: "attention_is_all_you_need.pdf",
   status: "READY",
+  document_sha256: "aa".repeat(32),
   page_count: 5,
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
@@ -61,6 +63,23 @@ const mockCitation: Citation = {
   quote:
     "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.",
   anchor_status: "verified",
+  document_sha256: "aa".repeat(32),
+  parser_version: "docling-2",
+  anchors: [
+    {
+      id: "anchor-1",
+      page_number: 2,
+      source_element_id: "element-1",
+      exact_quote:
+        "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.",
+      source_char_start: 0,
+      source_char_end: 110,
+      document_sha256: "aa".repeat(32),
+      parser_version: "docling-2",
+      anchor_status: "verified",
+      bounding_boxes: [],
+    },
+  ],
   bounding_boxes: [
     {
       x_min: 72,
@@ -76,6 +95,18 @@ const mockCitation: Citation = {
 
 describe("PdfViewer & Exact Range Matching", () => {
   beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      }),
+    );
+    vi.stubGlobal("crypto", {
+      subtle: {
+        digest: async () => new Uint8Array(32).fill(0xaa).buffer,
+      },
+    });
     // Mock HTMLCanvasElement.getContext to eliminate jsdom warning
     HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({
       fillRect: vi.fn(),
@@ -131,6 +162,8 @@ describe("PdfViewer & Exact Range Matching", () => {
     };
   });
 
+  afterEach(() => vi.unstubAllGlobals());
+
   describe("findRangeForQuote helper", () => {
     it("finds range spanning multiple text nodes with normalized whitespace", () => {
       const container = document.createElement("div");
@@ -154,7 +187,7 @@ describe("PdfViewer & Exact Range Matching", () => {
       expect(range).toBeNull();
     });
 
-    it("disambiguates repeated occurrences using preferredCharStart", () => {
+    it("refuses ambiguous repeated occurrences", () => {
       const container = document.createElement("div");
       const span1 = document.createElement("span");
       span1.textContent =
@@ -167,21 +200,7 @@ describe("PdfViewer & Exact Range Matching", () => {
 
       const targetQuote = "Introduction to the model architecture";
 
-      // Occurrence 1 at beginning
-      const range1 = findRangeForQuote(container, targetQuote, {
-        preferredCharStart: 0,
-      });
-      expect(range1).not.toBeNull();
-      expect(range1?.startContainer).toBe(span1.firstChild);
-      expect(range1?.startOffset).toBe(0);
-
-      // Occurrence 2 near char 75
-      const range2 = findRangeForQuote(container, targetQuote, {
-        preferredCharStart: 75,
-      });
-      expect(range2).not.toBeNull();
-      expect(range2?.startContainer).toBe(span2.firstChild);
-      expect(range2?.startOffset).toBe(11); // "Section 2: " is 11 chars
+      expect(findRangeForQuote(container, targetQuote)).toBeNull();
     });
   });
 
@@ -364,6 +383,42 @@ describe("PdfViewer & Exact Range Matching", () => {
     );
 
     // Shows explicit unavailable state and does not draw highlight
+    expect(screen.getByText("Exact highlight unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-highlight")).not.toBeInTheDocument();
+  });
+
+  it("rejects a changed served PDF even when metadata hashes agree", async () => {
+    vi.stubGlobal("crypto", {
+      subtle: {
+        digest: async () => new Uint8Array(32).fill(0xbb).buffer,
+      },
+    });
+    render(
+      <PdfViewer
+        paper={mockPaper}
+        activeCitation={mockCitation}
+        apiUrl="http://localhost:8000"
+      />,
+    );
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(screen.getByText("Exact highlight unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-highlight")).not.toBeInTheDocument();
+  });
+
+  it("rejects a verified badge without a matching verified source anchor", () => {
+    const citationWithWrongAnchor: Citation = {
+      ...mockCitation,
+      anchors: [
+        { ...mockCitation.anchors![0], exact_quote: "Different evidence." },
+      ],
+    };
+    render(
+      <PdfViewer
+        paper={mockPaper}
+        activeCitation={citationWithWrongAnchor}
+        apiUrl="http://localhost:8000"
+      />,
+    );
     expect(screen.getByText("Exact highlight unavailable")).toBeInTheDocument();
     expect(screen.queryByTestId("evidence-highlight")).not.toBeInTheDocument();
   });

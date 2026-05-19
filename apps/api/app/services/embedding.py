@@ -65,7 +65,11 @@ class DeterministicEmbeddingProvider(EmbeddingProvider):
 class BGEM3EmbeddingProvider(EmbeddingProvider):
     """BGE-M3 local embedding provider."""
 
-    def __init__(self, model_name: str = "BAAI/bge-m3", model_version: str = "v1") -> None:
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-m3",
+        model_version: str = "5617a9f61b028005a4858fdac845db406aefb181",
+    ) -> None:
         self._model_name = model_name
         self._model_version = model_version
         self._model = None
@@ -83,23 +87,32 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
             try:
                 from sentence_transformers import SentenceTransformer
 
-                self._model = SentenceTransformer(self.model_name)
+                self._model = SentenceTransformer(
+                    self.model_name, revision=self.model_version, local_files_only=True
+                )
             except Exception as err:
                 raise RuntimeError(
-                    f"Production embedding provider {self.model_name} requested "
-                    f"but could not be loaded: {err}"
+                    f"Pinned embedding model {self.model_name}@{self.model_version} is not "
+                    "available locally. Provision the approved model cache before indexing."
                 ) from err
         return self._model
+
+    @staticmethod
+    def _validated_vector(value) -> list[float]:
+        vector = value.tolist()
+        if len(vector) != 1024:
+            raise RuntimeError(f"BGE-M3 returned {len(vector)} dimensions; expected 1024")
+        return vector
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         model = self._load_model()
         embeddings = model.encode(texts, normalize_embeddings=True)
-        return [e.tolist() for e in embeddings]
+        return [self._validated_vector(e) for e in embeddings]
 
     def embed_query(self, text: str) -> list[float]:
         model = self._load_model()
         embedding = model.encode(text, normalize_embeddings=True)
-        return embedding.tolist()
+        return self._validated_vector(embedding)
 
 
 _default_embedding_provider: EmbeddingProvider | None = None
@@ -110,11 +123,13 @@ def get_embedding_provider() -> EmbeddingProvider:
     if _default_embedding_provider is None:
         import os
 
-        provider_type = os.getenv("MYRA_EMBEDDING_PROVIDER", "deterministic").lower()
-        if provider_type in ("bge-m3", "bge", "production"):
+        provider_type = os.getenv("MYRA_EMBEDDING_PROVIDER", "bge-m3").lower()
+        if provider_type == "bge-m3":
             _default_embedding_provider = BGEM3EmbeddingProvider()
-        else:
+        elif provider_type in ("test", "demo", "deterministic"):
             _default_embedding_provider = DeterministicEmbeddingProvider()
+        else:
+            raise ValueError(f"Unknown MYRA_EMBEDDING_PROVIDER: {provider_type}")
     return _default_embedding_provider
 
 
