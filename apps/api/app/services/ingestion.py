@@ -1,10 +1,11 @@
 import hashlib
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.crud.job import get_job, update_job_progress
-from app.crud.paper import get_paper, update_paper_status
+from app.crud.job import LostJobLeaseError, fence_job_for_publish, get_job, update_job_progress
+from app.crud.paper import get_paper
 from app.db.models import ChunkElement, PaperChunk, PaperElement, PaperPage
 from app.ingestion.chunker import DocumentChunker
 from app.ingestion.parser import DocumentParser
@@ -43,7 +44,9 @@ class IngestionPipeline:
         self.parser = parser or DocumentParser()
         self.chunker = chunker or DocumentChunker()
 
-    async def process_paper(self, db: Session, paper_id: UUID, job_id: UUID) -> None:
+    async def process_paper(
+        self, db: Session, paper_id: UUID, job_id: UUID, worker_id: str | None = None
+    ) -> None:
         paper = get_paper(db, paper_id)
         job = get_job(db, job_id)
         if not paper or not job:
@@ -51,7 +54,9 @@ class IngestionPipeline:
 
         try:
             # 1. Fetch file from storage
-            update_job_progress(db, job_id, stage=JobStage.PARSING, progress=0.1)
+            update_job_progress(
+                db, job_id, stage=JobStage.PARSING, progress=0.1, worker_id=worker_id
+            )
             storage = get_storage()
             key = paper.storage_path
             if key.startswith("gs://"):
@@ -66,71 +71,24 @@ class IngestionPipeline:
                 pdf_bytes = await storage.get(paper.storage_path)
 
             # 2. Parse PDF
-            update_job_progress(db, job_id, stage=JobStage.PARSING, progress=0.25)
-            if not paper.document_sha256:
-                paper.document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
-                db.flush()
+            update_job_progress(
+                db, job_id, stage=JobStage.PARSING, progress=0.25, worker_id=worker_id
+            )
+            document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+            if paper.document_sha256 and paper.document_sha256 != document_sha256:
+                raise ValueError("Stored PDF checksum does not match the uploaded document")
             parse_result = self.parser.parse(pdf_bytes)
 
-            # Clear any existing pages/elements if re-running (idempotent)
-            db.query(PaperPage).filter(PaperPage.paper_id == paper_id).delete()
-            db.query(PaperElement).filter(PaperElement.paper_id == paper_id).delete()
-            db.flush()
-
-            # Insert pages
-            for p in parse_result.pages:
-                db_page = PaperPage(
-                    paper_id=paper_id,
-                    page_number=p.page_number,
-                    width=p.width,
-                    height=p.height,
-                    rotation=p.rotation,
-                    crop_box=p.crop_box,
-                    raw_text=p.raw_text,
-                )
-                db.add(db_page)
-
-            # Insert elements and map element_index to DB element
-            elem_map: dict[int, PaperElement] = {}
-            for e in parse_result.elements:
-                db_elem = PaperElement(
-                    paper_id=paper_id,
-                    page_number=e.page_number,
-                    element_index=e.element_index,
-                    element_type=e.element_type,
-                    text=e.text,
-                    bbox_x_min=e.bbox_x_min,
-                    bbox_y_min=e.bbox_y_min,
-                    bbox_x_max=e.bbox_x_max,
-                    bbox_y_max=e.bbox_y_max,
-                    page_width=e.page_width,
-                    page_height=e.page_height,
-                    coordinate_origin=e.coordinate_origin,
-                    rotation=e.rotation,
-                    section_path=e.section_path,
-                    parser_version=e.parser_version,
-                )
-                db.add(db_elem)
-                elem_map[e.element_index] = db_elem
-
-            update_paper_status(
-                db,
-                paper_id,
-                status=PaperStatus.PROCESSING,
-                page_count=len(parse_result.pages),
-            )
-            db.flush()
-
             # 3. Chunk elements
-            update_job_progress(db, job_id, stage=JobStage.CHUNKING, progress=0.5)
+            update_job_progress(
+                db, job_id, stage=JobStage.CHUNKING, progress=0.5, worker_id=worker_id
+            )
             chunk_specs = self.chunker.chunk(parse_result.elements)
 
-            # Clear existing chunks
-            db.query(PaperChunk).filter(PaperChunk.paper_id == paper_id).delete()
-            db.flush()
-
             # 4. Embeddings
-            update_job_progress(db, job_id, stage=JobStage.EMBEDDING, progress=0.7)
+            update_job_progress(
+                db, job_id, stage=JobStage.EMBEDDING, progress=0.7, worker_id=worker_id
+            )
             embed_provider = get_embedding_provider()
             child_chunks = [c for c in chunk_specs if c.chunk_type == "child"]
             child_texts = [c.text for c in child_chunks]
@@ -140,8 +98,59 @@ class IngestionPipeline:
                 c.chunk_index: emb for c, emb in zip(child_chunks, child_embeddings, strict=False)
             }
 
-            # 5. Insert Chunks and ChunkElements
-            update_job_progress(db, job_id, stage=JobStage.INDEXING, progress=0.85)
+            # 5. The conditional UPDATE locks this job row through publication.
+            update_job_progress(
+                db, job_id, stage=JobStage.INDEXING, progress=0.85, worker_id=worker_id
+            )
+            fence_job_for_publish(db, job_id, worker_id)
+
+            # Replace the entire index in one transaction. A failed/stale worker
+            # cannot leave a half-updated paper marked READY.
+            chunk_ids = select(PaperChunk.id).where(PaperChunk.paper_id == paper_id)
+            db.query(ChunkElement).filter(ChunkElement.chunk_id.in_(chunk_ids)).delete(
+                synchronize_session=False
+            )
+            db.query(PaperChunk).filter(PaperChunk.paper_id == paper_id).delete()
+            db.query(PaperElement).filter(PaperElement.paper_id == paper_id).delete()
+            db.query(PaperPage).filter(PaperPage.paper_id == paper_id).delete()
+            db.flush()
+
+            for page in parse_result.pages:
+                db.add(
+                    PaperPage(
+                        paper_id=paper_id,
+                        page_number=page.page_number,
+                        width=page.width,
+                        height=page.height,
+                        rotation=page.rotation,
+                        crop_box=page.crop_box,
+                        raw_text=page.raw_text,
+                    )
+                )
+
+            elem_map: dict[int, PaperElement] = {}
+            for element in parse_result.elements:
+                db_element = PaperElement(
+                    paper_id=paper_id,
+                    page_number=element.page_number,
+                    element_index=element.element_index,
+                    element_type=element.element_type,
+                    text=element.text,
+                    bbox_x_min=element.bbox_x_min,
+                    bbox_y_min=element.bbox_y_min,
+                    bbox_x_max=element.bbox_x_max,
+                    bbox_y_max=element.bbox_y_max,
+                    page_width=element.page_width,
+                    page_height=element.page_height,
+                    coordinate_origin=element.coordinate_origin,
+                    rotation=element.rotation,
+                    section_path=element.section_path,
+                    parser_version=element.parser_version,
+                )
+                db.add(db_element)
+                elem_map[element.element_index] = db_element
+            db.flush()
+
             for c_spec in chunk_specs:
                 emb = embedding_map.get(c_spec.chunk_index)
                 db_chunk = PaperChunk(
@@ -167,22 +176,29 @@ class IngestionPipeline:
                         )
                         db.add(chunk_link)
 
+            paper.document_sha256 = document_sha256
+            paper.page_count = len(parse_result.pages)
+            paper.status = PaperStatus.READY
+            paper.error_message = None
+            job.status = JobStatus.COMPLETED
+            job.stage = JobStage.COMPLETED
+            job.progress = 1.0
+            job.error_message = None
+            job.is_retryable = False
             db.commit()
 
-            # 6. Mark done
-            update_paper_status(db, paper_id, status=PaperStatus.READY)
-            update_job_progress(
-                db,
-                job_id,
-                stage=JobStage.COMPLETED,
-                progress=1.0,
-                status=JobStatus.COMPLETED,
-            )
-
+        except LostJobLeaseError:
+            db.rollback()
+            return
         except Exception as err:
             db.rollback()
             err_msg = str(err)
+            try:
+                fence_job_for_publish(db, job_id, worker_id)
+            except LostJobLeaseError:
+                return
             current_job = get_job(db, job_id)
+            db.refresh(current_job)
             transient = is_transient_error(err)
             if current_job and transient and current_job.retry_count < current_job.max_retries:
                 current_job.retry_count += 1
@@ -195,13 +211,11 @@ class IngestionPipeline:
                 db.commit()
 
             else:
-                update_paper_status(db, paper_id, status=PaperStatus.FAILED, error_message=err_msg)
-                update_job_progress(
-                    db,
-                    job_id,
-                    stage=JobStage.FAILED,
-                    progress=1.0,
-                    status=JobStatus.FAILED,
-                    error_message=err_msg,
-                    is_retryable=False,
-                )
+                paper.status = PaperStatus.FAILED
+                paper.error_message = err_msg
+                current_job.stage = JobStage.FAILED
+                current_job.progress = 1.0
+                current_job.status = JobStatus.FAILED
+                current_job.error_message = err_msg[:500]
+                current_job.is_retryable = False
+                db.commit()

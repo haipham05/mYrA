@@ -12,14 +12,26 @@ class LocalStorage(ObjectStorage):
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_path(self, key: str) -> Path:
-        clean_key = key.lstrip("/")
-        return self.base_dir / clean_key
+        base = self.base_dir.resolve()
+        supplied = Path(key)
+        if supplied.is_absolute():
+            try:
+                supplied = supplied.relative_to(base)
+            except ValueError as err:
+                raise ValueError("Storage key is outside the local storage directory") from err
+        elif supplied.parts[: len(self.base_dir.parts)] == self.base_dir.parts:
+            # Read legacy rows whose storage_path included the relative base dir.
+            supplied = Path(*supplied.parts[len(self.base_dir.parts) :])
+        resolved = (base / supplied).resolve()
+        if not resolved.is_relative_to(base):
+            raise ValueError("Storage key is outside the local storage directory")
+        return resolved
 
     async def put(self, key: str, data: bytes, content_type: str = "application/pdf") -> str:
         file_path = self._resolve_path(key)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(data)
-        return str(file_path)
+        return key
 
     async def get(self, key: str) -> bytes:
         file_path = self._resolve_path(key)

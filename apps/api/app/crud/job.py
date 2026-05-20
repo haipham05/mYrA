@@ -6,6 +6,10 @@ from sqlalchemy.orm import Session
 from app.db.models import Job
 
 
+class LostJobLeaseError(RuntimeError):
+    """This worker no longer owns the job and must not publish its work."""
+
+
 def create_job(db: Session, paper_id: UUID) -> Job:
     job = Job(paper_id=paper_id, status="PENDING", stage="QUEUED", progress=0.0)
     db.add(job)
@@ -86,21 +90,40 @@ def update_job_progress(
     status: str = "PROCESSING",
     error_message: str | None = None,
     is_retryable: bool = False,
+    worker_id: str | None = None,
 ) -> Job | None:
     if isinstance(job_id, str):
         job_id = UUID(job_id)
-    job = get_job(db, job_id)
-    if not job:
-        return None
-    job.stage = stage
-    job.progress = progress
-    job.status = status
+    values = {
+        Job.stage: stage,
+        Job.progress: progress,
+        Job.status: status,
+        Job.is_retryable: is_retryable,
+    }
     if error_message is not None:
-        job.error_message = error_message
-    job.is_retryable = is_retryable
+        values[Job.error_message] = error_message
+    query = db.query(Job).filter(Job.id == job_id, Job.worker_id == worker_id)
+    if worker_id is None:
+        query = query.filter(Job.status.in_(["PENDING", "PROCESSING"]))
+    else:
+        query = query.filter(Job.status == "PROCESSING")
+    if query.update(values, synchronize_session=False) != 1:
+        db.rollback()
+        raise LostJobLeaseError(f"Job {job_id} is no longer owned by this worker")
     db.commit()
-    db.refresh(job)
-    return job
+    return get_job(db, job_id)
+
+
+def fence_job_for_publish(db: Session, job_id: UUID, worker_id: str | None) -> None:
+    """Lock the owned job row until the caller's final transaction commits."""
+    changed = (
+        db.query(Job)
+        .filter(Job.id == job_id, Job.status == "PROCESSING", Job.worker_id == worker_id)
+        .update({Job.claimed_at: datetime.now(tz=UTC)}, synchronize_session=False)
+    )
+    if changed != 1:
+        db.rollback()
+        raise LostJobLeaseError(f"Job {job_id} is no longer owned by this worker")
 
 
 def renew_job_lease(db: Session, job_id: UUID | str, worker_id: str | None = None) -> bool:

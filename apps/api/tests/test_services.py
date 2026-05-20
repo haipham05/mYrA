@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import httpx
 import pytest
 
@@ -24,7 +22,12 @@ async def test_local_storage(tmp_path):
     content = b"%PDF-test"
 
     path = await storage.put(key, content)
-    assert Path(path).exists()
+    assert path == key
+    assert await storage.exists(path)
+    assert await storage.get(str(tmp_path / "files" / key)) == content
+
+    with pytest.raises(ValueError, match="outside the local storage"):
+        await storage.get("../escape.pdf")
 
     retrieved = await storage.get(key)
     assert retrieved == content

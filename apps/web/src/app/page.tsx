@@ -202,6 +202,7 @@ export default function Home() {
 
   // Handle project selection with immediate state clearing
   const handleSelectProject = (project: Project | null) => {
+    if (selectedProject?.id === project?.id) return;
     setSelectedProject(project);
     setSelectedPaper(null);
     setActiveCitation(null);

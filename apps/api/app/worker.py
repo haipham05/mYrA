@@ -14,7 +14,9 @@ from app.services.ingestion import IngestionPipeline
 logger = logging.getLogger("myra.worker")
 
 
-async def run_worker(poll_interval: float = 2.0, once: bool = False) -> None:
+async def run_worker(
+    poll_interval: float = 2.0, once: bool = False, heartbeat_interval: float = 60.0
+) -> None:
     settings = Settings.from_environment()
     configure_logging(settings.log_level)
 
@@ -32,12 +34,17 @@ async def run_worker(poll_interval: float = 2.0, once: bool = False) -> None:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    async def _heartbeat(job_id, worker_id: str, interval: float = 60.0):
+    async def _heartbeat(
+        job_id, worker_id: str, processing_task: asyncio.Task, interval: float = 60.0
+    ):
         while True:
             await asyncio.sleep(interval)
             try:
                 with SessionLocal() as h_db:
-                    renew_job_lease(h_db, job_id, worker_id=worker_id)
+                    if not renew_job_lease(h_db, job_id, worker_id=worker_id):
+                        logger.warning("job_lease_lost", extra={"job_id": str(job_id)})
+                        processing_task.cancel()
+                        return
             except Exception:
                 pass
 
@@ -50,10 +57,24 @@ async def run_worker(poll_interval: float = 2.0, once: bool = False) -> None:
                     "claimed_job",
                     extra={"job_id": str(job.id), "paper_id": str(job.paper_id)},
                 )
-                heartbeat_task = asyncio.create_task(_heartbeat(job.id, worker_id=worker_id))
+                processing_task = asyncio.create_task(
+                    pipeline.process_paper(
+                        db, paper_id=job.paper_id, job_id=job.id, worker_id=worker_id
+                    )
+                )
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat(
+                        job.id,
+                        worker_id=worker_id,
+                        processing_task=processing_task,
+                        interval=heartbeat_interval,
+                    )
+                )
 
                 try:
-                    await pipeline.process_paper(db, paper_id=job.paper_id, job_id=job.id)
+                    await processing_task
+                except asyncio.CancelledError:
+                    db.rollback()
                 finally:
                     heartbeat_task.cancel()
                     try:

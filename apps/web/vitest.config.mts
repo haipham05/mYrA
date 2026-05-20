@@ -10,6 +10,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: { alias: { "@": path.resolve(directory, "./src") } },
   test: {
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
   },

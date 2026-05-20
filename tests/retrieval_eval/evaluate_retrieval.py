@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import os
 import sys
 import tempfile
@@ -12,44 +13,51 @@ repo_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(repo_root / "apps" / "api"))
 sys.path.insert(0, str(repo_root / "tests" / "retrieval_eval"))
 
-from app.config import Settings
 from app.crud.chat import create_conversation
 from app.crud.paper import create_paper_with_job
 from app.crud.project import create_project
 from app.db.base import Base
-from app.db.models import Project
-from app.db.session import SessionLocal, create_tables
+from app.ingestion.parser import DocumentParser
 from app.schemas.evidence import AnchorStatus
 from app.schemas.paper import PaperStatus
 from app.schemas.project import ProjectCreate
 from app.services.chat_service import ChatService
-from app.services.embedding import get_embedding_provider
+from app.services.embedding import (
+    DeterministicEmbeddingProvider,
+    get_embedding_provider,
+    set_embedding_provider,
+)
 from app.services.ingestion import IngestionPipeline
-from app.services.llm import get_llm_provider
-from app.services.retrieval import HybridRetriever, get_reranker
-from app.storage.factory import get_storage, set_storage
+from app.services.llm import FakeLLMProvider, get_llm_provider, set_llm_provider
+from app.services.retrieval import (
+    HybridRetriever,
+    SimpleLexicalReranker,
+    get_reranker,
+    set_reranker,
+)
+from app.storage.factory import set_storage
 from app.storage.local import LocalStorage
 from gold_corpus import GOLD_PAPERS, GOLD_QUESTIONS
 from sqlalchemy import create_engine
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 
-async def setup_gold_corpus_from_real_pdfs(db, fixtures_dir: Path):
-    """Ingest real fixture PDFs via the actual IngestionPipeline."""
+async def setup_gold_corpus(db, fixtures_dir: Path, storage):
+    """Ingest generated regression PDFs through the actual pipeline."""
     project = create_project(
         db, ProjectCreate(name=f"Gold Benchmark Project {uuid4().hex[:6]}")
     )
-    storage = get_storage()
-    pipeline = IngestionPipeline()
+    pipeline = IngestionPipeline(parser=DocumentParser(use_docling=True))
 
     paper_objs = []
+    document_hashes = []
     for p_spec in GOLD_PAPERS:
         pdf_path = fixtures_dir / p_spec["filename"]
         if not pdf_path.exists():
             raise FileNotFoundError(f"Fixture PDF not found: {pdf_path}")
 
         pdf_bytes = pdf_path.read_bytes()
+        document_hashes.append(hashlib.sha256(pdf_bytes).hexdigest())
         storage_key = f"gold/{project.id}/{p_spec['filename']}"
         await storage.put(storage_key, pdf_bytes)
 
@@ -66,45 +74,40 @@ async def setup_gold_corpus_from_real_pdfs(db, fixtures_dir: Path):
         await pipeline.process_paper(db, paper_id=paper.id, job_id=job.id)
         db.refresh(paper)
 
-    return project, paper_objs
+    return project, paper_objs, document_hashes
 
 
-async def run_evaluation(allow_live: bool = False):
-    settings = Settings.from_environment()
+async def run_evaluation():
     fixtures_dir = Path(__file__).resolve().parent / "fixtures"
 
     temp_dir = None
     isolated_engine = None
     db = None
-    project = None
+    offline_variables = {
+        name: os.environ.get(name)
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    }
 
     try:
-        # 1. Isolate environment unless explicitly allowed
-        is_remote_db = any(
-            x in settings.database_url.lower()
-            for x in ("supabase", "postgres", "amazonaws")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        # This regression runner never consumes the developer's configured cloud
+        # resources or production models, regardless of DATABASE_URL/.env.
+        temp_dir = tempfile.TemporaryDirectory(prefix="myra-eval-")
+        sqlite_path = Path(temp_dir.name) / "eval.db"
+        isolated_engine = create_engine(
+            f"sqlite:///{sqlite_path}", connect_args={"check_same_thread": False}
         )
-        if is_remote_db and not allow_live:
-            print(
-                "Notice: Remote database detected. Initializing isolated disposable SQLite and local storage..."
-            )
-            temp_dir = tempfile.TemporaryDirectory()
-            sqlite_path = Path(temp_dir.name) / "eval_isolated.db"
-            isolated_engine = create_engine(
-                f"sqlite:///{sqlite_path}", connect_args={"check_same_thread": False}
-            )
-            Base.metadata.create_all(bind=isolated_engine)
-            eval_session_factory = sessionmaker(
-                autocommit=False, autoflush=False, bind=isolated_engine
-            )
-            db = eval_session_factory()
-            isolated_storage = LocalStorage(
-                base_dir=str(Path(temp_dir.name) / "storage")
-            )
-            set_storage(isolated_storage)
-        else:
-            create_tables()
-            db = SessionLocal()
+        Base.metadata.create_all(bind=isolated_engine)
+        eval_session_factory = sessionmaker(
+            autocommit=False, autoflush=False, bind=isolated_engine
+        )
+        db = eval_session_factory()
+        isolated_storage = LocalStorage(base_dir=str(Path(temp_dir.name) / "storage"))
+        set_storage(isolated_storage)
+        set_embedding_provider(DeterministicEmbeddingProvider())
+        set_reranker(SimpleLexicalReranker())
+        set_llm_provider(FakeLLMProvider())
 
         embedder = get_embedding_provider()
         reranker = get_reranker()
@@ -112,7 +115,7 @@ async def run_evaluation(allow_live: bool = False):
         dialect = db.get_bind().dialect.name
 
         print("================================================================")
-        print("      mYrA REAL-PDF RETRIEVAL & CITATION EVALUATION GATE        ")
+        print("      mYrA GENERATED-PDF REGRESSION (NOT RELEASE EVIDENCE)       ")
         print("================================================================")
         print("Runtime Environment:")
         print(f"  - Database:           {dialect}")
@@ -121,9 +124,12 @@ async def run_evaluation(allow_live: bool = False):
         )
         print(f"  - Reranker:           {reranker.model_name}")
         print(f"  - LLM Provider:       {llm.provider_name}")
-        print(f"Loading & Ingesting {len(GOLD_PAPERS)} real PDF fixture files...")
+        print(f"Loading & Ingesting {len(GOLD_PAPERS)} generated PDF fixtures...")
 
-        project, paper_objs = await setup_gold_corpus_from_real_pdfs(db, fixtures_dir)
+        project, paper_objs, document_hashes = await setup_gold_corpus(
+            db, fixtures_dir, isolated_storage
+        )
+        print(f"  - Fixture SHA-256:    {', '.join(document_hashes)}")
         retriever = HybridRetriever(top_candidates=40, top_evidence=10, rrf_k=60)
         chat_service = ChatService(retriever=retriever)
 
@@ -133,8 +139,8 @@ async def run_evaluation(allow_live: bool = False):
         recall_at_5 = 0
         recall_at_10 = 0
         reciprocal_ranks = []
-        citation_precisions = []
-        exact_highlight_successes = 0
+        correct_citations = 0
+        backend_anchor_offsets = 0
         total_citations_evaluated = 0
         questions_with_citations = 0
         latencies = []
@@ -177,12 +183,17 @@ async def run_evaluation(allow_live: bool = False):
             chat_resp = await chat_service.answer_question(db, conv.id, q["query"])
 
             # 3. Evaluate Citation Precision & Exact Highlight Resolution
-            question_citations_valid = 0
             if chat_resp.citations:
                 questions_with_citations += 1
                 for cite in chat_resp.citations:
                     total_citations_evaluated += 1
                     quote = cite.quote.strip()
+                    if (
+                        cite.paper_id == target_paper.id
+                        and cite.page_number == target_page
+                        and key_phrase.casefold() in quote.casefold()
+                    ):
+                        correct_citations += 1
                     if (
                         quote
                         and cite.anchor_status == AnchorStatus.VERIFIED
@@ -193,11 +204,7 @@ async def run_evaluation(allow_live: bool = False):
                             for a in cite.anchors
                         )
                     ):
-                        exact_highlight_successes += 1
-                        question_citations_valid += 1
-
-                precision = question_citations_valid / len(chat_resp.citations)
-                citation_precisions.append(precision)
+                        backend_anchor_offsets += 1
 
             print(
                 f"  [{q['id']}] {rank_str:<14} | Citations: {len(chat_resp.citations)} "
@@ -208,13 +215,9 @@ async def run_evaluation(allow_live: bool = False):
         r5 = recall_at_5 / n
         r10 = recall_at_10 / n
         mrr = sum(reciprocal_ranks) / n
-        emitted_precision = (
-            sum(citation_precisions) / len(citation_precisions)
-            if citation_precisions
-            else 0.0
-        )
+        emitted_precision = correct_citations / max(1, total_citations_evaluated)
         citation_coverage = questions_with_citations / n
-        highlight_rate = exact_highlight_successes / max(1, total_citations_evaluated)
+        offset_rate = backend_anchor_offsets / max(1, total_citations_evaluated)
         avg_lat = sum(latencies) / n
 
         print("\n================================================================")
@@ -225,14 +228,15 @@ async def run_evaluation(allow_live: bool = False):
         print(f"Recall@10:                     {r10 * 100:.2f}% ({recall_at_10}/{n})")
         print(f"Mean Reciprocal Rank (MRR):    {mrr:.4f}")
         print(
-            f"Citation Anchor Precision:     {emitted_precision * 100:.2f}% (on emitted citations)"
+            f"Gold Citation Precision:       {emitted_precision * 100:.2f}% "
+            f"({correct_citations}/{total_citations_evaluated} emitted)"
         )
         print(
             f"Citation Coverage:             {citation_coverage * 100:.2f}% ({questions_with_citations}/{n})"
         )
         print(
-            f"Exact Highlight Success Rate:  {highlight_rate * 100:.2f}% "
-            f"({exact_highlight_successes}/{total_citations_evaluated})"
+            f"Backend Anchor Offset Rate:    {offset_rate * 100:.2f}% "
+            f"({backend_anchor_offsets}/{total_citations_evaluated}); not browser highlights"
         )
         print(f"Average Query Latency:         {avg_lat:.2f} ms")
         print("Active Evaluated Providers:")
@@ -248,44 +252,37 @@ async def run_evaluation(allow_live: bool = False):
         assert emitted_precision >= 0.90, (
             f"Citation Precision ({emitted_precision:.2f}) must be >= 0.90"
         )
-        assert highlight_rate >= 0.90, (
-            f"Highlight Rate ({highlight_rate:.2f}) must be >= 0.90"
-        )
         assert citation_coverage >= 0.80, (
             f"Citation Coverage ({citation_coverage:.2f}) must be >= 0.80"
         )
-        print("\nALL RELEASE EVALUATION ACCEPTANCE GATES PASSED!")
+        print(
+            "\nSynthetic regression thresholds passed; release evaluation remains open."
+        )
 
     finally:
-        # Guarantee cleanup of test project and isolated resources
-        if project and db:
-            try:
-                db.query(Project).filter(Project.id == project.id).delete()
-                db.commit()
-            except (SQLAlchemyError, OSError) as err:
-                print(f"Cleanup warning: {err}")
-
         if db:
             db.close()
         if isolated_engine:
             isolated_engine.dispose()
         set_storage(None)
+        set_embedding_provider(None)
+        set_reranker(None)
+        set_llm_provider(None)
         if temp_dir:
             temp_dir.cleanup()
+        for name, old_value in offline_variables.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
 
 
 def main():
-    parser = argparse.ArgumentParser(description="mYrA Retrieval Evaluation Benchmark")
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Allow running against configured live database and storage (MYRA_ALLOW_LIVE_EVAL=1)",
+    parser = argparse.ArgumentParser(
+        description="Isolated generated-PDF retrieval regression"
     )
-    args = parser.parse_args()
-    allow_live = args.live or (
-        os.getenv("MYRA_ALLOW_LIVE_EVAL", "0").lower() in ("1", "true")
-    )
-    asyncio.run(run_evaluation(allow_live=allow_live))
+    parser.parse_args()
+    asyncio.run(run_evaluation())
 
 
 if __name__ == "__main__":
