@@ -1,4 +1,5 @@
 import asyncio
+from typing import BinaryIO
 
 from app.storage.base import ObjectStorage
 
@@ -33,6 +34,17 @@ class GCSStorage(ObjectStorage):
 
         return await asyncio.to_thread(_upload)
 
+    async def put_stream(
+        self, key: str, source: BinaryIO, content_type: str = "application/pdf"
+    ) -> str:
+        def _upload() -> str:
+            source.seek(0)
+            blob = self._get_bucket().blob(key)
+            blob.upload_from_file(source, rewind=True, content_type=content_type)
+            return f"gs://{self.bucket_name}/{key}"
+
+        return await asyncio.to_thread(_upload)
+
     async def get(self, key: str) -> bytes:
         def _download() -> bytes:
             bucket = self._get_bucket()
@@ -59,3 +71,12 @@ class GCSStorage(ObjectStorage):
                 blob.delete()
 
         await asyncio.to_thread(_delete)
+
+    async def open_stream(self, key: str, chunk_size: int = 64 * 1024):
+        blob = self._get_bucket().blob(key)
+        reader = await asyncio.to_thread(blob.open, "rb", chunk_size=chunk_size)
+        try:
+            while chunk := await asyncio.to_thread(reader.read, chunk_size):
+                yield chunk
+        finally:
+            await asyncio.to_thread(reader.close)

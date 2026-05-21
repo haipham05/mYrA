@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -37,6 +39,32 @@ class FixedParser:
                 )
             ],
         )
+
+
+def test_two_workers_cannot_claim_one_pending_job():
+    create_tables()
+    with SessionLocal() as db:
+        db.query(Job).delete()
+        db.commit()
+        project = create_project(db, ProjectCreate(name="Concurrent claim"))
+        paper = create_paper(db, project.id, "claim.pdf", "claim.pdf")
+        job = create_job(db, paper.id)
+        job_id = job.id
+
+    barrier = Barrier(2)
+
+    def claim(worker_id: str):
+        with SessionLocal() as session:
+            barrier.wait()
+            claimed = claim_next_job(session, worker_id=worker_id)
+            return claimed.id if claimed else None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(claim, "worker-a")
+        second = pool.submit(claim, "worker-b")
+        results = [first.result(), second.result()]
+    assert results.count(job_id) == 1
+    assert results.count(None) == 1
 
 
 @pytest.mark.anyio

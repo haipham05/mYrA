@@ -71,6 +71,25 @@ def test_simple_lexical_reranker():
     assert ranked[0][0] == 1
 
 
+def test_demo_reranker_normalizes_question_words_and_plural_forms():
+    reranker = SimpleLexicalReranker()
+    docs = [
+        "The architecture uses attention in a network.",
+        "Positional Encoding: the model contains no recurrence or convolution.",
+    ]
+    assert reranker.rerank("Why are positional encodings needed?", docs)[0][0] == 1
+    assert (
+        reranker.rerank(
+            "What does the BERT acronym stand for?",
+            [
+                "BERT stands for Bidirectional Encoder Representations from Transformers.",
+                "The Transformer uses a BERT-style architecture.",
+            ],
+        )[0][0]
+        == 0
+    )
+
+
 def test_production_providers_are_explicit_and_pinned(monkeypatch):
     import sentence_transformers
 

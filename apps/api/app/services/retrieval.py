@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from abc import ABC, abstractmethod
 from uuid import UUID
 
@@ -42,22 +43,63 @@ class RerankerProvider(ABC):
 
 
 class SimpleLexicalReranker(RerankerProvider):
-    """Fast lexical overlap and length-normalized reranker for testing and CPU fallback."""
+    """Lightweight lexical reranker for the explicit test/demo profile."""
+
+    _stop_words = frozenset(
+        {
+            "a",
+            "an",
+            "and",
+            "are",
+            "as",
+            "by",
+            "do",
+            "does",
+            "for",
+            "from",
+            "how",
+            "in",
+            "is",
+            "of",
+            "on",
+            "the",
+            "to",
+            "was",
+            "what",
+            "why",
+            "with",
+            "would",
+        }
+    )
+
+    @classmethod
+    def _tokens(cls, value: str) -> set[str]:
+        words = re.findall(r"[a-z0-9]+", value.casefold())
+        return {
+            word[:-1] if word.endswith("s") and len(word) > 4 else word
+            for word in words
+            if word not in cls._stop_words
+        }
 
     @property
     def model_name(self) -> str:
         return "simple-lexical"
 
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
-        query_words = set(query.lower().split())
+        query_words = self._tokens(query)
+        document_words = [self._tokens(doc) for doc in documents]
+        document_frequency = {
+            word: sum(word in words for words in document_words) for word in query_words
+        }
         scored: list[tuple[int, float]] = []
-        for idx, doc in enumerate(documents):
-            doc_words = set(doc.lower().split())
+        for idx, doc_words in enumerate(document_words):
             if not query_words or not doc_words:
                 scored.append((idx, 0.0))
                 continue
-            overlap = len(query_words.intersection(doc_words))
-            score = overlap / math.sqrt(len(query_words) * len(doc_words))
+            score = sum(
+                math.log((len(documents) + 1) / (document_frequency[word] + 1)) + 1
+                for word in query_words.intersection(doc_words)
+            ) / math.sqrt(len(query_words) * len(doc_words))
             scored.append((idx, score))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored

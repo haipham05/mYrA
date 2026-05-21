@@ -183,6 +183,7 @@ async def run_evaluation():
             chat_resp = await chat_service.answer_question(db, conv.id, q["query"])
 
             # 3. Evaluate Citation Precision & Exact Highlight Resolution
+            matched_citation_for_question = False
             if chat_resp.citations:
                 questions_with_citations += 1
                 for cite in chat_resp.citations:
@@ -194,6 +195,7 @@ async def run_evaluation():
                         and key_phrase.casefold() in quote.casefold()
                     ):
                         correct_citations += 1
+                        matched_citation_for_question = True
                     if (
                         quote
                         and cite.anchor_status == AnchorStatus.VERIFIED
@@ -208,6 +210,7 @@ async def run_evaluation():
 
             print(
                 f"  [{q['id']}] {rank_str:<14} | Citations: {len(chat_resp.citations)} "
+                f"| Gold cite: {'yes' if matched_citation_for_question else 'no'} "
                 f"| Latency: {latency:.2f}ms"
             )
 

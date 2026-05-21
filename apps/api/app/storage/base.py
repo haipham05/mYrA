@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import BinaryIO
 
 
 class ObjectStorage(ABC):
@@ -11,6 +12,12 @@ class ObjectStorage(ABC):
     async def get(self, key: str) -> bytes:
         """Retrieve bytes for key."""
         pass
+
+    async def put_stream(
+        self, key: str, source: BinaryIO, content_type: str = "application/pdf"
+    ) -> str:
+        """Store a seekable upload stream; in-memory test adapters may buffer it."""
+        return await self.put(key, source.read(), content_type=content_type)
 
     @abstractmethod
     async def delete(self, key: str) -> None:

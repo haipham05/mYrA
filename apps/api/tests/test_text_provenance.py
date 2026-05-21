@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pytest
+from pypdf import PdfReader
 
 from app.ingestion.parser import (
     DocumentParser,
@@ -72,17 +75,19 @@ def test_find_verbatim_span_repeated_text_disambiguation_with_preferred_offset()
     )
     quote = "The model achieves state-of-the-art results."
 
-    # Disambiguate towards second occurrence
-    span_second = find_verbatim_span(page_text, quote, preferred_char_start=60)
+    # Only an independently known exact offset may identify an occurrence.
+    second_start = page_text.rfind(quote)
+    span_second = find_verbatim_span(page_text, quote, preferred_char_start=second_start)
     assert span_second is not None
     assert span_second[0] >= 50
     assert page_text[span_second[0] : span_second[1]] == quote
 
-    # Disambiguate towards first occurrence
-    span_first = find_verbatim_span(page_text, quote, preferred_char_start=10)
+    first_start = page_text.find(quote)
+    span_first = find_verbatim_span(page_text, quote, preferred_char_start=first_start)
     assert span_first is not None
     assert span_first[0] < 30
     assert page_text[span_first[0] : span_first[1]] == quote
+    assert find_verbatim_span(page_text, quote, preferred_char_start=first_start + 1) is None
 
 
 def test_parser_never_invents_fallback_50_50_boxes():
@@ -164,3 +169,19 @@ def test_docling_failure_does_not_silently_use_pypdf(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Docling assets unavailable"):
         parser.parse(b"%PDF")
+
+
+def test_docling_page_text_is_independent_of_its_elements():
+    fixture = (
+        Path(__file__).resolve().parents[3] / "tests/retrieval_eval/fixtures/devlin2018_bert.pdf"
+    )
+    source = fixture.read_bytes()
+    result = DocumentParser(use_docling=True).parse(source)
+    reader = PdfReader(fixture)
+
+    assert len(result.pages) == len(reader.pages)
+    assert result.pages[4].raw_text == reader.pages[4].extract_text()
+    assert result.pages[4].raw_text
+    assert result.elements[4].element_type == "text"
+    assert result.pages[4].crop_box is not None
+    assert find_verbatim_span(result.pages[4].raw_text, result.elements[4].text)

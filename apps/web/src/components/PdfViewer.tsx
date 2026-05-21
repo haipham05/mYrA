@@ -141,6 +141,9 @@ export default function PdfViewer({
   const [highlightRects, setHighlightRects] = useState<HighlightRect[]>([]);
   const [isExactMatch, setIsExactMatch] = useState<boolean>(false);
   const [textLayerReady, setTextLayerReady] = useState<number>(0);
+  const [textLayerRenderKey, setTextLayerRenderKey] = useState<string | null>(
+    null,
+  );
 
   const [renderError, setRenderError] = useState<string | null>(null);
   const [servedDocument, setServedDocument] = useState<{
@@ -169,6 +172,7 @@ export default function PdfViewer({
   const currentPage = userPage ?? citationPage;
   const paperId = paper?.id;
   const paperHash = paper?.document_sha256;
+  const renderKey = `${paperId ?? "none"}:${currentPage}:${scale}:${rotation}`;
 
   // Handle PDF document rendering with PDF.js
   useEffect(() => {
@@ -258,6 +262,7 @@ export default function PdfViewer({
             textLayerDiv.innerHTML = "";
           }
           if (!cancelled) {
+            setTextLayerRenderKey(renderKey);
             setTextLayerReady((c) => c + 1);
           }
         }
@@ -276,7 +281,7 @@ export default function PdfViewer({
     return () => {
       cancelled = true;
     };
-  }, [paper, currentPage, scale, rotation, apiUrl]);
+  }, [paper, currentPage, scale, rotation, apiUrl, renderKey]);
 
   useEffect(() => {
     const key = paperId
@@ -330,6 +335,7 @@ export default function PdfViewer({
       !isHashMatched ||
       !activeCitation.quote ||
       !textLayerRef.current ||
+      textLayerRenderKey !== renderKey ||
       renderError
     ) {
       setHighlightRects([]);
@@ -383,7 +389,15 @@ export default function PdfViewer({
       setHighlightRects([]);
       setIsExactMatch(false);
     }
-  }, [activeCitation, paper, currentPage, renderError, servedDocument]);
+  }, [
+    activeCitation,
+    paper,
+    currentPage,
+    renderError,
+    servedDocument,
+    textLayerRenderKey,
+    renderKey,
+  ]);
 
   useEffect(() => {
     const frameId = requestAnimationFrame(() => {
@@ -409,7 +423,10 @@ export default function PdfViewer({
   );
 
   const highlightStatus: "exact" | "unavailable" =
-    isCurrentPageCited && isExactMatch && highlightRects.length > 0
+    isCurrentPageCited &&
+    textLayerRenderKey === renderKey &&
+    isExactMatch &&
+    highlightRects.length > 0
       ? "exact"
       : "unavailable";
 

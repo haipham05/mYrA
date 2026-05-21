@@ -1,5 +1,7 @@
+import asyncio
 import os
 from pathlib import Path
+from typing import BinaryIO
 
 from app.storage.base import ObjectStorage
 
@@ -31,6 +33,19 @@ class LocalStorage(ObjectStorage):
         file_path = self._resolve_path(key)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(data)
+        return key
+
+    async def put_stream(
+        self, key: str, source: BinaryIO, content_type: str = "application/pdf"
+    ) -> str:
+        def _copy() -> None:
+            file_path = self._resolve_path(key)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with file_path.open("wb") as destination:
+                while chunk := source.read(1024 * 1024):
+                    destination.write(chunk)
+
+        await asyncio.to_thread(_copy)
         return key
 
     async def get(self, key: str) -> bytes:

@@ -1,5 +1,4 @@
 import hashlib
-import io
 import logging
 import tempfile
 from uuid import UUID, uuid4
@@ -116,54 +115,56 @@ async def upload_paper(
             )
 
         document_sha256 = hasher.hexdigest()
-        spooled.seek(0)
-        content = spooled.read()
-    finally:
-        spooled.close()
-
-    # 2. Check for duplicate upload within project
-    existing_paper = (
-        db.query(Paper)
-        .filter(Paper.project_id == project_id, Paper.document_sha256 == document_sha256)
-        .first()
-    )
-    if existing_paper:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Paper with identical content already exists in this project",
+        # 2. Check for duplicate upload within project before writing storage.
+        existing_paper = (
+            db.query(Paper)
+            .filter(Paper.project_id == project_id, Paper.document_sha256 == document_sha256)
+            .first()
         )
+        if existing_paper:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Paper with identical content already exists in this project",
+            )
 
-    # 3. Validate page count using pypdf
-    try:
-        reader = PdfReader(io.BytesIO(content))
-        page_count = len(reader.pages)
-        if page_count > settings.max_pdf_pages:
+        # 3. Validate page count on the seekable spool without materializing bytes.
+        try:
+            spooled.seek(0)
+            reader = PdfReader(spooled)
+            page_count = len(reader.pages)
+            if page_count > settings.max_pdf_pages:
+                detail = f"PDF page count ({page_count}) exceeds limit of {settings.max_pdf_pages}"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=detail,
+                )
+        except HTTPException:
+            raise
+        except Exception as err:
+            logger.warning("Unreadable or corrupt PDF upload", exc_info=err)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"PDF page count ({page_count}) exceeds limit of {settings.max_pdf_pages}",
+                detail="Corrupt or unreadable PDF document",
+            ) from err
+
+        paper_id = uuid4()
+        storage_key = f"papers/{project_id}/{paper_id}.pdf"
+        storage = get_storage(settings)
+
+        # 4. Stream from the spool into the selected storage backend.
+        try:
+            spooled.seek(0)
+            storage_path = await storage.put_stream(
+                storage_key, spooled, content_type="application/pdf"
             )
-    except HTTPException:
-        raise
-    except Exception as err:
-        logger.warning("Unreadable or corrupt PDF upload", exc_info=err)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Corrupt or unreadable PDF document",
-        ) from err
-
-    paper_id = uuid4()
-    storage_key = f"papers/{project_id}/{paper_id}.pdf"
-    storage = get_storage(settings)
-
-    # 4. Store file in storage backend
-    try:
-        storage_path = await storage.put(storage_key, content, content_type="application/pdf")
-    except Exception as err:
-        logger.error("Failed to store PDF", exc_info=err)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to store PDF document",
-        ) from err
+        except Exception as err:
+            logger.error("Failed to store PDF", exc_info=err)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to store PDF document",
+            ) from err
+    finally:
+        spooled.close()
 
     # 5. Create paper & job transactionally in a single DB commit; compensate storage on DB failure
     try:

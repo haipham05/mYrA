@@ -80,15 +80,12 @@ def find_verbatim_span(
     page_text: str,
     quote: str,
     preferred_char_start: int | None = None,
-    context: str | None = None,
 ) -> tuple[int, int] | None:
     """Find exact character span [start, end] of quote within page_text using
     reversible normalized-to-raw offset mapping.
 
-    If quote appears multiple times on the page:
-    - If preferred_char_start or context is provided, disambiguates to the matching occurrence.
-    - If ambiguous without disambiguating context, returns None (UNRESOLVED) to
-      prevent false matches.
+    Repeated text is ambiguous unless the caller supplies an independently
+    established exact source offset. A nearby offset is not sufficient.
     """
     if not page_text or not quote:
         return None
@@ -112,31 +109,11 @@ def find_verbatim_span(
         s, e = candidates[0]
         return (mapping[s], mapping[e - 1] + 1)
 
-    # Multiple candidates: disambiguate using preferred character start
+    # Only an exact, independent source offset can identify a repeated occurrence.
     if preferred_char_start is not None:
-        best_candidate = None
-        min_dist = float("inf")
-        for s, e in candidates:
-            raw_s = mapping[s]
-            dist = abs(raw_s - preferred_char_start)
-            if dist < min_dist:
-                min_dist = dist
-                best_candidate = (s, e)
-        if best_candidate is not None:
-            s, e = best_candidate
-            return (mapping[s], mapping[e - 1] + 1)
-
-    if context:
-        norm_context, _ = normalize_text_with_mapping(context)
-        matching_in_context = []
-        for s, e in candidates:
-            cand_raw_s = mapping[s]
-            cand_raw_e = mapping[e - 1] + 1
-            raw_slice = page_text[max(0, cand_raw_s - 50) : min(len(page_text), cand_raw_e + 50)]
-            if any(w in raw_slice for w in norm_context.split() if len(w) > 4):
-                matching_in_context.append((s, e))
-        if len(matching_in_context) == 1:
-            s, e = matching_in_context[0]
+        exact = [(s, e) for s, e in candidates if mapping[s] == preferred_char_start]
+        if len(exact) == 1:
+            s, e = exact[0]
             return (mapping[s], mapping[e - 1] + 1)
 
     # Ambiguous repeated text without disambiguating context: return None
@@ -211,10 +188,13 @@ class DocumentParser:
         doc_stream = DocumentStream(name="document.pdf", stream=io.BytesIO(pdf_bytes))
         res = converter.convert(doc_stream)
         doc = res.document
+        source_reader = PdfReader(io.BytesIO(pdf_bytes))
+        if len(source_reader.pages) != len(doc.pages):
+            raise ValueError("Docling page count does not match the source PDF")
 
         elements: list[ParsedElement] = []
         element_idx = 0
-        page_texts: dict[int, list[str]] = {}
+        current_section: list[str] = []
 
         for item in doc.texts:
             for prov in item.prov:
@@ -222,8 +202,6 @@ class DocumentParser:
                 elem_text = normalize_text(item.text[start_char:end_char].strip())
                 if not elem_text:
                     continue
-
-                page_texts.setdefault(prov.page_no, []).append(elem_text)
 
                 page = doc.pages.get(prov.page_no)
                 page_w = float(page.size.width) if page else 612.0
@@ -234,12 +212,15 @@ class DocumentParser:
                 x_max = float(bbox.r)
                 y_min = float(page_h - bbox.t)
                 y_max = float(page_h - bbox.b)
+                element_type = str(item.label)
+                if element_type in {"title", "section_header"}:
+                    current_section = [elem_text]
 
                 elements.append(
                     ParsedElement(
                         element_index=element_idx,
                         page_number=prov.page_no,
-                        element_type="paragraph",
+                        element_type=element_type,
                         text=elem_text,
                         bbox_x_min=max(0.0, x_min),
                         bbox_y_min=max(0.0, y_min),
@@ -248,8 +229,8 @@ class DocumentParser:
                         page_width=page_w,
                         page_height=page_h,
                         coordinate_origin="TOP_LEFT",
-                        rotation=0,
-                        section_path=[],
+                        rotation=int(source_reader.pages[prov.page_no - 1].get("/Rotate", 0) or 0),
+                        section_path=current_section.copy(),
                         parser_version=f"docling-{docling.__version__}",
                     )
                 )
@@ -257,13 +238,23 @@ class DocumentParser:
 
         pages: list[ParsedPage] = []
         for page_no, page in doc.pages.items():
+            source_page = source_reader.pages[page_no - 1]
+            crop = source_page.cropbox
             pages.append(
                 ParsedPage(
                     page_number=page_no,
                     width=float(page.size.width),
                     height=float(page.size.height),
-                    rotation=0,
-                    raw_text=" ".join(page_texts.get(page_no, [])),
+                    rotation=int(source_page.get("/Rotate", 0) or 0),
+                    crop_box={
+                        "left": float(crop.left),
+                        "bottom": float(crop.bottom),
+                        "right": float(crop.right),
+                        "top": float(crop.top),
+                    },
+                    # This is deliberately independent of Docling's elements.
+                    # If it cannot support a quote, the anchor stays unresolved.
+                    raw_text=source_page.extract_text() or "",
                 )
             )
 

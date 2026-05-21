@@ -37,49 +37,79 @@ def claim_next_job(db: Session, worker_id: str, lease_timeout_seconds: int = 300
         query = query.with_for_update(skip_locked=True)
 
     pending_jobs = query.all()
-    job = None
     for candidate in pending_jobs:
-        if candidate.retry_count == 0:
-            job = candidate
-            break
-        backoff_seconds = min(300, (2**candidate.retry_count) * 5)
-        if candidate.updated_at:
+        if candidate.retry_count > candidate.max_retries:
+            continue
+        eligible = candidate.retry_count == 0
+        if not eligible and candidate.updated_at:
+            backoff_seconds = min(300, (2**candidate.retry_count) * 5)
             cand_time = candidate.updated_at
             if cand_time.tzinfo is None:
                 cand_time = cand_time.replace(tzinfo=UTC)
             elapsed = (now - cand_time).total_seconds()
-            if elapsed >= backoff_seconds:
-                job = candidate
-                break
-        else:
-            job = candidate
-            break
+            eligible = elapsed >= backoff_seconds
+        elif not candidate.updated_at:
+            eligible = True
+        if not eligible:
+            continue
+
+        changed = (
+            db.query(Job)
+            .filter(Job.id == candidate.id, Job.status == "PENDING")
+            .update(
+                {
+                    Job.status: "PROCESSING",
+                    Job.stage: "PARSING",
+                    Job.worker_id: worker_id,
+                    Job.claimed_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed == 1:
+            db.commit()
+            db.refresh(candidate)
+            return candidate
 
     # 2. Recover abandoned PROCESSING jobs whose worker lease has expired
-    if not job:
-        expired_query = (
+    expired_query = (
+        db.query(Job)
+        .filter(
+            Job.status == "PROCESSING",
+            Job.claimed_at < cutoff,
+            Job.retry_count < Job.max_retries,
+        )
+        .order_by(Job.claimed_at.asc())
+    )
+    if not is_sqlite:
+        expired_query = expired_query.with_for_update(skip_locked=True)
+    for candidate in expired_query.all():
+        changed = (
             db.query(Job)
             .filter(
+                Job.id == candidate.id,
                 Job.status == "PROCESSING",
+                Job.worker_id == candidate.worker_id,
                 Job.claimed_at < cutoff,
                 Job.retry_count < Job.max_retries,
             )
-            .order_by(Job.claimed_at.asc())
+            .update(
+                {
+                    Job.status: "PROCESSING",
+                    Job.stage: "PARSING",
+                    Job.worker_id: worker_id,
+                    Job.claimed_at: now,
+                    Job.retry_count: Job.retry_count + 1,
+                },
+                synchronize_session=False,
+            )
         )
-        if not is_sqlite:
-            expired_query = expired_query.with_for_update(skip_locked=True)
-        job = expired_query.first()
-        if job:
-            job.retry_count += 1
-
-    if job:
-        job.status = "PROCESSING"
-        job.stage = "PARSING"
-        job.worker_id = worker_id
-        job.claimed_at = now
-        db.commit()
-        db.refresh(job)
-    return job
+        if changed == 1:
+            db.commit()
+            db.refresh(candidate)
+            return candidate
+    db.rollback()
+    return None
 
 
 def update_job_progress(
