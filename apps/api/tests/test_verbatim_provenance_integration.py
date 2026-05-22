@@ -150,6 +150,14 @@ async def test_full_provenance_roundtrip(test_db_session):
     assert citation.anchor_status == AnchorStatus.VERIFIED
     assert len(citation.bounding_boxes) > 0
 
+    # A model may wrap a real quotation in prose that is not itself present in
+    # the paper. Keep only the verbatim text and its verified citation.
+    set_llm_provider(FakeLLMProvider(fixed_response=f'The paper explains "{top_item.quote}" [E1].'))
+    extractive = await chat_service.answer_question(db, conv.id, "Explain scaled attention")
+    assert extractive.content.startswith(f'"{top_item.quote}" [1]')
+    assert "The paper explains" not in extractive.content
+    assert len(extractive.citations) == 1
+
 
 @pytest.mark.anyio
 async def test_adversarial_hallucination_and_abstention(test_db_session):

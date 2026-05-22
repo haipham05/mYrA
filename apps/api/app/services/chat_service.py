@@ -96,6 +96,21 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
     return True
 
 
+def extract_verbatim_quoted_phrase(claim_text: str, evidence_quote: str) -> str | None:
+    """Keep a model-quoted source phrase, never its unsupported surrounding prose."""
+    for match in re.finditer(r'["“]([^"”]+)["”]', claim_text):
+        candidate = match.group(1).strip()
+        if len(re.findall(r"\b\w+\b", candidate)) < 3:
+            continue
+        source_match = re.search(re.escape(candidate), evidence_quote, flags=re.IGNORECASE)
+        if source_match is None:
+            continue
+        source_phrase = source_match.group(0)
+        if check_claim_support(source_phrase, evidence_quote):
+            return source_phrase
+    return None
+
+
 def matching_verified_anchor(evidence: EvidenceItem) -> CitationAnchor | None:
     if not evidence.document_sha256 or not evidence.parser_version:
         return None
@@ -158,10 +173,12 @@ class ChatService:
 
         system_prompt = (
             "You are mYrA, an academic research assistant. "
-            "Answer the user's question using ONLY the provided evidence. "
-            "Every statement derived from the papers MUST cite the evidence using [E1], [E2]. "
-            "If evidence is insufficient to answer the question, clearly state that. "
-            "Do not make up citations."
+            "Answer using ONLY the provided evidence quotes, not the surrounding context. "
+            "For each claim, copy a short relevant sentence or phrase verbatim from ONE "
+            "Evidence quote, preserving its words, numbers, and order, then append that "
+            "quote's citation ID such as [E1]. Do not paraphrase or combine quotes. "
+            "If no quote directly answers the question, say that evidence is insufficient. "
+            "Never invent a citation ID."
         )
 
         evidence_text_parts = []
@@ -215,19 +232,33 @@ class ChatService:
 
             # Verify claim support against cited evidence
             sentence_supported = True
+            source_phrase: str | None = None
             for m in cite_matches:
                 e_id = f"E{m.group(1)}"
                 evidence = evidence_map[e_id]
                 clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
-                if not matching_verified_anchor(evidence) or not check_claim_support(
-                    clean_claim, evidence.quote
-                ):
+                if not matching_verified_anchor(evidence):
                     sentence_supported = False
                     break
+                if not check_claim_support(clean_claim, evidence.quote):
+                    # Some otherwise useful responses wrap a verbatim excerpt in
+                    # unverified prose. Publish only the exact excerpt, and only
+                    # when one verified source is cited by this sentence.
+                    source_phrase = (
+                        extract_verbatim_quoted_phrase(clean_claim, evidence.quote)
+                        if len(cite_matches) == 1
+                        else None
+                    )
+                    if source_phrase is None:
+                        sentence_supported = False
+                        break
 
             if not sentence_supported:
                 # Unsupported claim: discard entire sentence
                 continue
+
+            if source_phrase is not None:
+                sentence = f'"{source_phrase}" {cite_matches[0].group()}.'
 
             # Register verified citations for supported sentence
             for m in cite_matches:

@@ -14,7 +14,11 @@ from app.main import app
 from app.schemas.evidence import AnchorStatus
 from app.schemas.paper import PaperStatus
 from app.schemas.project import ProjectCreate
-from app.services.chat_service import ChatService, check_claim_support
+from app.services.chat_service import (
+    ChatService,
+    check_claim_support,
+    extract_verbatim_quoted_phrase,
+)
 from app.services.llm import FakeLLMProvider, set_llm_provider
 
 client = TestClient(app)
@@ -36,6 +40,28 @@ def test_claim_support_requires_ordered_extract():
     # Empty inputs
     assert check_claim_support("", quote) is False
     assert check_claim_support(claim, "") is False
+
+
+def test_only_verbatim_source_phrase_survives_an_unsupported_wrapper():
+    source = (
+        "We introduce BERT, which stands for Bidirectional Encoder "
+        "Representations from Transformers."
+    )
+    wrapper = (
+        'The BERT acronym stands for "Bidirectional Encoder Representations from Transformers".'
+    )
+    assert check_claim_support(wrapper, source) is False
+    assert extract_verbatim_quoted_phrase(wrapper, source) == (
+        "Bidirectional Encoder Representations from Transformers"
+    )
+    assert (
+        extract_verbatim_quoted_phrase(
+            'It means "bidirectional encoder representations from transformers".', source
+        )
+        == "Bidirectional Encoder Representations from Transformers"
+    )
+    assert extract_verbatim_quoted_phrase('It means "Bidirectional Encoder".', source) is None
+    assert extract_verbatim_quoted_phrase('It means "an unrelated model".', source) is None
 
 
 def test_oversized_pdf_upload():
