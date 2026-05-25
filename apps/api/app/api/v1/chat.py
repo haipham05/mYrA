@@ -4,13 +4,21 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.crud.chat import create_conversation, get_conversation
+from app.crud.chat import (
+    create_conversation,
+    delete_conversation,
+    get_conversation,
+    list_conversations,
+    update_conversation,
+)
 from app.crud.project import get_project
 from app.db.models import Conversation
 from app.db.session import get_db
 from app.schemas.chat import (
     ConversationCreate,
+    ConversationListResponse,
     ConversationResponse,
+    ConversationUpdate,
     MessageCreate,
     MessageResponse,
     MessageRole,
@@ -21,6 +29,21 @@ from app.services.chat_service import ChatService
 logger = logging.getLogger("myra.api.chat")
 router = APIRouter(tags=["chat"])
 chat_service = ChatService()
+
+
+def _to_conversation_response(
+    conv: Conversation, message_count: int | None = None
+) -> ConversationResponse:
+    count = message_count if message_count is not None else len(conv.messages)
+    return ConversationResponse(
+        id=conv.id,
+        project_id=conv.project_id,
+        title=conv.title,
+        is_archived=conv.is_archived,
+        message_count=count,
+        created_at=conv.created_at,
+        updated_at=conv.updated_at,
+    )
 
 
 @router.post(
@@ -42,34 +65,40 @@ def create_new_conversation(
 
     title = conversation_in.title if conversation_in else None
     conv = create_conversation(db, project_id=project_id, title=title)
-    return ConversationResponse.model_validate(conv, from_attributes=True)
+    return _to_conversation_response(conv, message_count=0)
 
 
 @router.get(
     "/projects/{project_id}/conversations",
-    response_model=list[ConversationResponse],
+    response_model=ConversationListResponse,
 )
 def list_project_conversations(
     project_id: UUID,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    include_archived: bool = Query(default=False),
     db: Session = Depends(get_db),
-) -> list[ConversationResponse]:
+) -> ConversationListResponse:
     project = get_project(db, project_id)
     if not project:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Project {project_id} not found",
         )
-    convs = (
-        db.query(Conversation)
-        .filter(Conversation.project_id == project_id)
-        .order_by(Conversation.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
+    convs, total = list_conversations(
+        db,
+        project_id=project_id,
+        limit=limit,
+        offset=offset,
+        include_archived=include_archived,
     )
-    return [ConversationResponse.model_validate(c, from_attributes=True) for c in convs]
+    items = [_to_conversation_response(c) for c in convs]
+    return ConversationListResponse(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get(
@@ -86,7 +115,46 @@ def get_single_conversation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation {conversation_id} not found",
         )
-    return ConversationResponse.model_validate(conv, from_attributes=True)
+    return _to_conversation_response(conv)
+
+
+@router.patch(
+    "/conversations/{conversation_id}",
+    response_model=ConversationResponse,
+)
+def update_single_conversation(
+    conversation_id: UUID,
+    conv_update: ConversationUpdate,
+    db: Session = Depends(get_db),
+) -> ConversationResponse:
+    conv = update_conversation(
+        db,
+        conversation_id=conversation_id,
+        title=conv_update.title,
+        is_archived=conv_update.is_archived,
+    )
+    if not conv:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation {conversation_id} not found",
+        )
+    return _to_conversation_response(conv)
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_single_conversation(
+    conversation_id: UUID,
+    db: Session = Depends(get_db),
+) -> None:
+    deleted = delete_conversation(db, conversation_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation {conversation_id} not found",
+        )
 
 
 @router.get(
@@ -116,6 +184,8 @@ def get_conversation_messages(
                 content=msg.content,
                 citations=citations,
                 evidence=evidence,
+                model_name=msg.model_name,
+                token_count=msg.token_count,
                 created_at=msg.created_at,
             )
         )

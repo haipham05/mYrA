@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import type { Citation, Message } from "@/types";
+import ConversationNavigator from "@/components/ConversationNavigator";
+import type { Citation, Conversation, Message } from "@/types";
 
 interface ChatPanelProps {
   messages: Message[];
@@ -10,6 +11,12 @@ interface ChatPanelProps {
   onCitationClick: (citation: Citation) => void;
   activeCitation: Citation | null;
   disabled: boolean;
+  conversations?: Conversation[];
+  activeConversation?: Conversation | null;
+  onSelectConversation?: (conv: Conversation) => void;
+  onCreateConversation?: (title?: string) => Promise<void>;
+  onRenameConversation?: (id: string, newTitle: string) => Promise<void>;
+  onDeleteConversation?: (id: string) => Promise<void>;
 }
 
 export default function ChatPanel({
@@ -19,6 +26,12 @@ export default function ChatPanel({
   onCitationClick,
   activeCitation,
   disabled,
+  conversations,
+  activeConversation,
+  onSelectConversation,
+  onCreateConversation,
+  onRenameConversation,
+  onDeleteConversation,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
 
@@ -74,6 +87,22 @@ export default function ChatPanel({
           evidence.
         </p>
       </div>
+
+      {conversations &&
+        onSelectConversation &&
+        onCreateConversation &&
+        onRenameConversation &&
+        onDeleteConversation && (
+          <ConversationNavigator
+            conversations={conversations}
+            activeConversation={activeConversation || null}
+            onSelectConversation={onSelectConversation}
+            onCreateConversation={onCreateConversation}
+            onRenameConversation={onRenameConversation}
+            onDeleteConversation={onDeleteConversation}
+            disabled={disabled}
+          />
+        )}
 
       {/* Messages Scroll Area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">

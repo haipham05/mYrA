@@ -221,6 +221,7 @@ class Conversation(Base):
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -247,6 +248,8 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     citations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

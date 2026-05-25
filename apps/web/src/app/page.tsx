@@ -13,6 +13,7 @@ export default function Home() {
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [papers, setPapers] = useState<Paper[]>([]);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
@@ -53,7 +54,7 @@ export default function Home() {
     };
   }, [apiUrl]);
 
-  // 3. Fetch papers & active conversation when project changes
+  // 3. Fetch papers & conversations when project changes
   useEffect(() => {
     if (!selectedProject) return;
     let ignore = false;
@@ -73,18 +74,20 @@ export default function Home() {
           }
         }
 
-        // Restore existing conversation if available, or create new
+        // Restore conversations for project
         const listConvRes = await fetch(
           `${apiUrl}/api/v1/projects/${selectedProject?.id}/conversations`,
         );
-        let activeConv: Conversation | null = null;
+        let convList: Conversation[] = [];
         if (listConvRes.ok) {
-          const convList = await listConvRes.json();
-          if (Array.isArray(convList) && convList.length > 0) {
-            activeConv = convList[0];
-          }
+          const data = await listConvRes.json();
+          convList = Array.isArray(data) ? data : data.items || [];
         }
-        if (!activeConv) {
+
+        let activeConv: Conversation | null = null;
+        if (convList.length > 0) {
+          activeConv = convList[0];
+        } else {
           const createConvRes = await fetch(
             `${apiUrl}/api/v1/projects/${selectedProject?.id}/conversations`,
             {
@@ -95,19 +98,25 @@ export default function Home() {
           );
           if (createConvRes.ok) {
             activeConv = await createConvRes.json();
+            if (activeConv) {
+              convList = [activeConv];
+            }
           }
         }
 
-        if (!ignore && activeConv) {
-          setConversation(activeConv);
-          const msgsRes = await fetch(
-            `${apiUrl}/api/v1/conversations/${activeConv.id}/messages`,
-          );
-          if (!ignore && msgsRes.ok) {
-            const msgs = await msgsRes.json();
-            setMessages(msgs);
-          } else if (!ignore) {
-            setMessages([]);
+        if (!ignore) {
+          setConversations(convList);
+          if (activeConv) {
+            setConversation(activeConv);
+            const msgsRes = await fetch(
+              `${apiUrl}/api/v1/conversations/${activeConv.id}/messages`,
+            );
+            if (!ignore && msgsRes.ok) {
+              const msgs = await msgsRes.json();
+              setMessages(msgs);
+            } else if (!ignore) {
+              setMessages([]);
+            }
           }
         }
       } catch {
@@ -152,6 +161,97 @@ export default function Home() {
       const newProj = await res.json();
       setProjects((prev) => [newProj, ...prev]);
       setSelectedProject(newProj);
+    }
+  };
+
+  // Switch conversation
+  const handleSelectConversation = async (conv: Conversation) => {
+    setConversation(conv);
+    setActiveCitation(null);
+    try {
+      const msgsRes = await fetch(
+        `${apiUrl}/api/v1/conversations/${conv.id}/messages`,
+      );
+      if (msgsRes.ok) {
+        const msgs = await msgsRes.json();
+        setMessages(msgs);
+      } else {
+        setMessages([]);
+      }
+    } catch {
+      setMessages([]);
+    }
+  };
+
+  // Create conversation
+  const handleCreateConversation = async (title?: string) => {
+    if (!selectedProject) return;
+    try {
+      const res = await fetch(
+        `${apiUrl}/api/v1/projects/${selectedProject.id}/conversations`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: title || "New Research Chat" }),
+        },
+      );
+      if (res.ok) {
+        const newConv: Conversation = await res.json();
+        setConversations((prev) => [newConv, ...prev]);
+        setConversation(newConv);
+        setMessages([]);
+        setActiveCitation(null);
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  // Rename conversation
+  const handleRenameConversation = async (id: string, newTitle: string) => {
+    try {
+      const res = await fetch(`${apiUrl}/api/v1/conversations/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: newTitle }),
+      });
+      if (res.ok) {
+        const updated: Conversation = await res.json();
+        setConversations((prev) =>
+          prev.map((c) => (c.id === id ? { ...c, title: updated.title } : c)),
+        );
+        if (conversation?.id === id) {
+          setConversation((prev) =>
+            prev ? { ...prev, title: updated.title } : prev,
+          );
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  // Delete conversation
+  const handleDeleteConversation = async (id: string) => {
+    try {
+      const res = await fetch(`${apiUrl}/api/v1/conversations/${id}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        const remaining = conversations.filter((c) => c.id !== id);
+        setConversations(remaining);
+        if (conversation?.id === id) {
+          if (remaining.length > 0) {
+            handleSelectConversation(remaining[0]);
+          } else {
+            setConversation(null);
+            setMessages([]);
+            setActiveCitation(null);
+          }
+        }
+      }
+    } catch {
+      // Ignore
     }
   };
 
@@ -207,6 +307,7 @@ export default function Home() {
     setSelectedPaper(null);
     setActiveCitation(null);
     setPapers([]);
+    setConversations([]);
     setConversation(null);
     setMessages([]);
   };
@@ -268,6 +369,12 @@ export default function Home() {
               onCitationClick={handleCitationClick}
               activeCitation={activeCitation}
               disabled={!hasReadyPaper}
+              conversations={conversations}
+              activeConversation={conversation}
+              onSelectConversation={handleSelectConversation}
+              onCreateConversation={handleCreateConversation}
+              onRenameConversation={handleRenameConversation}
+              onDeleteConversation={handleDeleteConversation}
             />
           </div>
 

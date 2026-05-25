@@ -84,6 +84,8 @@ export interface Conversation {
   id: string;
   project_id: string;
   title?: string | null;
+  is_archived?: boolean;
+  message_count?: number;
   created_at: string;
   updated_at: string;
 }

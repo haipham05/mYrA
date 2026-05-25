@@ -315,6 +315,7 @@ class ChatService:
         )
 
         # 6. Save assistant message
+        model_name = getattr(llm, "model_name", llm.provider_name)
         assistant_msg: Message = add_message(
             db=db,
             conversation_id=conversation_id,
@@ -322,6 +323,7 @@ class ChatService:
             content=formatted_answer,
             citations=[c.model_dump(mode="json") for c in validated_citations],
             evidence=[e.model_dump(mode="json") for e in evidence_items],
+            model_name=model_name,
         )
 
         return MessageResponse(
@@ -331,5 +333,7 @@ class ChatService:
             content=formatted_answer,
             citations=validated_citations,
             evidence=evidence_items,
+            model_name=assistant_msg.model_name,
+            token_count=assistant_msg.token_count,
             created_at=assistant_msg.created_at,
         )

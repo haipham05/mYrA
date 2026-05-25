@@ -1,6 +1,8 @@
 from app.schemas.chat import (
     ConversationCreate,
+    ConversationListResponse,
     ConversationResponse,
+    ConversationUpdate,
     MessageCreate,
     MessageResponse,
     MessageRole,
@@ -30,7 +32,9 @@ __all__ = [
     "Citation",
     "CitationAnchor",
     "ConversationCreate",
+    "ConversationListResponse",
     "ConversationResponse",
+    "ConversationUpdate",
     "CoordinateOrigin",
     "ErrorResponse",
     "EvidenceItem",

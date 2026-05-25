@@ -216,6 +216,10 @@ async function assertHighlightMatchesQuote(
 }
 
 test.describe("isolated citation browser regression", () => {
+  let sharedProjectId: string;
+  let sharedPaperId: string;
+  let sharedCitationQuote: string;
+
   test.beforeAll(async ({ request }) => {
     try {
       await startIsolatedApi(request);
@@ -235,6 +239,7 @@ test.describe("isolated citation browser regression", () => {
     });
     expect(projectResponse.ok()).toBeTruthy();
     const projectId = (await projectResponse.json()).id as string;
+    sharedProjectId = projectId;
 
     const uploadResponse = await request.post(
       `${apiOrigin}/api/v1/projects/${projectId}/papers`,
@@ -300,6 +305,8 @@ test.describe("isolated citation browser regression", () => {
     const answer = await (await answerResponse).json();
     expect(answer.citations).toHaveLength(1);
     const citation = answer.citations[0];
+    sharedPaperId = upload.paper_id;
+    sharedCitationQuote = citation.quote;
     expect(citation.paper_id).toBe(upload.paper_id);
     expect(citation.page_number).toBe(5);
     expect(citation.quote).toContain("overall score of 80.5%");
@@ -338,5 +345,129 @@ test.describe("isolated citation browser regression", () => {
     await page.getByRole("button", { name: "Previous" }).click();
     await expect(page.getByText(/Page 4 of/)).toBeVisible();
     await expect(highlights).toHaveCount(0);
+  });
+
+  test("conversation persistence: reload, reopen chat, verify citations, switch, and delete chats", async ({
+    page,
+    request,
+  }) => {
+    // 1. Route requests to isolated API and load web UI
+    await routeOnlyToIsolatedApi(page);
+    await page.goto(WEB_ORIGIN);
+    await expect(page.getByText("Connected", { exact: true })).toBeVisible();
+
+    // 2. Select the shared project and paper
+    await page.locator("#project-select").selectOption(sharedProjectId);
+    await page
+      .getByRole("button", { name: /devlin2018_bert\.pdf/ })
+      .click({ timeout: 10000 });
+
+    // 3. Verify conversation and messages are reopened from DB
+    await expect(
+      page.getByText("What score did BERT obtain on the GLUE benchmark?"),
+    ).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText(/overall score of 80.5%/)).toBeVisible();
+
+    const initialConvId = await page
+      .locator("#conversation-select")
+      .inputValue();
+    expect(initialConvId).toBeTruthy();
+
+    // 4. Click citation chip in reopened conversation and verify highlight
+    await page.getByRole("button", { name: "[1]" }).click();
+    await expect(page.getByText(/Page 5 of/)).toBeVisible();
+    await expect(page.getByText("Verbatim match")).toBeVisible();
+    await assertHighlightMatchesQuote(page, sharedCitationQuote);
+
+    // 5. Rename conversation in UI
+    await page.getByRole("button", { name: "Rename conversation" }).click();
+    const titleInput = page.getByPlaceholder("Chat title");
+    await titleInput.fill("BERT GLUE Discussion");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.locator("#conversation-select")).toContainText(
+      "BERT GLUE Discussion",
+    );
+
+    // 6. Test browser page reload and verify state persists
+    await page.reload();
+    await expect(page.getByText("Connected", { exact: true })).toBeVisible();
+    await page.locator("#project-select").selectOption(sharedProjectId);
+    await page
+      .getByRole("button", { name: /devlin2018_bert\.pdf/ })
+      .click({ timeout: 10000 });
+    await expect(page.locator("#conversation-select")).toContainText(
+      "BERT GLUE Discussion",
+    );
+    await expect(
+      page.getByText("What score did BERT obtain on the GLUE benchmark?"),
+    ).toBeVisible();
+    await expect(page.getByText(/overall score of 80.5%/)).toBeVisible();
+
+    // 7. Verify citation chip still highlights after page reload
+    await page.getByRole("button", { name: "[1]" }).click();
+    await expect(page.getByText(/Page 5 of/)).toBeVisible();
+    await expect(page.getByText("Verbatim match")).toBeVisible();
+    await expect(page.getByTestId("evidence-highlight").first()).toBeVisible();
+    await assertHighlightMatchesQuote(page, sharedCitationQuote);
+
+    // 8. Create a new conversation
+    await page.getByRole("button", { name: "+ New Chat" }).click();
+    const newChatInput = page.getByPlaceholder("New chat title (optional)");
+    await newChatInput.fill("Secondary Investigation");
+    await page.getByRole("button", { name: "Start" }).click();
+    await expect(page.locator("#conversation-select")).toContainText(
+      "Secondary Investigation",
+    );
+    const newConvId = await page.locator("#conversation-select").inputValue();
+    expect(newConvId).not.toBe(initialConvId);
+
+    // Verify new chat has clean message area
+    await expect(
+      page.getByText("What score did BERT obtain on the GLUE benchmark?"),
+    ).not.toBeVisible();
+
+    // 9. Switch back to the previous conversation
+    await page.locator("#conversation-select").selectOption(initialConvId);
+    await expect(
+      page.getByText("What score did BERT obtain on the GLUE benchmark?"),
+    ).toBeVisible();
+    await expect(page.getByText(/overall score of 80.5%/)).toBeVisible();
+
+    // 10. Switch back to new conversation and delete it
+    await page.locator("#conversation-select").selectOption(newConvId);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Delete conversation" }).click();
+    await expect(page.locator("#conversation-select")).not.toContainText(
+      "Secondary Investigation",
+    );
+    // After deletion, active conversation falls back to the remaining conversation
+    await expect(page.locator("#conversation-select")).toHaveValue(
+      initialConvId,
+    );
+
+    // 11. Edge condition: Wrong-project isolation
+    const missingProjectId = "00000000-0000-0000-0000-000000000000";
+    const wrongProjectRes = await request.get(
+      `${apiOrigin}/api/v1/projects/${missingProjectId}/conversations`,
+    );
+    expect(wrongProjectRes.status()).toBe(404);
+
+    const missingConvId = "00000000-0000-0000-0000-000000000000";
+    const wrongConvRes = await request.get(
+      `${apiOrigin}/api/v1/conversations/${missingConvId}/messages`,
+    );
+    expect(wrongConvRes.status()).toBe(404);
+
+    // 12. Edge condition: System configuration status (non-secret, missing provider safe)
+    const systemStatusRes = await request.get(
+      `${apiOrigin}/api/v1/system/status`,
+    );
+    expect(systemStatusRes.ok()).toBeTruthy();
+    const systemStatus = await systemStatusRes.json();
+    expect(systemStatus.deepseek_configured).toBe(false);
+    expect(systemStatus.storage_backend).toBe("local");
+    const serialized = JSON.stringify(systemStatus);
+    expect(serialized).not.toContain("key");
+    expect(serialized).not.toContain("secret");
   });
 });

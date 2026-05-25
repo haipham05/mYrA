@@ -1,6 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +36,20 @@ app.add_middleware(
 async def health_check() -> dict[str, str]:
     """Return the service health status."""
     return {"status": "ok", "service": "myra-api"}
+
+
+@api_v1.get("/system/status", tags=["system"])
+async def system_status() -> dict[str, Any]:
+    """Return system configuration status without exposing sensitive credentials."""
+    current_settings = Settings.from_environment()
+    return {
+        "status": "ok",
+        "provider": "deepseek",
+        "deepseek_configured": bool(current_settings.deepseek_api_key),
+        "storage_backend": "gcs" if current_settings.gcs_bucket_name else "local",
+        "max_upload_size_bytes": current_settings.max_upload_size_bytes,
+        "max_pdf_pages": current_settings.max_pdf_pages,
+    }
 
 
 api_v1.include_router(api_router)

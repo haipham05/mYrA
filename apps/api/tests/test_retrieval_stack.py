@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -332,23 +333,37 @@ def test_sqlite_dense_search_ignores_incompatible_vectors(monkeypatch):
 
 
 def test_postgres_live_vector_and_fts():
-    """Opt-in live PostgreSQL test when DATABASE_URL is set to postgres."""
-    db_url = os.getenv("DATABASE_URL")
+    """Opt-in live PostgreSQL test when DATABASE_URL or .env is set to postgres."""
+    db_url = os.getenv("LIVE_DATABASE_URL") or os.getenv("DATABASE_URL")
+    if not db_url or "postgres" not in db_url:
+        env_file = Path(__file__).resolve().parents[3] / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("DATABASE_URL="):
+                    candidate = line.split("=", 1)[1].strip().strip("\"'")
+                    if "postgres" in candidate:
+                        db_url = candidate
+                        break
+
     if not db_url or "postgres" not in db_url:
         pytest.skip("Skipping postgres live test: DATABASE_URL is not PostgreSQL")
 
-    from app.db.session import engine
+    from sqlalchemy import create_engine
 
-    with engine.connect() as conn:
-        res = conn.execute(
-            text("SELECT '[0.1, 0.2]'::halfvec <=> '[0.1, 0.2]'::halfvec AS d;")
-        ).scalar()
-        assert pytest.approx(float(res)) == 0.0
+    live_engine = create_engine(db_url)
+    try:
+        with live_engine.connect() as conn:
+            res = conn.execute(
+                text("SELECT '[0.1, 0.2]'::halfvec <=> '[0.1, 0.2]'::halfvec AS d;")
+            ).scalar()
+            assert pytest.approx(float(res)) == 0.0
 
-        fts_res = conn.execute(
-            text(
-                "SELECT to_tsvector('english', 'Hybrid retrieval test with pgvector') @@ "
-                "plainto_tsquery('english', 'pgvector') AS match;"
-            )
-        ).scalar()
-        assert fts_res is True
+            fts_res = conn.execute(
+                text(
+                    "SELECT to_tsvector('english', 'Hybrid retrieval test with pgvector') @@ "
+                    "plainto_tsquery('english', 'pgvector') AS match;"
+                )
+            ).scalar()
+            assert fts_res is True
+    finally:
+        live_engine.dispose()
