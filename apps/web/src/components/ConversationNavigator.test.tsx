@@ -121,4 +121,54 @@ describe("ConversationNavigator", () => {
     fireEvent.click(screen.getByTitle("Delete conversation"));
     expect(onDelete).toHaveBeenCalledWith("conv-1");
   });
+
+  it("handles archiving conversation", async () => {
+    const onArchive = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ConversationNavigator
+        conversations={mockConversations}
+        activeConversation={mockConversations[0]}
+        onSelectConversation={vi.fn()}
+        onCreateConversation={vi.fn()}
+        onRenameConversation={vi.fn()}
+        onArchiveConversation={onArchive}
+        onDeleteConversation={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Archive conversation"));
+    expect(onArchive).toHaveBeenCalledWith("conv-1", true);
+  });
+
+  it("cancels rename and create on Escape key press", () => {
+    render(
+      <ConversationNavigator
+        conversations={mockConversations}
+        activeConversation={mockConversations[0]}
+        onSelectConversation={vi.fn()}
+        onCreateConversation={vi.fn()}
+        onRenameConversation={vi.fn()}
+        onDeleteConversation={vi.fn()}
+      />,
+    );
+
+    // Test rename cancel on Escape
+    fireEvent.click(screen.getByTitle("Rename conversation"));
+    const renameInput = screen.getByPlaceholderText("Chat title");
+    expect(renameInput).toBeDefined();
+    fireEvent.keyDown(renameInput, { key: "Escape" });
+    expect(screen.queryByPlaceholderText("Chat title")).toBeNull();
+
+    // Test create cancel on Escape
+    fireEvent.click(screen.getByRole("button", { name: "+ New Chat" }));
+    const createInput = screen.getByPlaceholderText(
+      "New chat title (optional)",
+    );
+    expect(createInput).toBeDefined();
+    fireEvent.keyDown(createInput, { key: "Escape" });
+    expect(
+      screen.queryByPlaceholderText("New chat title (optional)"),
+    ).toBeNull();
+  });
 });

@@ -7,6 +7,8 @@ import type { Citation, Conversation, Message } from "@/types";
 interface ChatPanelProps {
   messages: Message[];
   isLoading: boolean;
+  error?: string | null;
+  onDismissError?: () => void;
   onSendMessage: (content: string) => Promise<void>;
   onCitationClick: (citation: Citation) => void;
   activeCitation: Citation | null;
@@ -16,12 +18,15 @@ interface ChatPanelProps {
   onSelectConversation?: (conv: Conversation) => void;
   onCreateConversation?: (title?: string) => Promise<void>;
   onRenameConversation?: (id: string, newTitle: string) => Promise<void>;
+  onArchiveConversation?: (id: string, isArchived: boolean) => Promise<void>;
   onDeleteConversation?: (id: string) => Promise<void>;
 }
 
 export default function ChatPanel({
   messages,
   isLoading,
+  error,
+  onDismissError,
   onSendMessage,
   onCitationClick,
   activeCitation,
@@ -31,6 +36,7 @@ export default function ChatPanel({
   onSelectConversation,
   onCreateConversation,
   onRenameConversation,
+  onArchiveConversation,
   onDeleteConversation,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
@@ -99,16 +105,37 @@ export default function ChatPanel({
             onSelectConversation={onSelectConversation}
             onCreateConversation={onCreateConversation}
             onRenameConversation={onRenameConversation}
+            onArchiveConversation={onArchiveConversation}
             onDeleteConversation={onDeleteConversation}
             disabled={disabled}
           />
         )}
 
+      {/* Error banner */}
+      {error && (
+        <div className="flex items-center justify-between border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-800">
+          <span>{error}</span>
+          {onDismissError && (
+            <button
+              type="button"
+              onClick={onDismissError}
+              className="text-red-500 hover:text-red-700 cursor-pointer ml-2"
+              title="Dismiss error"
+              aria-label="Dismiss error"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Messages Scroll Area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 ? (
           <div className="flex h-full items-center justify-center text-center text-zinc-400 text-sm">
-            Ask a question over the indexed papers in this project.
+            {activeConversation
+              ? "Ask a question over the indexed papers in this project."
+              : "Click '+ New Chat' to begin asking questions."}
           </div>
         ) : (
           messages.map((msg) => (
@@ -153,7 +180,9 @@ export default function ChatPanel({
             disabled={disabled || isLoading}
             placeholder={
               disabled
-                ? "Upload and index a paper to begin asking questions…"
+                ? !activeConversation
+                  ? "Create a chat to begin asking questions…"
+                  : "Upload and index a paper to begin asking questions…"
                 : "Ask a grounded research question…"
             }
             className="flex-1 rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 placeholder-zinc-400 focus:border-zinc-900 focus:outline-hidden disabled:bg-zinc-50 disabled:opacity-60"

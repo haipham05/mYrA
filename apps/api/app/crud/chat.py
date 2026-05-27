@@ -46,6 +46,7 @@ def update_conversation(
     db: Session,
     conversation_id: UUID,
     title: str | None = None,
+    summary: str | None = None,
     is_archived: bool | None = None,
 ) -> Conversation | None:
     conv = get_conversation(db, conversation_id)
@@ -53,6 +54,8 @@ def update_conversation(
         return None
     if title is not None:
         conv.title = title
+    if summary is not None:
+        conv.summary = summary
     if is_archived is not None:
         conv.is_archived = is_archived
     conv.updated_at = datetime.now(UTC)

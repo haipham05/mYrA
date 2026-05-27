@@ -39,6 +39,7 @@ def _to_conversation_response(
         id=conv.id,
         project_id=conv.project_id,
         title=conv.title,
+        summary=conv.summary,
         is_archived=conv.is_archived,
         message_count=count,
         created_at=conv.created_at,
@@ -107,9 +108,10 @@ def list_project_conversations(
 )
 def get_single_conversation(
     conversation_id: UUID,
+    project_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> ConversationResponse:
-    conv = get_conversation(db, conversation_id)
+    conv = get_conversation(db, conversation_id, project_id=project_id)
     if not conv:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -125,12 +127,20 @@ def get_single_conversation(
 def update_single_conversation(
     conversation_id: UUID,
     conv_update: ConversationUpdate,
+    project_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> ConversationResponse:
+    existing = get_conversation(db, conversation_id, project_id=project_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation {conversation_id} not found",
+        )
     conv = update_conversation(
         db,
         conversation_id=conversation_id,
         title=conv_update.title,
+        summary=conv_update.summary,
         is_archived=conv_update.is_archived,
     )
     if not conv:
@@ -147,9 +157,10 @@ def update_single_conversation(
 )
 def delete_single_conversation(
     conversation_id: UUID,
+    project_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> None:
-    deleted = delete_conversation(db, conversation_id)
+    deleted = delete_conversation(db, conversation_id, project_id=project_id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -163,17 +174,23 @@ def delete_single_conversation(
 )
 def get_conversation_messages(
     conversation_id: UUID,
+    project_id: UUID | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[MessageResponse]:
-    conv = get_conversation(db, conversation_id)
+    conv = get_conversation(db, conversation_id, project_id=project_id)
     if not conv:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation {conversation_id} not found",
         )
 
+    from app.crud.chat import list_messages
+
+    msgs, _ = list_messages(db, conversation_id, limit=limit, offset=offset)
     results = []
-    for msg in conv.messages:
+    for msg in msgs:
         citations = [Citation.model_validate(c) for c in (msg.citations or [])]
         evidence = [EvidenceItem.model_validate(e) for e in (msg.evidence or [])]
         results.append(
@@ -199,9 +216,10 @@ def get_conversation_messages(
 async def send_message(
     conversation_id: UUID,
     message_in: MessageCreate,
+    project_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> MessageResponse:
-    conv = get_conversation(db, conversation_id)
+    conv = get_conversation(db, conversation_id, project_id=project_id)
     if not conv:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

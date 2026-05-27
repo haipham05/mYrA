@@ -196,11 +196,26 @@ def test_conversation_api_endpoints(client, db):
     res_archived = client.get(f"/api/v1/projects/{p.id}/conversations?include_archived=true")
     assert res_archived.json()["total"] == 1
 
-    # 6. Delete conversation
+    # 6. Project-scoping query parameter check
+    other_project_id = uuid4()
+    res_other = client.get(f"/api/v1/conversations/{conv_id}?project_id={other_project_id}")
+    assert res_other.status_code == 404
+    res_other_msgs = client.get(
+        f"/api/v1/conversations/{conv_id}/messages?project_id={other_project_id}"
+    )
+    assert res_other_msgs.status_code == 404
+    res_other_patch = client.patch(
+        f"/api/v1/conversations/{conv_id}?project_id={other_project_id}", json={"title": "Hacked"}
+    )
+    assert res_other_patch.status_code == 404
+    res_other_del = client.delete(f"/api/v1/conversations/{conv_id}?project_id={other_project_id}")
+    assert res_other_del.status_code == 404
+
+    # 7. Delete conversation
     res_del = client.delete(f"/api/v1/conversations/{conv_id}")
     assert res_del.status_code == 204
 
-    # 7. Get deleted conversation returns 404
+    # 8. Get deleted conversation returns 404
     res_get = client.get(f"/api/v1/conversations/{conv_id}")
     assert res_get.status_code == 404
 
@@ -231,3 +246,18 @@ async def test_chat_service_transactional_consistency_on_error(db):
     assert len(messages) == 1
     assert messages[0].role == MessageRole.USER
     assert messages[0].content == "Will this fail?"
+
+    # 3. Test duplicate submit deduplication:
+    # Retrying the exact same question when the last message is an unanswered USER message
+    # does NOT insert an unnecessary duplicate user record.
+    with patch("app.services.chat_service.get_llm_provider") as mock_get_llm:
+        mock_llm = AsyncMock()
+        mock_llm.generate.side_effect = RuntimeError("Second timeout")
+        mock_get_llm.return_value = mock_llm
+
+        with pytest.raises(RuntimeError, match="Second timeout"):
+            await chat_service.answer_question(db, conv.id, "Will this fail?")
+
+    messages_after_retry = db.query(Message).filter(Message.conversation_id == conv.id).all()
+    assert len(messages_after_retry) == 1
+    assert messages_after_retry[0].content == "Will this fail?"

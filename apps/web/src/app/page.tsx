@@ -18,16 +18,29 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [isAsking, setIsAsking] = useState(false);
+  const [deepseekStatus, setDeepseekStatus] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(null);
 
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
   const apiUrl = rawApiUrl.replace("localhost", "127.0.0.1");
 
-  // 1. Health check
+  // 1. Health check & system status
   useEffect(() => {
     fetch(`${apiUrl}/health`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then(() => setApiStatus("Connected"))
       .catch(() => setApiStatus("Unavailable"));
+
+    fetch(`${apiUrl}/api/v1/system/status`)
+      .then((res) => (res.ok ? res.json() : Promise.reject()))
+      .then((data) => {
+        setDeepseekStatus(
+          data.deepseek_configured
+            ? "DeepSeek configured"
+            : "Test provider mode",
+        );
+      })
+      .catch(() => {});
   }, [apiUrl]);
 
   // 2. Fetch projects
@@ -76,7 +89,7 @@ export default function Home() {
 
         // Restore conversations for project
         const listConvRes = await fetch(
-          `${apiUrl}/api/v1/projects/${selectedProject?.id}/conversations`,
+          `${apiUrl}/api/v1/projects/${selectedProject?.id}/conversations?include_archived=true`,
         );
         let convList: Conversation[] = [];
         if (listConvRes.ok) {
@@ -231,6 +244,32 @@ export default function Home() {
     }
   };
 
+  // Archive / unarchive conversation
+  const handleArchiveConversation = async (id: string, isArchived: boolean) => {
+    try {
+      const res = await fetch(`${apiUrl}/api/v1/conversations/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_archived: isArchived }),
+      });
+      if (res.ok) {
+        const updated: Conversation = await res.json();
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === id ? { ...c, is_archived: updated.is_archived } : c,
+          ),
+        );
+        if (conversation?.id === id) {
+          setConversation((prev) =>
+            prev ? { ...prev, is_archived: updated.is_archived } : prev,
+          );
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
   // Delete conversation
   const handleDeleteConversation = async (id: string) => {
     try {
@@ -257,8 +296,9 @@ export default function Home() {
 
   // Send QA Question
   const handleSendMessage = async (content: string) => {
-    if (!conversation) return;
+    if (!conversation || isAsking) return;
     setIsAsking(true);
+    setChatError(null);
     try {
       const res = await fetch(
         `${apiUrl}/api/v1/conversations/${conversation.id}/messages`,
@@ -271,13 +311,13 @@ export default function Home() {
       if (res.ok) {
         const assistantMsg: Message = await res.json();
         const userMsg: Message = {
-          id: `usr-${Date.now()}`,
+          id: `usr-${assistantMsg.id}`,
           conversation_id: conversation.id,
           role: "USER",
           content,
           citations: [],
           evidence: [],
-          created_at: new Date().toISOString(),
+          created_at: assistantMsg.created_at,
         };
         setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
@@ -285,7 +325,16 @@ export default function Home() {
         if (assistantMsg.citations && assistantMsg.citations.length > 0) {
           handleCitationClick(assistantMsg.citations[0]);
         }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        setChatError(
+          errData.detail || "Failed to generate answer. Please try again.",
+        );
       }
+    } catch (err: unknown) {
+      setChatError(
+        err instanceof Error ? err.message : "Network error. Please try again.",
+      );
     } finally {
       setIsAsking(false);
     }
@@ -339,6 +388,11 @@ export default function Home() {
             <div className="text-xs text-zinc-600">
               API:{" "}
               <span className="font-medium text-zinc-900">{apiStatus}</span>
+              {deepseekStatus && (
+                <span className="ml-2 font-normal text-zinc-500">
+                  · {deepseekStatus}
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -365,15 +419,18 @@ export default function Home() {
             <ChatPanel
               messages={messages}
               isLoading={isAsking}
+              error={chatError}
+              onDismissError={() => setChatError(null)}
               onSendMessage={handleSendMessage}
               onCitationClick={handleCitationClick}
               activeCitation={activeCitation}
-              disabled={!hasReadyPaper}
+              disabled={!hasReadyPaper || !conversation}
               conversations={conversations}
               activeConversation={conversation}
               onSelectConversation={handleSelectConversation}
               onCreateConversation={handleCreateConversation}
               onRenameConversation={handleRenameConversation}
+              onArchiveConversation={handleArchiveConversation}
               onDeleteConversation={handleDeleteConversation}
             />
           </div>

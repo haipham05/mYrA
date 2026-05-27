@@ -152,15 +152,22 @@ class ChatService:
 
         project_id = conv.project_id
 
-        # 1. Save user message
-        add_message(
-            db=db,
-            conversation_id=conversation_id,
-            role=MessageRole.USER,
-            content=question,
-            citations=[],
-            evidence=[],
+        # 1. Save user message if not an immediate duplicate of prior unanswered message
+        last_msg = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc())
+            .first()
         )
+        if not (last_msg and last_msg.role == MessageRole.USER and last_msg.content == question):
+            add_message(
+                db=db,
+                conversation_id=conversation_id,
+                role=MessageRole.USER,
+                content=question,
+                citations=[],
+                evidence=[],
+            )
 
         # 2. Retrieve evidence
         evidence_items: list[EvidenceItem] = self.retriever.retrieve(

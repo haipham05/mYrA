@@ -217,7 +217,6 @@ async function assertHighlightMatchesQuote(
 
 test.describe("isolated citation browser regression", () => {
   let sharedProjectId: string;
-  let sharedPaperId: string;
   let sharedCitationQuote: string;
 
   test.beforeAll(async ({ request }) => {
@@ -305,7 +304,6 @@ test.describe("isolated citation browser regression", () => {
     const answer = await (await answerResponse).json();
     expect(answer.citations).toHaveLength(1);
     const citation = answer.citations[0];
-    sharedPaperId = upload.paper_id;
     sharedCitationQuote = citation.quote;
     expect(citation.paper_id).toBe(upload.paper_id);
     expect(citation.page_number).toBe(5);

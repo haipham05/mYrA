@@ -19,6 +19,7 @@ class ConversationCreate(BaseModel):
 
 class ConversationUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=255)
+    summary: str | None = None
     is_archived: bool | None = None
 
 
@@ -26,6 +27,7 @@ class ConversationResponse(BaseModel):
     id: UUID
     project_id: UUID
     title: str | None = None
+    summary: str | None = None
     is_archived: bool = False
     message_count: int = 0
     created_at: datetime

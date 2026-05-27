@@ -77,6 +77,8 @@ export interface Message {
   content: string;
   citations: Citation[];
   evidence: EvidenceItem[];
+  model_name?: string | null;
+  token_count?: number | null;
   created_at: string;
 }
 
@@ -84,6 +86,7 @@ export interface Conversation {
   id: string;
   project_id: string;
   title?: string | null;
+  summary?: string | null;
   is_archived?: boolean;
   message_count?: number;
   created_at: string;

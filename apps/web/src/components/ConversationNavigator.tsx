@@ -9,6 +9,7 @@ interface ConversationNavigatorProps {
   onSelectConversation: (conv: Conversation) => void;
   onCreateConversation: (title?: string) => Promise<void>;
   onRenameConversation: (id: string, newTitle: string) => Promise<void>;
+  onArchiveConversation?: (id: string, isArchived: boolean) => Promise<void>;
   onDeleteConversation: (id: string) => Promise<void>;
   disabled?: boolean;
 }
@@ -19,6 +20,7 @@ export default function ConversationNavigator({
   onSelectConversation,
   onCreateConversation,
   onRenameConversation,
+  onArchiveConversation,
   onDeleteConversation,
   disabled = false,
 }: ConversationNavigatorProps) {
@@ -48,6 +50,19 @@ export default function ConversationNavigator({
     try {
       await onRenameConversation(activeConversation.id, editTitle.trim());
       setIsRenaming(false);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleArchive = async () => {
+    if (!activeConversation || !onArchiveConversation || loading) return;
+    setLoading(true);
+    try {
+      await onArchiveConversation(
+        activeConversation.id,
+        !activeConversation.is_archived,
+      );
     } finally {
       setLoading(false);
     }
@@ -91,6 +106,7 @@ export default function ConversationNavigator({
           {conversations.map((c) => (
             <option key={c.id} value={c.id}>
               {c.title || "Untitled Chat"}
+              {c.is_archived ? " [Archived]" : ""}
               {c.message_count !== undefined ? ` (${c.message_count})` : ""}
             </option>
           ))}
@@ -108,6 +124,27 @@ export default function ConversationNavigator({
             aria-label="Rename conversation"
           >
             ✎
+          </button>
+        )}
+
+        {activeConversation && onArchiveConversation && !isRenaming && (
+          <button
+            type="button"
+            onClick={handleArchive}
+            disabled={disabled || loading}
+            className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 cursor-pointer text-xs disabled:opacity-40"
+            title={
+              activeConversation.is_archived
+                ? "Unarchive conversation"
+                : "Archive conversation"
+            }
+            aria-label={
+              activeConversation.is_archived
+                ? "Unarchive conversation"
+                : "Archive conversation"
+            }
+          >
+            {activeConversation.is_archived ? "📦" : "📁"}
           </button>
         )}
 
@@ -133,6 +170,11 @@ export default function ConversationNavigator({
               type="text"
               value={editTitle}
               onChange={(e) => setEditTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setIsRenaming(false);
+                }
+              }}
               placeholder="Chat title"
               required
               autoFocus
@@ -159,6 +201,11 @@ export default function ConversationNavigator({
               type="text"
               value={newTitle}
               onChange={(e) => setNewTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setIsCreating(false);
+                }
+              }}
               placeholder="New chat title (optional)"
               autoFocus
               className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-xs text-zinc-900 focus:border-zinc-900 focus:outline-hidden"

@@ -95,4 +95,26 @@ describe("ChatPanel", () => {
 
     expect(onSendMessage).toHaveBeenCalledWith("How many layers?");
   });
+
+  it("renders error banner and calls onDismissError when dismissed", () => {
+    const onDismiss = vi.fn();
+    render(
+      <ChatPanel
+        messages={[]}
+        isLoading={false}
+        error="Failed to connect to DeepSeek"
+        onDismissError={onDismiss}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByText("Failed to connect to DeepSeek"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+    expect(onDismiss).toHaveBeenCalled();
+  });
 });
