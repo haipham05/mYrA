@@ -1,6 +1,8 @@
 from collections.abc import Generator
+from typing import Any
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
@@ -19,6 +21,15 @@ engine = create_engine(
     connect_args=connect_args,
     echo=(settings.log_level == "DEBUG"),
 )
+
+
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_connection: Any, connection_record: Any) -> None:
+    if type(dbapi_connection).__module__ == "sqlite3":
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

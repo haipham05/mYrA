@@ -179,22 +179,28 @@ def test_conversation_api_endpoints(client, db):
     assert len(list_data["items"]) == 1
     assert list_data["items"][0]["id"] == conv_id
 
-    # 3. Patch conversation (rename and archive)
+    # 3. Patch conversation (rename, archive, and summary)
     res_patch = client.patch(
         f"/api/v1/conversations/{conv_id}",
-        json={"title": "Renamed Chat", "is_archived": True},
+        json={
+            "title": "Renamed Chat",
+            "summary": "Initial conversation summary.",
+            "is_archived": True,
+        },
     )
     assert res_patch.status_code == 200
     assert res_patch.json()["title"] == "Renamed Chat"
+    assert res_patch.json()["summary"] == "Initial conversation summary."
     assert res_patch.json()["is_archived"] is True
 
     # 4. List without include_archived returns 0 items
     res_active = client.get(f"/api/v1/projects/{p.id}/conversations")
     assert res_active.json()["total"] == 0
 
-    # 5. List with include_archived=true returns 1 item
+    # 5. List with include_archived=true returns 1 item with summary
     res_archived = client.get(f"/api/v1/projects/{p.id}/conversations?include_archived=true")
     assert res_archived.json()["total"] == 1
+    assert res_archived.json()["items"][0]["summary"] == "Initial conversation summary."
 
     # 6. Project-scoping query parameter check
     other_project_id = uuid4()
@@ -261,3 +267,63 @@ async def test_chat_service_transactional_consistency_on_error(db):
     messages_after_retry = db.query(Message).filter(Message.conversation_id == conv.id).all()
     assert len(messages_after_retry) == 1
     assert messages_after_retry[0].content == "Will this fail?"
+
+
+@pytest.mark.anyio
+async def test_chat_service_multiturn_context_and_token_count(db):
+    p = Project(name="Multiturn Project")
+    db.add(p)
+    db.commit()
+
+    conv = create_conversation(db, project_id=p.id, title="Multiturn Chat")
+
+    # Add prior turn
+    add_message(
+        db=db,
+        conversation_id=conv.id,
+        role=MessageRole.USER,
+        content="What score did BERT obtain on GLUE?",
+        citations=[],
+        evidence=[],
+    )
+    add_message(
+        db=db,
+        conversation_id=conv.id,
+        role=MessageRole.ASSISTANT,
+        content="BERT obtained an 80.5% average score.",
+        citations=[],
+        evidence=[],
+    )
+
+    chat_service = ChatService()
+
+    with patch("app.services.chat_service.get_llm_provider") as mock_get_llm:
+        mock_llm = AsyncMock()
+        mock_llm.provider_name = "test-provider"
+        mock_llm.model_name = "test-chat-model"
+        mock_llm.generate.return_value = "No direct comparison found."
+        mock_get_llm.return_value = mock_llm
+
+        res = await chat_service.answer_question(
+            db, conv.id, "How does that compare to the baseline?"
+        )
+
+        # 1. Assert multi-turn history was propagated to user_prompt
+        call_args = mock_llm.generate.call_args
+        assert call_args is not None
+        user_prompt_sent = call_args.kwargs.get("user_prompt", "")
+        assert "CONVERSATION HISTORY:" in user_prompt_sent
+        assert "What score did BERT obtain on GLUE?" in user_prompt_sent
+        assert "BERT obtained an 80.5% average score." in user_prompt_sent
+        assert "How does that compare to the baseline?" in user_prompt_sent
+
+        # 2. Assert token count is calculated and populated
+        assert res.token_count is not None
+        assert res.token_count > 0
+        assert res.model_name == "test-chat-model"
+
+        # 3. Assert message record in database has token_count
+        db_msg = db.get(Message, res.id)
+        assert db_msg is not None
+        assert db_msg.token_count == res.token_count
+        assert db_msg.model_name == "test-chat-model"

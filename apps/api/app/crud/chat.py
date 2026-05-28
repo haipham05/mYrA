@@ -115,7 +115,7 @@ def list_messages(
     query = (
         db.query(Message)
         .filter(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.asc(), Message.id.asc())
     )
     total = query.count()
     items = query.offset(offset).limit(limit).all()

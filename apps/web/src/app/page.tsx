@@ -74,6 +74,11 @@ export default function Home() {
 
     async function loadProjectDetails() {
       try {
+        if (!ignore) {
+          setActiveCitation(null);
+          setChatError(null);
+        }
+
         const papersRes = await fetch(
           `${apiUrl}/api/v1/projects/${selectedProject?.id}/papers`,
         );
@@ -84,7 +89,12 @@ export default function Home() {
           setPapers(items);
           if (items.length > 0) {
             setSelectedPaper(items[0]);
+          } else {
+            setSelectedPaper(null);
           }
+        } else if (!ignore) {
+          setPapers([]);
+          setSelectedPaper(null);
         }
 
         // Restore conversations for project
@@ -130,6 +140,9 @@ export default function Home() {
             } else if (!ignore) {
               setMessages([]);
             }
+          } else {
+            setConversation(null);
+            setMessages([]);
           }
         }
       } catch {
@@ -214,9 +227,11 @@ export default function Home() {
         setConversation(newConv);
         setMessages([]);
         setActiveCitation(null);
+      } else {
+        setChatError("Failed to create conversation.");
       }
     } catch {
-      // Ignore
+      setChatError("Network error: Failed to create conversation.");
     }
   };
 
@@ -238,9 +253,11 @@ export default function Home() {
             prev ? { ...prev, title: updated.title } : prev,
           );
         }
+      } else {
+        setChatError("Failed to rename conversation.");
       }
     } catch {
-      // Ignore
+      setChatError("Network error: Failed to rename conversation.");
     }
   };
 
@@ -264,9 +281,11 @@ export default function Home() {
             prev ? { ...prev, is_archived: updated.is_archived } : prev,
           );
         }
+      } else {
+        setChatError("Failed to update archive status.");
       }
     } catch {
-      // Ignore
+      setChatError("Network error: Failed to update archive status.");
     }
   };
 
@@ -288,9 +307,11 @@ export default function Home() {
             setActiveCitation(null);
           }
         }
+      } else {
+        setChatError("Failed to delete conversation.");
       }
     } catch {
-      // Ignore
+      setChatError("Network error: Failed to delete conversation.");
     }
   };
 

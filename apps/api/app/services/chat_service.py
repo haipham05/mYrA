@@ -178,9 +178,25 @@ class ChatService:
 
         evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
 
+        # 3. Retrieve prior conversation history (bounded to last 6 messages)
+        history_msgs = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.asc())
+            .all()
+        )
+        history_turns = []
+        for msg in history_msgs:
+            if msg.role == MessageRole.USER and msg.content == question and msg == history_msgs[-1]:
+                continue
+            history_turns.append(f"{msg.role}: {msg.content}")
+
+        history_block = "\n".join(history_turns[-6:]) if history_turns else ""
+
         system_prompt = (
             "You are mYrA, an academic research assistant. "
-            "Answer using ONLY the provided evidence quotes, not the surrounding context. "
+            "Answer the QUESTION using ONLY the provided evidence quotes, "
+            "maintaining continuity with CONVERSATION HISTORY when relevant. "
             "For each claim, copy a short relevant sentence or phrase verbatim from ONE "
             "Evidence quote, preserving its words, numbers, and order, then append that "
             "quote's citation ID such as [E1]. Do not paraphrase or combine quotes. "
@@ -204,7 +220,15 @@ class ChatService:
             if evidence_text_parts
             else "No relevant evidence found."
         )
-        user_prompt = f"EVIDENCE:\n{evidence_block}\n\nQUESTION:\n{question}"
+
+        if history_block:
+            user_prompt = (
+                f"EVIDENCE:\n{evidence_block}\n\n"
+                f"CONVERSATION HISTORY:\n{history_block}\n\n"
+                f"QUESTION:\n{question}"
+            )
+        else:
+            user_prompt = f"EVIDENCE:\n{evidence_block}\n\nQUESTION:\n{question}"
 
         # 4. Generate answer with LLM
         llm = get_llm_provider()
@@ -310,19 +334,9 @@ class ChatService:
             )
             validated_citations = []
 
-        latency_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(
-            "answer_generated",
-            extra={
-                "conversation_id": str(conversation_id),
-                "latency_ms": round(latency_ms, 2),
-                "evidence_count": len(evidence_items),
-                "citations_count": len(validated_citations),
-            },
-        )
-
         # 6. Save assistant message
         model_name = getattr(llm, "model_name", llm.provider_name)
+        token_count = max(1, len(formatted_answer.split()))
         assistant_msg: Message = add_message(
             db=db,
             conversation_id=conversation_id,
@@ -331,6 +345,19 @@ class ChatService:
             citations=[c.model_dump(mode="json") for c in validated_citations],
             evidence=[e.model_dump(mode="json") for e in evidence_items],
             model_name=model_name,
+            token_count=token_count,
+        )
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(
+            "answer_generated",
+            extra={
+                "conversation_id": str(conversation_id),
+                "latency_ms": round(latency_ms, 2),
+                "evidence_count": len(evidence_items),
+                "citations_count": len(validated_citations),
+                "token_count": token_count,
+            },
         )
 
         return MessageResponse(
