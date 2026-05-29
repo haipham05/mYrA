@@ -32,6 +32,7 @@ def get_single_paper(
 @router.get("/{paper_id}/document")
 async def get_paper_document(
     paper_id: UUID,
+    project_id: UUID | None = None,
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     paper = get_paper(db, paper_id)
@@ -39,6 +40,11 @@ async def get_paper_document(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Paper {paper_id} not found",
+        )
+    if project_id and paper.project_id != project_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Paper {paper_id} not found in project {project_id}",
         )
 
     storage = get_storage()
@@ -66,7 +72,10 @@ async def get_paper_document(
     headers = {
         "Content-Disposition": f'inline; filename="{paper.filename}"',
         "Content-Type": "application/pdf",
+        "Cache-Control": "public, max-age=3600",
     }
+    if paper.document_sha256:
+        headers["ETag"] = f'"{paper.document_sha256}"'
 
     return StreamingResponse(stream, media_type="application/pdf", headers=headers)
 

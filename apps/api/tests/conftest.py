@@ -13,6 +13,7 @@ os.environ["MYRA_LLM_MODE"] = "test"
 os.environ["MYRA_EMBEDDING_PROVIDER"] = "deterministic"
 os.environ["MYRA_RERANKER_PROVIDER"] = "simple-lexical"
 os.environ["MYRA_USE_DOCLING"] = "false"
+os.environ["MYRA_CHECK_MIGRATIONS"] = "false"
 
 
 def pytest_sessionfinish() -> None:

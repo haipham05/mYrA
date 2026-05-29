@@ -6,7 +6,7 @@ import signal
 from uuid import uuid4
 
 from app.config import Settings
-from app.crud.job import claim_next_job, renew_job_lease
+from app.crud.job import claim_next_job, release_job, renew_job_lease
 from app.db.session import SessionLocal
 from app.logging import configure_logging
 from app.services.ingestion import IngestionPipeline
@@ -20,16 +20,25 @@ async def run_worker(
     settings = Settings.from_environment()
     configure_logging(settings.log_level)
 
+    if settings.check_migration_compatibility:
+        from app.db.compatibility import check_schema_compatibility
+        from app.db.session import engine
+
+        check_schema_compatibility(engine)
+
     worker_id = f"worker-{os.getpid()}-{uuid4().hex[:6]}"
     logger.info("worker_started", extra={"worker_id": worker_id})
 
     pipeline = IngestionPipeline()
     running = True
+    active_processing_task: asyncio.Task | None = None
 
     def _sig_handler(sig, frame):
         nonlocal running
         logger.info("worker_stopping")
         running = False
+        if active_processing_task and not active_processing_task.done():
+            active_processing_task.cancel()
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
@@ -62,6 +71,7 @@ async def run_worker(
                         db, paper_id=job.paper_id, job_id=job.id, worker_id=worker_id
                     )
                 )
+                active_processing_task = processing_task
                 heartbeat_task = asyncio.create_task(
                     _heartbeat(
                         job.id,
@@ -75,13 +85,18 @@ async def run_worker(
                     await processing_task
                 except asyncio.CancelledError:
                     db.rollback()
+                    with SessionLocal() as r_db:
+                        release_job(r_db, job.id, worker_id=worker_id)
+                    logger.info("released_job_on_shutdown", extra={"job_id": str(job.id)})
                 finally:
                     heartbeat_task.cancel()
+                    active_processing_task = None
                     try:
                         await heartbeat_task
                     except asyncio.CancelledError:
                         pass
                 logger.info("finished_job", extra={"job_id": str(job.id)})
+
                 if once:
                     break
                 continue

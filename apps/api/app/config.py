@@ -23,6 +23,7 @@ class Settings(BaseModel):
     deepseek_base_url: str = "https://api.deepseek.com"
     max_upload_size_bytes: int = 50 * 1024 * 1024
     max_pdf_pages: int = 150
+    check_migration_compatibility: bool = True
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -53,4 +54,10 @@ class Settings(BaseModel):
             values["max_upload_size_bytes"] = int(max_size)
         if max_pages := os.getenv("MYRA_MAX_PDF_PAGES"):
             values["max_pdf_pages"] = int(max_pages)
+        if check_migrations := os.getenv("MYRA_CHECK_MIGRATIONS"):
+            values["check_migration_compatibility"] = check_migrations.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
         return cls.model_validate(values)

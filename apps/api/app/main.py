@@ -16,7 +16,13 @@ api_v1 = APIRouter(prefix="/api/v1")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    configure_logging(settings.log_level)
+    current_settings = Settings.from_environment()
+    configure_logging(current_settings.log_level)
+    if current_settings.check_migration_compatibility:
+        from app.db.compatibility import check_schema_compatibility
+        from app.db.session import engine
+
+        check_schema_compatibility(engine)
     logging.getLogger("myra.api").info("application_started")
     yield
 
@@ -34,8 +40,80 @@ app.add_middleware(
 @api_v1.get("/health", tags=["health"])
 @app.get("/health", tags=["health"], include_in_schema=False)
 async def health_check() -> dict[str, str]:
-    """Return the service health status."""
+    """Return the service health liveness status."""
     return {"status": "ok", "service": "myra-api"}
+
+
+@api_v1.get("/health/ready", tags=["health"])
+@app.get("/health/ready", tags=["health"], include_in_schema=False)
+async def readiness_check() -> dict[str, Any]:
+    """Readiness probe checking database connectivity, schema compatibility, and storage."""
+    from fastapi import HTTPException
+    from sqlalchemy import text
+
+    from app.db.compatibility import get_schema_revisions
+    from app.db.session import engine
+    from app.storage.factory import get_storage
+
+    current_settings = Settings.from_environment()
+    readiness: dict[str, Any] = {
+        "status": "ready",
+        "service": "myra-api",
+        "database": "unknown",
+        "storage": "unknown",
+    }
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        readiness["database"] = "connected"
+    except Exception as err:
+        readiness["status"] = "unready"
+        readiness["database"] = "unreachable"
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "unready", "error": "Database connectivity check failed"},
+        ) from err
+
+    current_rev = None
+    if current_settings.check_migration_compatibility:
+        try:
+            current_rev, expected_heads = get_schema_revisions(engine)
+            if not current_rev or current_rev not in expected_heads:
+                readiness["status"] = "unready"
+                readiness["schema"] = "incompatible"
+                err_msg = f"Schema mismatch (current: {current_rev}, expected: {expected_heads})"
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "status": "unready",
+                        "error": err_msg,
+                    },
+                )
+            readiness["schema"] = "compatible"
+            readiness["schema_revision"] = current_rev
+        except HTTPException:
+            raise
+        except Exception as err:
+            readiness["status"] = "unready"
+            raise HTTPException(
+                status_code=503,
+                detail={"status": "unready", "error": "Schema revision check failed"},
+            ) from err
+
+    try:
+        storage = get_storage(current_settings)
+        await storage.exists("__readiness_probe__")
+        readiness["storage"] = "available"
+    except Exception as err:
+        readiness["status"] = "unready"
+        readiness["storage"] = "unavailable"
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "unready", "error": "Storage backend check failed"},
+        ) from err
+
+    return readiness
 
 
 @api_v1.get("/system/status", tags=["system"])

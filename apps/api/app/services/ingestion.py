@@ -12,6 +12,7 @@ from app.ingestion.parser import DocumentParser
 from app.schemas.job import JobStage, JobStatus
 from app.schemas.paper import PaperStatus
 from app.services.embedding import get_embedding_provider
+from app.services.error_sanitizer import classify_and_sanitize_error
 from app.storage.factory import get_storage
 
 
@@ -192,30 +193,32 @@ class IngestionPipeline:
             return
         except Exception as err:
             db.rollback()
-            err_msg = str(err)
+            classified = classify_and_sanitize_error(err)
             try:
                 fence_job_for_publish(db, job_id, worker_id)
             except LostJobLeaseError:
                 return
             current_job = get_job(db, job_id)
             db.refresh(current_job)
-            transient = is_transient_error(err)
+            transient = classified.is_transient or is_transient_error(err)
             if current_job and transient and current_job.retry_count < current_job.max_retries:
                 current_job.retry_count += 1
                 current_job.status = JobStatus.PENDING
                 current_job.stage = JobStage.QUEUED
                 retries = f"{current_job.retry_count}/{current_job.max_retries}"
-                msg = f"Transient failure ({retries}): {err_msg}"
+                code_str = classified.code.value
+                msg = f"[{code_str}] Transient failure ({retries}): {classified.sanitized_message}"
                 current_job.error_message = msg[:500]
                 current_job.is_retryable = True
                 db.commit()
 
             else:
+                msg = f"[{classified.code.value}] {classified.sanitized_message}"
                 paper.status = PaperStatus.FAILED
-                paper.error_message = err_msg
+                paper.error_message = msg
                 current_job.stage = JobStage.FAILED
                 current_job.progress = 1.0
                 current_job.status = JobStatus.FAILED
-                current_job.error_message = err_msg[:500]
+                current_job.error_message = msg[:500]
                 current_job.is_retryable = False
                 db.commit()

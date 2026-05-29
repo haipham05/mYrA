@@ -3,14 +3,26 @@ import logging
 import tempfile
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.responses import StreamingResponse
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.crud.job import create_job
 from app.crud.paper import create_paper_with_job, list_papers_by_project
 from app.crud.project import create_project, get_project, list_projects
-from app.db.models import Paper
+from app.db.models import Job, Paper
 from app.db.session import get_db
 from app.schemas.paper import PaperListResponse, PaperResponse, PaperStatus, PaperUploadResponse
 from app.schemas.project import ProjectCreate, ProjectListResponse, ProjectResponse
@@ -66,7 +78,9 @@ def get_single_project(
 )
 async def upload_paper(
     project_id: UUID,
+    response: Response,
     file: UploadFile = File(...),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
 ) -> PaperUploadResponse:
     project = get_project(db, project_id)
@@ -115,17 +129,47 @@ async def upload_paper(
             )
 
         document_sha256 = hasher.hexdigest()
+
         # 2. Check for duplicate upload within project before writing storage.
+        # Idempotency policy (3.B3): return existing record if content exists
         existing_paper = (
             db.query(Paper)
             .filter(Paper.project_id == project_id, Paper.document_sha256 == document_sha256)
             .first()
         )
         if existing_paper:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Paper with identical content already exists in this project",
+            latest_job = (
+                db.query(Job)
+                .filter(Job.paper_id == existing_paper.id)
+                .order_by(Job.created_at.desc())
+                .first()
             )
+            if existing_paper.status == PaperStatus.READY:
+                response.status_code = status.HTTP_200_OK
+                return PaperUploadResponse(
+                    paper_id=existing_paper.id,
+                    job_id=latest_job.id if latest_job else existing_paper.id,
+                    status=PaperStatus.READY,
+                )
+            if existing_paper.status == PaperStatus.PROCESSING:
+                response.status_code = status.HTTP_202_ACCEPTED
+                return PaperUploadResponse(
+                    paper_id=existing_paper.id,
+                    job_id=latest_job.id if latest_job else existing_paper.id,
+                    status=PaperStatus.PROCESSING,
+                )
+            if existing_paper.status == PaperStatus.FAILED:
+                # Recover failed paper by creating a new job and re-queuing
+                new_job = create_job(db, existing_paper.id)
+                existing_paper.status = PaperStatus.PROCESSING
+                existing_paper.error_message = None
+                db.commit()
+                response.status_code = status.HTTP_202_ACCEPTED
+                return PaperUploadResponse(
+                    paper_id=existing_paper.id,
+                    job_id=new_job.id,
+                    status=PaperStatus.PROCESSING,
+                )
 
         # 3. Validate page count on the seekable spool without materializing bytes.
         try:
@@ -216,3 +260,14 @@ def get_project_papers(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/{project_id}/papers/{paper_id}/document")
+async def get_project_paper_document(
+    project_id: UUID,
+    paper_id: UUID,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    from app.api.v1.papers import get_paper_document
+
+    return await get_paper_document(paper_id=paper_id, project_id=project_id, db=db)

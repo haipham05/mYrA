@@ -20,6 +20,9 @@ settings = Settings.from_environment()
 target_metadata = Base.metadata
 
 def get_url() -> str:
+    url = config.get_main_option("sqlalchemy.url")
+    if url and url != "driver://user:pass@localhost/dbname":
+        return url
     return settings.database_url or "sqlite:///./myra_dev.db"
 
 

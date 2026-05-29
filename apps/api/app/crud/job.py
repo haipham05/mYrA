@@ -169,3 +169,27 @@ def renew_job_lease(db: Session, job_id: UUID | str, worker_id: str | None = Non
         db.commit()
         return True
     return False
+
+
+def release_job(db: Session, job_id: UUID | str, worker_id: str) -> bool:
+    """Release an owned job back to PENDING state upon graceful worker shutdown."""
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    changed = (
+        db.query(Job)
+        .filter(Job.id == job_id, Job.status == "PROCESSING", Job.worker_id == worker_id)
+        .update(
+            {
+                Job.status: "PENDING",
+                Job.stage: "QUEUED",
+                Job.worker_id: None,
+                Job.claimed_at: None,
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed == 1:
+        db.commit()
+        return True
+    db.rollback()
+    return False
