@@ -2,12 +2,15 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import uuid4
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
 from app.api.v1 import api_router
 from app.config import Settings
+from app.db.session import get_db
 from app.logging import configure_logging
 
 settings = Settings.from_environment()
@@ -35,6 +38,20 @@ app.add_middleware(
     allow_methods=settings.cors_methods,
     allow_headers=settings.cors_headers,
 )
+
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next) -> Response:
+    correlation_id = (
+        request.headers.get("X-Correlation-ID")
+        or request.headers.get("X-Request-ID")
+        or uuid4().hex
+    )
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    response.headers["X-Request-ID"] = correlation_id
+    return response
 
 
 @api_v1.get("/health", tags=["health"])
@@ -127,6 +144,26 @@ async def system_status() -> dict[str, Any]:
         "storage_backend": "gcs" if current_settings.gcs_bucket_name else "local",
         "max_upload_size_bytes": current_settings.max_upload_size_bytes,
         "max_pdf_pages": current_settings.max_pdf_pages,
+    }
+
+
+@api_v1.post("/system/reconcile", tags=["system"])
+async def trigger_reconciliation(
+    dry_run: bool = True,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Reconcile stranded resources (expired worker leases and unreferenced storage objects)."""
+    from app.crud.reconciliation import reconcile_stranded_resources
+    from app.storage.factory import get_storage
+
+    storage = get_storage()
+    report = reconcile_stranded_resources(db=db, storage=storage, dry_run=dry_run)
+    return {
+        "dry_run": report.dry_run,
+        "stuck_jobs_expired": report.stuck_jobs_expired,
+        "stuck_jobs_recovered": report.stuck_jobs_recovered,
+        "orphaned_storage_keys": report.orphaned_storage_keys,
+        "storage_keys_scanned": report.storage_keys_scanned,
     }
 
 

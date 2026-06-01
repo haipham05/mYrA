@@ -85,9 +85,10 @@ async def run_worker(
                     await processing_task
                 except asyncio.CancelledError:
                     db.rollback()
-                    with SessionLocal() as r_db:
-                        release_job(r_db, job.id, worker_id=worker_id)
-                    logger.info("released_job_on_shutdown", extra={"job_id": str(job.id)})
+                    if not running:
+                        with SessionLocal() as r_db:
+                            release_job(r_db, job.id, worker_id=worker_id)
+                        logger.info("released_job_on_shutdown", extra={"job_id": str(job.id)})
                 finally:
                     heartbeat_task.cancel()
                     active_processing_task = None

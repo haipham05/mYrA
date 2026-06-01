@@ -4,6 +4,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.db.models import Job
+from app.services.job_state_machine import validate_job_transition
 
 
 class LostJobLeaseError(RuntimeError):
@@ -124,6 +125,11 @@ def update_job_progress(
 ) -> Job | None:
     if isinstance(job_id, str):
         job_id = UUID(job_id)
+    current_job = get_job(db, job_id)
+    if current_job:
+        if worker_id is not None and current_job.worker_id != worker_id:
+            raise LostJobLeaseError(f"Job {job_id} is no longer owned by this worker")
+        validate_job_transition(current_job.status, current_job.stage, status, stage)
     values = {
         Job.stage: stage,
         Job.progress: progress,
@@ -193,3 +199,34 @@ def release_job(db: Session, job_id: UUID | str, worker_id: str) -> bool:
         return True
     db.rollback()
     return False
+
+
+def retry_job(db: Session, job_id: UUID | str) -> Job:
+    """Manually retry a FAILED or retryable job, resetting it to PENDING/QUEUED."""
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    job = get_job(db, job_id)
+    if not job:
+        raise ValueError(f"Job {job_id} not found")
+    if job.status == "PROCESSING":
+        raise ValueError("Cannot retry a job that is currently processing")
+    if job.status == "COMPLETED":
+        raise ValueError("Cannot retry an already completed job")
+
+    validate_job_transition(job.status, job.stage, "PENDING", "QUEUED")
+    job.status = "PENDING"
+    job.stage = "QUEUED"
+    job.progress = 0.0
+    job.worker_id = None
+    job.claimed_at = None
+    job.retry_count = 0
+    job.error_message = None
+    job.is_retryable = False
+
+    if job.paper:
+        job.paper.status = "PROCESSING"
+        job.paper.error_message = None
+
+    db.commit()
+    db.refresh(job)
+    return job

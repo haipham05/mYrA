@@ -138,38 +138,44 @@ async def upload_paper(
             .first()
         )
         if existing_paper:
-            latest_job = (
-                db.query(Job)
-                .filter(Job.paper_id == existing_paper.id)
-                .order_by(Job.created_at.desc())
-                .first()
+            if idempotency_key is not None:
+                latest_job = (
+                    db.query(Job)
+                    .filter(Job.paper_id == existing_paper.id)
+                    .order_by(Job.created_at.desc())
+                    .first()
+                )
+                if existing_paper.status == PaperStatus.READY:
+                    response.status_code = status.HTTP_200_OK
+                    return PaperUploadResponse(
+                        paper_id=existing_paper.id,
+                        job_id=latest_job.id if latest_job else existing_paper.id,
+                        status=PaperStatus.READY,
+                    )
+                if existing_paper.status == PaperStatus.PROCESSING:
+                    response.status_code = status.HTTP_202_ACCEPTED
+                    return PaperUploadResponse(
+                        paper_id=existing_paper.id,
+                        job_id=latest_job.id if latest_job else existing_paper.id,
+                        status=PaperStatus.PROCESSING,
+                    )
+                if existing_paper.status == PaperStatus.FAILED:
+                    # Recover failed paper by creating a new job and re-queuing
+                    new_job = create_job(db, existing_paper.id)
+                    existing_paper.status = PaperStatus.PROCESSING
+                    existing_paper.error_message = None
+                    db.commit()
+                    response.status_code = status.HTTP_202_ACCEPTED
+                    return PaperUploadResponse(
+                        paper_id=existing_paper.id,
+                        job_id=new_job.id,
+                        status=PaperStatus.PROCESSING,
+                    )
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Paper with identical content already exists in this project",
             )
-            if existing_paper.status == PaperStatus.READY:
-                response.status_code = status.HTTP_200_OK
-                return PaperUploadResponse(
-                    paper_id=existing_paper.id,
-                    job_id=latest_job.id if latest_job else existing_paper.id,
-                    status=PaperStatus.READY,
-                )
-            if existing_paper.status == PaperStatus.PROCESSING:
-                response.status_code = status.HTTP_202_ACCEPTED
-                return PaperUploadResponse(
-                    paper_id=existing_paper.id,
-                    job_id=latest_job.id if latest_job else existing_paper.id,
-                    status=PaperStatus.PROCESSING,
-                )
-            if existing_paper.status == PaperStatus.FAILED:
-                # Recover failed paper by creating a new job and re-queuing
-                new_job = create_job(db, existing_paper.id)
-                existing_paper.status = PaperStatus.PROCESSING
-                existing_paper.error_message = None
-                db.commit()
-                response.status_code = status.HTTP_202_ACCEPTED
-                return PaperUploadResponse(
-                    paper_id=existing_paper.id,
-                    job_id=new_job.id,
-                    status=PaperStatus.PROCESSING,
-                )
 
         # 3. Validate page count on the seekable spool without materializing bytes.
         try:

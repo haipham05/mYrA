@@ -70,16 +70,26 @@ def test_upload_paper_and_idempotency():
         paper.status = PaperStatus.READY
         db.commit()
 
-    # Repeated upload after READY -> 200 OK with SAME paper_id and status READY
+    # Repeated upload after READY with Idempotency-Key -> 200 OK with SAME paper_id and status READY
     file_payload3 = {"file": ("paper.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
     res3 = client.post(
         f"/api/v1/projects/{project_id}/papers",
         files=file_payload3,
+        headers={"Idempotency-Key": "test-key-1"},
     )
     assert res3.status_code == 200
     data3 = res3.json()
     assert data3["paper_id"] == paper_id
     assert data3["status"] == "READY"
+
+    # Repeated upload WITHOUT Idempotency-Key -> 409 Conflict
+    file_payload4 = {"file": ("paper.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
+    res4 = client.post(
+        f"/api/v1/projects/{project_id}/papers",
+        files=file_payload4,
+    )
+    assert res4.status_code == 409
+    assert "already exists" in res4.json()["detail"]
 
 
 def test_upload_failed_paper_retries_idempotently():
@@ -103,10 +113,11 @@ def test_upload_failed_paper_retries_idempotently():
         paper.error_message = "Simulated failure"
         db.commit()
 
-    # Re-upload should safely re-queue a new job
+    # Re-upload with Idempotency-Key should safely re-queue a new job
     res2 = client.post(
         f"/api/v1/projects/{project_id}/papers",
         files={"file": ("paper.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        headers={"Idempotency-Key": "test-retry-key"},
     )
     assert res2.status_code == 202
     data2 = res2.json()

@@ -79,6 +79,7 @@ async function startIsolatedApi(request: APIRequestContext): Promise<void> {
     MYRA_USE_DOCLING: "false",
     MYRA_EMBEDDING_PROVIDER: "deterministic",
     MYRA_RERANKER_PROVIDER: "simple-lexical",
+    MYRA_CHECK_MIGRATIONS: "false",
     HF_HUB_OFFLINE: "1",
     TRANSFORMERS_OFFLINE: "1",
     PYTHONPATH: apiDir,

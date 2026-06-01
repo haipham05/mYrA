@@ -80,12 +80,12 @@ def classify_and_sanitize_error(err: Exception) -> ClassifiedError:
             is_transient=False,
         )
 
-    if isinstance(err, (TimeoutError, ConnectionError, OSError)) or any(
-        k in err_type for k in ("Connection", "Timeout", "Network")
+    if any(k in err_str for k in ("ocr", "parse", "parsing", "chunk")) and (
+        isinstance(err, TimeoutError) or "timeout" in err_str
     ):
         return ClassifiedError(
-            code=IngestionErrorCode.STORAGE_TEMPORARY_ERROR,
-            sanitized_message="Temporary network or storage connectivity error",
+            code=IngestionErrorCode.PROCESSING_TIMEOUT,
+            sanitized_message="Document parsing or OCR processing timed out",
             is_transient=True,
         )
 
@@ -93,6 +93,15 @@ def classify_and_sanitize_error(err: Exception) -> ClassifiedError:
         return ClassifiedError(
             code=IngestionErrorCode.EMBEDDING_PROVIDER_ERROR,
             sanitized_message="Document embedding generation service error",
+            is_transient=True,
+        )
+
+    if isinstance(err, (TimeoutError, ConnectionError, OSError)) or any(
+        k in err_type for k in ("Connection", "Timeout", "Network")
+    ):
+        return ClassifiedError(
+            code=IngestionErrorCode.STORAGE_TEMPORARY_ERROR,
+            sanitized_message="Temporary network or storage connectivity error",
             is_transient=True,
         )
 
