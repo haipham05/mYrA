@@ -10,6 +10,11 @@ from app.db.models import Message
 from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import AnchorStatus, Citation, CitationAnchor, EvidenceItem
 from app.services.llm import get_llm_provider
+from app.services.memory_service import (
+    capture_conversation_memories,
+    format_memories_for_prompt,
+    retrieve_project_memories,
+)
 from app.services.retrieval import HybridRetriever
 
 logger = logging.getLogger("myra.chat")
@@ -169,7 +174,7 @@ class ChatService:
                 evidence=[],
             )
 
-        # 2. Retrieve evidence
+        # 2a. Retrieve evidence
         evidence_items: list[EvidenceItem] = self.retriever.retrieve(
             db=db,
             project_id=project_id,
@@ -177,6 +182,16 @@ class ChatService:
         )
 
         evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
+
+        # 2b. Retrieve active project memories
+        project_memories = retrieve_project_memories(
+            db=db,
+            project_id=project_id,
+            query=question,
+            limit=5,
+            record_access=True,
+        )
+        memory_block = format_memories_for_prompt(project_memories)
 
         # 3. Retrieve prior conversation history (bounded to last 6 messages)
         history_msgs = (
@@ -195,13 +210,19 @@ class ChatService:
 
         system_prompt = (
             "You are mYrA, an academic research assistant. "
-            "Answer the QUESTION using ONLY the provided evidence quotes, "
-            "maintaining continuity with CONVERSATION HISTORY when relevant. "
-            "For each claim, copy a short relevant sentence or phrase verbatim from ONE "
-            "Evidence quote, preserving its words, numbers, and order, then append that "
-            "quote's citation ID such as [E1]. Do not paraphrase or combine quotes. "
-            "If no quote directly answers the question, say that evidence is insufficient. "
-            "Never invent a citation ID."
+            "Answer the QUESTION using the provided EVIDENCE quotes and PROJECT MEMORY, "
+            "maintaining continuity with CONVERSATION HISTORY when relevant.\n\n"
+            "CITATION & PROVENANCE RULES:\n"
+            "- For any factual claim from papers, copy a short relevant sentence or phrase "
+            "verbatim from ONE Evidence quote, preserving its words, numbers, and order, "
+            "then append that quote's citation ID such as [E1].\n"
+            "- Never invent a citation ID. Never use [E...] brackets for project decisions "
+            "or user preferences.\n"
+            "- For questions regarding project decisions, user preferences, terminology, or "
+            "choices, answer accurately using the PROJECT MEMORY section without adding "
+            "paper citation brackets.\n"
+            "- If neither the evidence nor the project memory contains enough information "
+            "to answer, state that evidence is insufficient."
         )
 
         evidence_text_parts = []
@@ -221,14 +242,14 @@ class ChatService:
             else "No relevant evidence found."
         )
 
+        prompt_parts = []
+        if memory_block:
+            prompt_parts.append(f"PROJECT MEMORY:\n{memory_block}")
+        prompt_parts.append(f"EVIDENCE:\n{evidence_block}")
         if history_block:
-            user_prompt = (
-                f"EVIDENCE:\n{evidence_block}\n\n"
-                f"CONVERSATION HISTORY:\n{history_block}\n\n"
-                f"QUESTION:\n{question}"
-            )
-        else:
-            user_prompt = f"EVIDENCE:\n{evidence_block}\n\nQUESTION:\n{question}"
+            prompt_parts.append(f"CONVERSATION HISTORY:\n{history_block}")
+        prompt_parts.append(f"QUESTION:\n{question}")
+        user_prompt = "\n\n".join(prompt_parts)
 
         # 4. Generate answer with LLM
         llm = get_llm_provider()
@@ -245,7 +266,7 @@ class ChatService:
         for sentence in raw_sentences:
             cite_matches = list(re.finditer(r"\[E(\d+)\]", sentence))
             if not cite_matches:
-                if not evidence_items:
+                if not evidence_items or project_memories:
                     retained_sentences.append(sentence)
                 continue
 
@@ -326,7 +347,7 @@ class ChatService:
 
             retained_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
 
-        if retained_sentences and validated_citations:
+        if retained_sentences and (validated_citations or project_memories or not evidence_items):
             formatted_answer = " ".join(retained_sentences)
         else:
             formatted_answer = (
@@ -347,6 +368,14 @@ class ChatService:
             model_name=model_name,
             token_count=token_count,
         )
+
+        # 7. Post-turn memory capture (extract decisions/preferences from turns)
+        try:
+            capture_conversation_memories(
+                db=db, project_id=project_id, conversation_id=conversation_id
+            )
+        except Exception as e:
+            logger.warning("Failed to capture conversation memories: %s", e)
 
         latency_ms = (time.perf_counter() - start_time) * 1000
         logger.info(

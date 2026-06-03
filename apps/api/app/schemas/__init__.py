@@ -18,6 +18,18 @@ from app.schemas.evidence import (
     SourceElement,
 )
 from app.schemas.job import JobResponse, JobStage, JobStatus
+from app.schemas.memory import (
+    MemoryAuditResponse,
+    MemoryCreate,
+    MemoryListResponse,
+    MemoryResponse,
+    MemorySourceCreate,
+    MemorySourceResponse,
+    MemorySourceType,
+    MemoryStatus,
+    MemoryType,
+    MemoryUpdate,
+)
 from app.schemas.paper import (
     PaperListResponse,
     PaperResponse,
@@ -41,6 +53,16 @@ __all__ = [
     "JobResponse",
     "JobStage",
     "JobStatus",
+    "MemoryAuditResponse",
+    "MemoryCreate",
+    "MemoryListResponse",
+    "MemoryResponse",
+    "MemorySourceCreate",
+    "MemorySourceResponse",
+    "MemorySourceType",
+    "MemoryStatus",
+    "MemoryType",
+    "MemoryUpdate",
     "MessageCreate",
     "MessageResponse",
     "MessageRole",

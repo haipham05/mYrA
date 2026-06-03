@@ -44,6 +44,9 @@ class Project(Base):
     conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    memories: Mapped[list["Memory"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class Paper(Base):
@@ -256,3 +259,95 @@ class Message(Base):
     )
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+
+
+class Memory(Base):
+    __tablename__ = "memories"
+    __table_args__ = (
+        Index("ix_memories_project_status", "project_id", "status"),
+        Index("ix_memories_project_type", "project_id", "memory_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    memory_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(50), default="ACTIVE", nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    importance: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    superseded_by_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("memories.id", ondelete="SET NULL"), nullable=True
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
+    embedding_vec: Mapped[list[float] | None] = mapped_column(PGVector(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+    last_accessed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    project: Mapped["Project"] = relationship(back_populates="memories")
+    sources: Mapped[list["MemorySource"]] = relationship(
+        back_populates="memory", cascade="all, delete-orphan"
+    )
+    history: Mapped[list["MemoryAudit"]] = relationship(
+        back_populates="memory",
+        cascade="all, delete-orphan",
+        order_by="MemoryAudit.created_at.desc()",
+    )
+    superseded_by: Mapped["Memory | None"] = relationship(remote_side=[id])
+
+
+class MemorySource(Base):
+    __tablename__ = "memory_sources"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    memory_id: Mapped[UUID] = mapped_column(
+        ForeignKey("memories.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_type: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # "MESSAGE" or "PAPER_CHUNK"
+    message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    paper_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("papers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quote_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    memory: Mapped["Memory"] = relationship(back_populates="sources")
+    message: Mapped["Message | None"] = relationship()
+    paper: Mapped["Paper | None"] = relationship()
+
+
+class MemoryAudit(Base):
+    __tablename__ = "memory_audits"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    memory_id: Mapped[UUID] = mapped_column(
+        ForeignKey("memories.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    old_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    new_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    memory: Mapped["Memory"] = relationship(back_populates="history")
