@@ -2,12 +2,16 @@
 
 import { useEffect, useState } from "react";
 import ChatPanel from "@/components/ChatPanel";
+import MemoryInspector from "@/components/MemoryInspector";
 import PaperUploader from "@/components/PaperUploader";
 import PdfViewer from "@/components/PdfViewer";
 import ProjectSelector from "@/components/ProjectSelector";
 import type { Citation, Conversation, Message, Paper, Project } from "@/types";
 
 export default function Home() {
+  const [activeTab, setActiveTab] = useState<"workspace" | "memory">(
+    "workspace",
+  );
   const [apiStatus, setApiStatus] = useState("Checking API…");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -399,6 +403,31 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-6">
+            <div className="flex items-center gap-1 bg-zinc-100 p-1 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setActiveTab("workspace")}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${
+                  activeTab === "workspace"
+                    ? "bg-white text-zinc-900 shadow-2xs"
+                    : "text-zinc-600 hover:text-zinc-900"
+                }`}
+              >
+                Workspace
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("memory")}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition ${
+                  activeTab === "memory"
+                    ? "bg-white text-zinc-900 shadow-2xs"
+                    : "text-zinc-600 hover:text-zinc-900"
+                }`}
+              >
+                Project Memory
+              </button>
+            </div>
+
             <ProjectSelector
               projects={projects}
               selectedProject={selectedProject}
@@ -421,50 +450,61 @@ export default function Home() {
 
       {/* Main Container */}
       <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col gap-6 p-6">
-        {/* Paper Ingestion Section */}
-        <section>
-          <PaperUploader
-            projectId={selectedProject?.id || null}
-            apiUrl={apiUrl}
-            papers={papers}
-            selectedPaper={selectedPaper}
-            onPaperSelect={setSelectedPaper}
-            onUploadSuccess={refreshPapers}
-          />
-        </section>
-
-        {/* Split Screen QA and PDF Citation Viewer */}
-        <section className="grid flex-1 grid-cols-1 gap-6 lg:grid-cols-2 min-h-[600px]">
-          {/* Left: Chat QA */}
-          <div className="flex flex-col h-[650px]">
-            <ChatPanel
-              messages={messages}
-              isLoading={isAsking}
-              error={chatError}
-              onDismissError={() => setChatError(null)}
-              onSendMessage={handleSendMessage}
-              onCitationClick={handleCitationClick}
-              activeCitation={activeCitation}
-              disabled={!hasReadyPaper || !conversation}
-              conversations={conversations}
-              activeConversation={conversation}
-              onSelectConversation={handleSelectConversation}
-              onCreateConversation={handleCreateConversation}
-              onRenameConversation={handleRenameConversation}
-              onArchiveConversation={handleArchiveConversation}
-              onDeleteConversation={handleDeleteConversation}
-            />
-          </div>
-
-          {/* Right: PDF Evidence Viewer */}
-          <div className="flex flex-col h-[650px]">
-            <PdfViewer
-              paper={selectedPaper}
-              activeCitation={activeCitation}
+        {activeTab === "memory" ? (
+          <section className="flex-1">
+            <MemoryInspector
+              projectId={selectedProject?.id || null}
               apiUrl={apiUrl}
             />
-          </div>
-        </section>
+          </section>
+        ) : (
+          <>
+            {/* Paper Ingestion Section */}
+            <section>
+              <PaperUploader
+                projectId={selectedProject?.id || null}
+                apiUrl={apiUrl}
+                papers={papers}
+                selectedPaper={selectedPaper}
+                onPaperSelect={setSelectedPaper}
+                onUploadSuccess={refreshPapers}
+              />
+            </section>
+
+            {/* Split Screen QA and PDF Citation Viewer */}
+            <section className="grid flex-1 grid-cols-1 gap-6 lg:grid-cols-2 min-h-[600px]">
+              {/* Left: Chat QA */}
+              <div className="flex flex-col h-[650px]">
+                <ChatPanel
+                  messages={messages}
+                  isLoading={isAsking}
+                  error={chatError}
+                  onDismissError={() => setChatError(null)}
+                  onSendMessage={handleSendMessage}
+                  onCitationClick={handleCitationClick}
+                  activeCitation={activeCitation}
+                  disabled={!hasReadyPaper || !conversation}
+                  conversations={conversations}
+                  activeConversation={conversation}
+                  onSelectConversation={handleSelectConversation}
+                  onCreateConversation={handleCreateConversation}
+                  onRenameConversation={handleRenameConversation}
+                  onArchiveConversation={handleArchiveConversation}
+                  onDeleteConversation={handleDeleteConversation}
+                />
+              </div>
+
+              {/* Right: PDF Evidence Viewer */}
+              <div className="flex flex-col h-[650px]">
+                <PdfViewer
+                  paper={selectedPaper}
+                  activeCitation={activeCitation}
+                  apiUrl={apiUrl}
+                />
+              </div>
+            </section>
+          </>
+        )}
       </main>
     </div>
   );

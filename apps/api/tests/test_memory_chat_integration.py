@@ -140,8 +140,8 @@ async def test_chat_distinguishes_paper_evidence_from_user_decision(db: Session)
     mock_llm = AsyncMock()
     # LLM cites E1 for paper fact, but cites nothing for project decision
     mock_llm.generate.return_value = (
-        'Transformer architectures rely on multi-head self-attention mechanisms [E1]. '
-        'In our project, we prioritize calibration metrics over raw accuracy.'
+        "Transformer architectures rely on multi-head self-attention mechanisms [E1]. "
+        "In our project, we prioritize calibration metrics over raw accuracy."
     )
     mock_llm.model_name = "test-deepseek"
 

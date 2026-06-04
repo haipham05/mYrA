@@ -150,14 +150,23 @@ async def system_status() -> dict[str, Any]:
 @api_v1.post("/system/reconcile", tags=["system"])
 async def trigger_reconciliation(
     dry_run: bool = True,
+    scan_storage: bool = False,
+    prefix: str = "papers/",
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Reconcile stranded resources (expired worker leases and unreferenced storage objects)."""
-    from app.crud.reconciliation import reconcile_stranded_resources
+    from app.crud.reconciliation import reconcile_stranded_resources_async
     from app.storage.factory import get_storage
 
-    storage = get_storage()
-    report = reconcile_stranded_resources(db=db, storage=storage, dry_run=dry_run)
+    storage = get_storage() if scan_storage else None
+    scan_prefix = prefix if scan_storage else None
+
+    report = await reconcile_stranded_resources_async(
+        db=db,
+        storage=storage,
+        dry_run=dry_run,
+        scan_prefix=scan_prefix,
+    )
     return {
         "dry_run": report.dry_run,
         "stuck_jobs_expired": report.stuck_jobs_expired,

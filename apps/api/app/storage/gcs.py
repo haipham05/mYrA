@@ -80,3 +80,11 @@ class GCSStorage(ObjectStorage):
                 yield chunk
         finally:
             await asyncio.to_thread(reader.close)
+
+    async def list_keys(self, prefix: str = "") -> list[str]:
+        def _list() -> list[str]:
+            bucket = self._get_bucket()
+            blobs = bucket.list_blobs(prefix=prefix if prefix else None)
+            return [b.name for b in blobs]
+
+        return await asyncio.to_thread(_list)

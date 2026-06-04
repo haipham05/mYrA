@@ -101,3 +101,55 @@ export interface Job {
   progress: number;
   error_message?: string | null;
 }
+
+export type MemoryType =
+  | "DECISION"
+  | "PREFERENCE"
+  | "TERMINOLOGY"
+  | "PROCEDURAL"
+  | "PAPER_FACT"
+  | "EPISODIC";
+
+export type MemoryStatus = "ACTIVE" | "SUPERSEDED" | "ARCHIVED" | "DISPUTED";
+export type MemorySourceType = "MESSAGE" | "PAPER_CHUNK";
+
+export interface MemorySource {
+  id: string;
+  memory_id: string;
+  source_type: MemorySourceType;
+  message_id?: string | null;
+  paper_id?: string | null;
+  page_number?: number | null;
+  quote_text?: string | null;
+  document_sha256?: string | null;
+  created_at: string;
+}
+
+export interface MemoryAudit {
+  id: string;
+  memory_id: string;
+  action: string;
+  old_content?: string | null;
+  new_content?: string | null;
+  reason?: string | null;
+  created_at: string;
+}
+
+export interface Memory {
+  id: string;
+  project_id: string;
+  memory_type: MemoryType;
+  status: MemoryStatus;
+  title: string;
+  content: string;
+  confidence: number;
+  importance: number;
+  version: number;
+  is_pinned: boolean;
+  superseded_by_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  last_accessed_at?: string | null;
+  sources: MemorySource[];
+  history: MemoryAudit[];
+}

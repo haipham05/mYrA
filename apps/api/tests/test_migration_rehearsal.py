@@ -38,16 +38,19 @@ def test_empty_database_migration_rehearsal():
 
 
 def test_seeded_database_migration_rehearsal_and_data_preservation():
-    """Prove that upgrading an already-seeded database preserves all existing research rows."""
+    """Prove that upgrading an already-seeded database preserves
+    all existing research rows across migrations.
+    """
     with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
         db_url = f"sqlite:///{tmp.name}"
         cfg = get_alembic_config(db_url)
 
-        # 1. Migrate up to intermediate revision (e.g. conversation summary revision)
-        command.upgrade(cfg, "a1b2c3d4e5f6")
+        # 1. Migrate up to predecessor revision e6f7a8b9c0d1
+        # (before conversation summary and long-term memory)
+        command.upgrade(cfg, "e6f7a8b9c0d1")
         engine = create_engine(db_url)
 
-        # 2. Seed data into projects, papers, conversations
+        # 2. Seed data into projects, papers, conversations (without summary column yet)
         project_id = str(uuid4())
         paper_id = str(uuid4())
         conv_id = str(uuid4())
@@ -76,26 +79,45 @@ def test_seeded_database_migration_rehearsal_and_data_preservation():
             conn.execute(
                 text(
                     "INSERT INTO conversations "
-                    "(id, project_id, title, summary, created_at, updated_at) "
-                    "VALUES (:id, :project_id, :title, :summary, "
+                    "(id, project_id, title, is_archived, created_at, updated_at) "
+                    "VALUES (:id, :project_id, :title, 0, "
                     "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
                 ),
                 {
                     "id": conv_id,
                     "project_id": project_id,
-                    "title": "Seeded Conversation",
-                    "summary": "Initial summary",
+                    "title": "Seeded Conversation Prior to Summary",
                 },
             )
             conn.commit()
 
-        # 3. Run upgrade to head (additive migration e6f7a8b9c0d1)
+        # 3. Transition 1: Upgrade to a1b2c3d4e5f6 (adds summary column)
+        command.upgrade(cfg, "a1b2c3d4e5f6")
+
+        # Verify summary column is present, existing row has summary = None, and can be updated
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT title, summary, is_archived FROM conversations WHERE id = :id"),
+                {"id": conv_id},
+            ).fetchone()
+            assert row is not None
+            assert row[0] == "Seeded Conversation Prior to Summary"
+            assert row[1] is None  # Safe default on new column
+            assert row[2] in (0, False)
+
+            conn.execute(
+                text("UPDATE conversations SET summary = :s WHERE id = :id"),
+                {"s": "Summary generated post-migration", "id": conv_id},
+            )
+            conn.commit()
+
+        # 4. Transition 2: Upgrade to head (f1a2b3c4d5e6 - adds long-term memory tables)
         command.upgrade(cfg, "head")
 
-        # 4. Verify compatibility check passes
+        # 5. Verify compatibility check passes at head
         check_schema_compatibility(engine)
 
-        # 5. Verify all seeded data is preserved and new column has safe defaults
+        # 6. Verify all seeded research data survives and new memory tables are functional
         with engine.connect() as conn:
             proj_row = conn.execute(
                 text("SELECT name FROM projects WHERE id = :id"), {"id": project_id}
@@ -115,7 +137,30 @@ def test_seeded_database_migration_rehearsal_and_data_preservation():
                 {"id": conv_id},
             ).fetchone()
             assert conv_row is not None
-            assert conv_row[0] == "Seeded Conversation"
-            assert conv_row[1] == "Initial summary"
-            # In SQLite / Postgres, default is False (0)
+            assert conv_row[0] == "Seeded Conversation Prior to Summary"
+            assert conv_row[1] == "Summary generated post-migration"
             assert conv_row[2] in (0, False)
+
+            # Insert into newly created memories table referencing the seeded project
+            memory_id = str(uuid4())
+            conn.execute(
+                text(
+                    "INSERT INTO memories "
+                    "(id, project_id, memory_type, status, title, content, "
+                    "importance, confidence, version, created_at, updated_at) "
+                    "VALUES (:id, :project_id, 'DECISION', 'ACTIVE', 'ResNet Choice', "
+                    "'Use ResNet50 baseline', 0.8, 1.0, 1, "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"id": memory_id, "project_id": project_id},
+            )
+            conn.commit()
+
+            mem_row = conn.execute(
+                text("SELECT title, content, status FROM memories WHERE id = :id"),
+                {"id": memory_id},
+            ).fetchone()
+            assert mem_row is not None
+            assert mem_row[0] == "ResNet Choice"
+            assert mem_row[1] == "Use ResNet50 baseline"
+            assert mem_row[2] == "ACTIVE"

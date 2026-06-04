@@ -70,6 +70,21 @@ class LocalStorage(ObjectStorage):
             while chunk := f.read(chunk_size):
                 yield chunk
 
+    async def list_keys(self, prefix: str = "") -> list[str]:
+        def _scan() -> list[str]:
+            base = self.base_dir.resolve()
+            if not base.exists():
+                return []
+            results = []
+            for path in base.rglob("*"):
+                if path.is_file():
+                    rel = str(path.relative_to(base))
+                    if not prefix or rel.startswith(prefix):
+                        results.append(rel)
+            return results
+
+        return await asyncio.to_thread(_scan)
+
 
 class MemoryStorage(ObjectStorage):
     """In-memory storage for unit testing without disk I/O."""
@@ -91,3 +106,6 @@ class MemoryStorage(ObjectStorage):
 
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
+
+    async def list_keys(self, prefix: str = "") -> list[str]:
+        return [k for k in self._store.keys() if not prefix or k.startswith(prefix)]

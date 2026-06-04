@@ -192,9 +192,7 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
         consolidate_memory_candidate(db, project_id=project2.id, candidate=forged_cand)
 
     # 2. Legitimate paper fact in same project succeeds
-    valid_mem = consolidate_memory_candidate(
-        db, project_id=project1.id, candidate=forged_cand
-    )
+    valid_mem = consolidate_memory_candidate(db, project_id=project1.id, candidate=forged_cand)
     assert valid_mem.id is not None
     assert valid_mem.memory_type == MemoryType.PAPER_FACT.value
 

@@ -120,6 +120,71 @@ def test_reconcile_storage_orphans():
         assert asyncio.run(storage.exists("papers/valid.pdf")) is True
 
 
+def test_reconcile_auto_discover_storage_orphans():
+    """Prove that storage orphans can be auto-discovered under a bounded prefix."""
+    storage = MemoryStorage()
+    asyncio.run(storage.put("papers/valid_active.pdf", b"Active Paper Content"))
+    asyncio.run(storage.put("papers/stranded_orphan.pdf", b"Orphan Content"))
+    asyncio.run(storage.put("other/unrelated.pdf", b"Unrelated Folder Content"))
+
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Discovery Test"))
+        create_paper_with_job(
+            db,
+            project_id=project.id,
+            filename="valid.pdf",
+            storage_path="papers/valid_active.pdf",
+            document_sha256="hashvalidactive",
+            status=PaperStatus.READY,
+        )
+
+        # 1. Bounded discovery with dry_run=True (scans papers/, ignores other/)
+        report_dry = reconcile_stranded_resources(
+            db, storage=storage, dry_run=True, scan_prefix="papers/"
+        )
+        assert report_dry.storage_keys_scanned == 2
+        assert "papers/stranded_orphan.pdf" in report_dry.orphaned_storage_keys
+        assert "papers/valid_active.pdf" not in report_dry.orphaned_storage_keys
+        assert "other/unrelated.pdf" not in report_dry.orphaned_storage_keys
+        assert asyncio.run(storage.exists("papers/stranded_orphan.pdf")) is True
+
+        # 2. Bounded discovery with dry_run=False (deletes orphan, preserves active)
+        report_live = reconcile_stranded_resources(
+            db, storage=storage, dry_run=False, scan_prefix="papers/"
+        )
+        assert "papers/stranded_orphan.pdf" in report_live.orphaned_storage_keys
+        assert asyncio.run(storage.exists("papers/stranded_orphan.pdf")) is False
+        assert asyncio.run(storage.exists("papers/valid_active.pdf")) is True
+        assert asyncio.run(storage.exists("other/unrelated.pdf")) is True
+
+
+def test_reconcile_api_endpoint(monkeypatch):
+    """Prove that POST /api/v1/system/reconcile handles scan_storage flags properly."""
+    from starlette.testclient import TestClient
+
+    from app.main import app
+
+    storage = MemoryStorage()
+    asyncio.run(storage.put("papers/orphan_api.pdf", b"Orphan"))
+    monkeypatch.setattr("app.storage.factory.get_storage", lambda: storage)
+
+    client = TestClient(app)
+
+    # 1. Default reconcile: job only, does not scan storage
+    res1 = client.post("/api/v1/system/reconcile?dry_run=true")
+    assert res1.status_code == 200
+    data1 = res1.json()
+    assert data1["storage_keys_scanned"] == 0
+    assert data1["orphaned_storage_keys"] == []
+
+    # 2. Reconcile with scan_storage=true: discovers orphan
+    res2 = client.post("/api/v1/system/reconcile?dry_run=true&scan_storage=true")
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["storage_keys_scanned"] >= 1
+    assert "papers/orphan_api.pdf" in data2["orphaned_storage_keys"]
+
+
 def test_release_job_on_worker_shutdown():
     with SessionLocal() as db:
         project = create_project(db, ProjectCreate(name="Shutdown Test"))

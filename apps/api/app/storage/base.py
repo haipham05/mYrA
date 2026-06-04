@@ -37,3 +37,7 @@ class ObjectStorage(ABC):
         data = await self.get(key)
         for i in range(0, len(data), chunk_size):
             yield data[i : i + chunk_size]
+
+    async def list_keys(self, prefix: str = "") -> list[str]:
+        """List object keys under the given prefix."""
+        return []

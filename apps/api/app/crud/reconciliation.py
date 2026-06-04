@@ -19,21 +19,23 @@ class ReconciliationReport:
     storage_keys_scanned: int = 0
 
 
-def reconcile_stranded_resources(
+async def reconcile_stranded_resources_async(
     db: Session,
     storage: ObjectStorage | None = None,
     dry_run: bool = True,
     lease_timeout_seconds: int = 300,
     storage_candidates: list[str] | None = None,
+    scan_prefix: str | None = None,
 ) -> ReconciliationReport:
-    """Reconciles stranded jobs and orphaned storage keys.
+    """Reconciles stranded jobs and orphaned storage keys asynchronously.
 
     - Scans for jobs stuck in PROCESSING beyond lease_timeout_seconds.
       - If retry_count >= max_retries: marks FAILED.
       - If retry_count < max_retries: releases back to PENDING/QUEUED.
-    - If storage is provided and storage_candidates is supplied:
+    - If storage is provided and either storage_candidates is supplied or scan_prefix is set:
+      - Discovers or uses supplied storage keys.
       - Verifies whether keys are referenced by any Paper record.
-      - If dry_run is False: deletes unreferenced orphan keys.
+      - If dry_run is False: deletes unreferenced orphan keys safely via await storage.delete.
       - Never deletes keys referenced by a Paper.
     """
     now = datetime.now(tz=UTC)
@@ -74,21 +76,67 @@ def reconcile_stranded_resources(
     if not dry_run and stuck_jobs:
         db.commit()
 
-    # 2. Check storage candidates if provided
-    if storage and storage_candidates:
-        report.storage_keys_scanned = len(storage_candidates)
-        # Fetch all referenced storage paths from DB
-        referenced_paths = set(p[0] for p in db.query(Paper.storage_path).all() if p[0])
-        for key in storage_candidates:
-            is_referenced = any(
-                key == ref or key.endswith(ref) or ref.endswith(key) for ref in referenced_paths
-            )
-            if not is_referenced:
-                report.orphaned_storage_keys.append(key)
-                if not dry_run:
-                    try:
-                        asyncio.run(storage.delete(key))
-                    except Exception:
-                        pass
+    # 2. Check storage candidates or discover them
+    if storage:
+        candidates = storage_candidates
+        if candidates is None and scan_prefix is not None:
+            candidates = await storage.list_keys(prefix=scan_prefix)
+
+        if candidates:
+            report.storage_keys_scanned = len(candidates)
+            referenced_paths = set(p[0] for p in db.query(Paper.storage_path).all() if p[0])
+            for key in candidates:
+                is_referenced = any(
+                    key == ref or key.endswith(ref) or ref.endswith(key) for ref in referenced_paths
+                )
+                if not is_referenced:
+                    report.orphaned_storage_keys.append(key)
+                    if not dry_run:
+                        try:
+                            await storage.delete(key)
+                        except Exception:
+                            pass
 
     return report
+
+
+def reconcile_stranded_resources(
+    db: Session,
+    storage: ObjectStorage | None = None,
+    dry_run: bool = True,
+    lease_timeout_seconds: int = 300,
+    storage_candidates: list[str] | None = None,
+    scan_prefix: str | None = None,
+) -> ReconciliationReport:
+    """Synchronous wrapper for reconcile_stranded_resources_async."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                asyncio.run,
+                reconcile_stranded_resources_async(
+                    db=db,
+                    storage=storage,
+                    dry_run=dry_run,
+                    lease_timeout_seconds=lease_timeout_seconds,
+                    storage_candidates=storage_candidates,
+                    scan_prefix=scan_prefix,
+                ),
+            ).result()
+    else:
+        return asyncio.run(
+            reconcile_stranded_resources_async(
+                db=db,
+                storage=storage,
+                dry_run=dry_run,
+                lease_timeout_seconds=lease_timeout_seconds,
+                storage_candidates=storage_candidates,
+                scan_prefix=scan_prefix,
+            )
+        )
