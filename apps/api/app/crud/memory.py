@@ -31,6 +31,7 @@ def create_memory(
         version=1,
         is_pinned=memory_in.is_pinned,
         embedding=embedding,
+        embedding_vec=embedding,
     )
     db.add(memory)
     db.flush()
@@ -126,7 +127,11 @@ def update_memory(
     memory_update: MemoryUpdate,
     reason: str | None = None,
 ) -> Memory:
-    if memory_update.version is not None and memory_update.version != memory.version:
+    if memory_update.version is None:
+        raise MemoryVersionConflictError(
+            "Version is required for updating memory to prevent silent overwrites."
+        )
+    if memory_update.version != memory.version:
         raise MemoryVersionConflictError(
             f"Version conflict: current version is {memory.version}, "
             f"but provided version was {memory_update.version}"
@@ -190,6 +195,15 @@ def supersede_memory(
     new_memory: Memory,
     reason: str = "Superseded by newer decision",
 ) -> Memory:
+    if old_memory.id == new_memory.id:
+        raise ValueError("Cannot supersede memory with itself.")
+    if old_memory.content.strip().lower() == new_memory.content.strip().lower():
+        raise ValueError("Cannot supersede memory with identical content.")
+    if old_memory.status != MemoryStatus.ACTIVE.value:
+        raise ValueError(
+            f"Cannot supersede memory with status '{old_memory.status}'; must be ACTIVE."
+        )
+
     old_content = old_memory.content
     old_memory.status = MemoryStatus.SUPERSEDED.value
     old_memory.superseded_by_id = new_memory.id

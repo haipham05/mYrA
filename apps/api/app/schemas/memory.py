@@ -92,7 +92,9 @@ class MemoryUpdate(BaseModel):
     importance: float | None = Field(default=None, ge=0.0, le=1.0)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     is_pinned: bool | None = None
-    version: int | None = None
+    version: int = Field(
+        ..., description="Current version of the memory for optimistic concurrency"
+    )
     reason: str | None = None
 
 

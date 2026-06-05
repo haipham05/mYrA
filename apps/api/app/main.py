@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -152,27 +152,44 @@ async def trigger_reconciliation(
     dry_run: bool = True,
     scan_storage: bool = False,
     prefix: str = "papers/",
+    min_age_seconds: int = 900,
+    confirm_destructive: bool = False,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Reconcile stranded resources (expired worker leases and unreferenced storage objects)."""
-    from app.crud.reconciliation import reconcile_stranded_resources_async
+    if scan_storage and not dry_run and not confirm_destructive:
+        raise HTTPException(
+            status_code=400,
+            detail="Destructive storage reconciliation requires confirm_destructive=true.",
+        )
+
+    from app.crud.reconciliation import reconcile_stranded_resources_async, validate_scan_prefix
     from app.storage.factory import get_storage
 
-    storage = get_storage() if scan_storage else None
-    scan_prefix = prefix if scan_storage else None
+    storage = None
+    scan_prefix = None
+    if scan_storage:
+        try:
+            scan_prefix = validate_scan_prefix(prefix)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+        storage = get_storage()
 
     report = await reconcile_stranded_resources_async(
         db=db,
         storage=storage,
         dry_run=dry_run,
         scan_prefix=scan_prefix,
+        min_age_seconds=min_age_seconds,
     )
     return {
         "dry_run": report.dry_run,
         "stuck_jobs_expired": report.stuck_jobs_expired,
         "stuck_jobs_recovered": report.stuck_jobs_recovered,
         "orphaned_storage_keys": report.orphaned_storage_keys,
+        "skipped_in_flight_keys": report.skipped_in_flight_keys,
         "storage_keys_scanned": report.storage_keys_scanned,
+        "deletion_errors": report.deletion_errors,
     }
 
 

@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
 
+from app.crud import job as job_crud
 from app.crud.job import (
     LostJobLeaseError,
     claim_next_job,
@@ -163,6 +165,54 @@ async def test_worker_stops_when_heartbeat_loses_lease(monkeypatch):
         assert db.get(Job, job.id).status == "PROCESSING"
         assert db.get(type(paper), paper.id).status != "READY"
         assert db.query(PaperPage).filter(PaperPage.paper_id == paper.id).count() == 0
+    finally:
+        db.close()
+        set_storage(None)
+
+
+@pytest.mark.anyio
+async def test_heartbeat_renews_lease_during_slow_cpu_bound_parsing(monkeypatch):
+    """Prove that CPU-bound parsing offloaded to a thread does not starve the heartbeat."""
+    create_tables()
+    db = SessionLocal()
+    db.query(Job).delete()
+    db.commit()
+
+    project = create_project(db, ProjectCreate(name="CPU Heartbeat Resilience"))
+    paper = create_paper(db, project.id, "heavy_docling.pdf", "heavy_docling.pdf")
+    job = create_job(db, paper.id)
+
+    class SlowCpuParser(FixedParser):
+        def parse(self, data: bytes) -> ParseResult:
+            # Synchronous CPU blocking call (e.g. Docling layout analysis)
+            time.sleep(0.4)
+            return super().parse(data)
+
+    storage = MemoryStorage()
+    await storage.put("heavy_docling.pdf", b"%PDF-heavy")
+    set_storage(storage)
+
+    real_renew = job_crud.renew_job_lease
+    renew_count = 0
+
+    def spy_renew_job_lease(*args, **kwargs):
+        nonlocal renew_count
+        renew_count += 1
+        return real_renew(*args, **kwargs)
+
+    monkeypatch.setattr("app.worker.renew_job_lease", spy_renew_job_lease)
+    monkeypatch.setattr("app.services.ingestion.DocumentParser", SlowCpuParser)
+
+    try:
+        # Heartbeat every 0.1s while CPU parse takes 0.4s
+        await run_worker(poll_interval=0.01, once=True, heartbeat_interval=0.1)
+        db.expire_all()
+        completed_job = db.get(Job, job.id)
+        assert completed_job.status == "COMPLETED"
+        assert completed_job.stage == "COMPLETED"
+        assert db.get(type(paper), paper.id).status == "READY"
+        # The heartbeat must have executed at least 2 times during the 0.4s blocking parse
+        assert renew_count >= 2
     finally:
         db.close()
         set_storage(None)

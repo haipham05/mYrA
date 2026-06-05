@@ -76,7 +76,7 @@ If an application release must be rolled back:
    - If rolling back to an older container image that lacks newer Alembic scripts, the startup gate will fail fast with `IncompatibleSchemaError`.
    - **Tested Rollback Procedure**: To roll back application code while preserving additive database columns/tables:
      - Ensure the rollback image includes the updated Alembic version scripts (decoupling schema metadata from code logic), OR
-     - If deploying an older binary where migration files cannot be refreshed, temporarily set `CHECK_MIGRATION_COMPATIBILITY=false` in the container environment, verifying that all database changes are strictly additive (nullable columns or safe defaults).
+     - If deploying an older binary where migration files cannot be refreshed, temporarily set `MYRA_CHECK_MIGRATIONS=false` in the container environment, verifying that all database changes are strictly additive (nullable columns or safe defaults).
    - **Database Downgrade Policy**: Live production databases must NEVER be downgraded via `alembic downgrade` unless emergency restoration is explicitly authorized, because downgrading drops new user data (e.g. long-term memories or conversation summaries).
 
 2. **Failed Backfill Recovery**:

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from uuid import UUID
 
@@ -78,13 +79,13 @@ class IngestionPipeline:
             document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
             if paper.document_sha256 and paper.document_sha256 != document_sha256:
                 raise ValueError("Stored PDF checksum does not match the uploaded document")
-            parse_result = self.parser.parse(pdf_bytes)
+            parse_result = await asyncio.to_thread(self.parser.parse, pdf_bytes)
 
             # 3. Chunk elements
             update_job_progress(
                 db, job_id, stage=JobStage.CHUNKING, progress=0.5, worker_id=worker_id
             )
-            chunk_specs = self.chunker.chunk(parse_result.elements)
+            chunk_specs = await asyncio.to_thread(self.chunker.chunk, parse_result.elements)
 
             # 4. Embeddings
             update_job_progress(
@@ -93,7 +94,11 @@ class IngestionPipeline:
             embed_provider = get_embedding_provider()
             child_chunks = [c for c in chunk_specs if c.chunk_type == "child"]
             child_texts = [c.text for c in child_chunks]
-            child_embeddings = embed_provider.embed_documents(child_texts) if child_texts else []
+            child_embeddings = (
+                await asyncio.to_thread(embed_provider.embed_documents, child_texts)
+                if child_texts
+                else []
+            )
 
             embedding_map = {
                 c.chunk_index: emb for c, emb in zip(child_chunks, child_embeddings, strict=False)

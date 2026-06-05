@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import BinaryIO
 
 
@@ -38,6 +39,13 @@ class ObjectStorage(ABC):
         for i in range(0, len(data), chunk_size):
             yield data[i : i + chunk_size]
 
-    async def list_keys(self, prefix: str = "") -> list[str]:
-        """List object keys under the given prefix."""
+    async def list_objects(
+        self, prefix: str = "", limit: int = 500
+    ) -> list[tuple[str, datetime | None]]:
+        """List object keys along with their modification timestamp up to limit."""
         return []
+
+    async def list_keys(self, prefix: str = "", limit: int = 500) -> list[str]:
+        """List object keys under the given prefix."""
+        objs = await self.list_objects(prefix=prefix, limit=limit)
+        return [k for k, _ in objs]

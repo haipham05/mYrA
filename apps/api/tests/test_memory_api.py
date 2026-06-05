@@ -102,7 +102,13 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
     assert updated_data["version"] == 2
     assert updated_data["importance"] == 0.9
 
-    # 6. Patch memory with stale version returns 409 Conflict
+    # 6a. Patch memory with missing version returns 422 Unprocessable Entity
+    resp_no_ver = client.patch(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}", json={"title": "No Version"}
+    )
+    assert resp_no_ver.status_code == 422
+
+    # 6b. Patch memory with stale version returns 409 Conflict
     stale_payload = {
         "title": "Conflict Attempt",
         "version": 1,  # Stale, version is now 2
@@ -112,6 +118,7 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
     assert "conflict" in resp.json()["detail"].lower()
 
     # 7. Supersede memory via POST /{memory_id}/supersede
+    # 7a. Version conflict on supersede
     supersede_payload = {
         "memory_type": MemoryType.DECISION.value,
         "title": "Switch to Brier Score",
@@ -121,14 +128,46 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
         "is_pinned": True,
         "sources": [],
     }
-    resp = client.post(
+    resp_conf = client.post(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=1",
+        json=supersede_payload,
+    )
+    assert resp_conf.status_code == 409
+
+    # 7b. Same content rejection on supersede
+    same_content_payload = {
+        "memory_type": MemoryType.DECISION.value,
+        "title": "Selected AURC Repeat",
+        "content": "Project decision: Selected AURC over ECE for calibration.",
+        "importance": 0.9,
+        "confidence": 0.95,
+        "is_pinned": True,
+        "sources": [],
+    }
+    resp_same = client.post(
         f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede",
+        json=same_content_payload,
+    )
+    assert resp_same.status_code == 400
+    assert "identical content" in resp_same.json()["detail"].lower()
+
+    # 7c. Successful supersede with expected_version
+    resp = client.post(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=2",
         json=supersede_payload,
     )
     assert resp.status_code == 200
     new_memory_data = resp.json()
     assert new_memory_data["title"] == "Switch to Brier Score"
     new_id = new_memory_data["id"]
+
+    # 7d. Superseding an already superseded memory is rejected
+    resp_again = client.post(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede",
+        json=supersede_payload,
+    )
+    assert resp_again.status_code == 400
+    assert "active" in resp_again.json()["detail"].lower()
 
     # Verify old memory is now SUPERSEDED
     resp_old = client.get(f"/api/v1/projects/{project.id}/memories/{memory_id}")
@@ -152,10 +191,14 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
 
 def test_memory_consolidation_endpoint(client: TestClient, db: Session) -> None:
     project = Project(name="Consolidation API Project")
-    db.add(project)
+    other_project = Project(name="Other Project")
+    db.add_all([project, other_project])
     db.commit()
 
     conv = create_conversation(db, project_id=project.id, title="Decision Conversation")
+    other_conv = create_conversation(
+        db, project_id=other_project.id, title="Other Decision Conversation"
+    )
     msg = Message(
         conversation_id=conv.id,
         role="user",
@@ -163,6 +206,13 @@ def test_memory_consolidation_endpoint(client: TestClient, db: Session) -> None:
     )
     db.add(msg)
     db.commit()
+
+    # Foreign conversation consolidation must return 404
+    resp_foreign = client.post(
+        f"/api/v1/projects/{project.id}/memories/consolidate",
+        json={"conversation_id": str(other_conv.id)},
+    )
+    assert resp_foreign.status_code == 404
 
     resp = client.post(
         f"/api/v1/projects/{project.id}/memories/consolidate",

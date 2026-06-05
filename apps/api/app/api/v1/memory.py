@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.crud.memory import (
     MemoryVersionConflictError,
+    create_memory,
     delete_memory,
     get_memory,
     list_memories,
@@ -26,6 +27,7 @@ from app.schemas.memory import (
 from app.services.memory_service import (
     capture_conversation_memories,
     consolidate_memory_candidate,
+    validate_memory_candidate,
 )
 
 logger = logging.getLogger("myra.api.memory")
@@ -142,6 +144,7 @@ def supersede_project_memory(
     project_id: UUID,
     memory_id: UUID,
     new_memory_in: MemoryCreate,
+    expected_version: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> MemoryResponse:
     old_mem = get_memory(db, memory_id=memory_id, project_id=project_id)
@@ -151,8 +154,41 @@ def supersede_project_memory(
             detail=f"Memory {memory_id} not found in project {project_id}",
         )
 
+    if old_mem.status != MemoryStatus.ACTIVE.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot supersede memory with status '{old_mem.status}'; must be ACTIVE.",
+        )
+
+    if expected_version is not None and old_mem.version != expected_version:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Version conflict: current version is {old_mem.version}, "
+                f"but expected {expected_version}"
+            ),
+        )
+
+    if new_memory_in.content.strip().lower() == old_mem.content.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot supersede memory with identical content.",
+        )
+
     try:
-        new_mem = consolidate_memory_candidate(db, project_id=project_id, candidate=new_memory_in)
+        validate_memory_candidate(db, project_id=project_id, candidate=new_memory_in)
+        embedding = None
+        try:
+            from app.services.embedding import get_embedding_provider
+
+            provider = get_embedding_provider()
+            embedding = provider.embed_query(new_memory_in.content)
+        except Exception:
+            embedding = None
+
+        new_mem = create_memory(
+            db, project_id=project_id, memory_in=new_memory_in, embedding=embedding
+        )
         supersede_memory(
             db,
             old_memory=old_mem,
@@ -203,7 +239,13 @@ def trigger_conversation_consolidation(
             detail=f"Project {project_id} not found",
         )
 
-    memories = capture_conversation_memories(
-        db=db, project_id=project_id, conversation_id=body.conversation_id
-    )
+    try:
+        memories = capture_conversation_memories(
+            db=db, project_id=project_id, conversation_id=body.conversation_id
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
     return [MemoryResponse.model_validate(m, from_attributes=True) for m in memories]

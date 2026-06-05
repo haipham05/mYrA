@@ -100,16 +100,19 @@ export default function ConversationNavigator({
           }}
           className="max-w-[200px] truncate rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-900 focus:border-zinc-900 focus:outline-hidden disabled:opacity-50"
         >
-          {conversations.length === 0 && (
-            <option value="">No conversations</option>
-          )}
-          {conversations.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.title || "Untitled Chat"}
-              {c.is_archived ? " [Archived]" : ""}
-              {c.message_count !== undefined ? ` (${c.message_count})` : ""}
+          {conversations.length === 0 ? (
+            <option key="empty" value="">
+              No conversations
             </option>
-          ))}
+          ) : (
+            conversations.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.title || "Untitled Chat"}
+                {c.is_archived ? " [Archived]" : ""}
+                {c.message_count !== undefined ? ` (${c.message_count})` : ""}
+              </option>
+            ))
+          )}
         </select>
 
         {activeConversation && !isRenaming && (

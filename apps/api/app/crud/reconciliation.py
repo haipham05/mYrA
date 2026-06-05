@@ -16,7 +16,30 @@ class ReconciliationReport:
     stuck_jobs_expired: list[str] = field(default_factory=list)
     stuck_jobs_recovered: list[str] = field(default_factory=list)
     orphaned_storage_keys: list[str] = field(default_factory=list)
+    skipped_in_flight_keys: list[str] = field(default_factory=list)
     storage_keys_scanned: int = 0
+    deletion_errors: list[str] = field(default_factory=list)
+
+
+def normalize_storage_path(path: str) -> str:
+    """Normalize stored URIs and relative paths for exact comparison."""
+    p = path.strip()
+    if p.startswith("memory://"):
+        p = p[len("memory://") :]
+    elif p.startswith("gs://"):
+        parts = p.split("/", 3)
+        p = parts[3] if len(parts) > 3 else p
+    return p.lstrip("/")
+
+
+def validate_scan_prefix(prefix: str | None) -> str:
+    """Validate that scan_prefix is non-empty and strictly inside approved namespaces."""
+    if not prefix or not prefix.strip():
+        raise ValueError("scan_prefix must be a non-empty path within the 'papers/' namespace")
+    cleaned = prefix.strip().lstrip("/")
+    if not cleaned.startswith("papers/"):
+        raise ValueError(f"scan_prefix '{prefix}' is outside the approved 'papers/' namespace")
+    return cleaned
 
 
 async def reconcile_stranded_resources_async(
@@ -26,17 +49,16 @@ async def reconcile_stranded_resources_async(
     lease_timeout_seconds: int = 300,
     storage_candidates: list[str] | None = None,
     scan_prefix: str | None = None,
+    min_age_seconds: int = 900,
+    max_keys: int = 500,
 ) -> ReconciliationReport:
     """Reconciles stranded jobs and orphaned storage keys asynchronously.
 
-    - Scans for jobs stuck in PROCESSING beyond lease_timeout_seconds.
-      - If retry_count >= max_retries: marks FAILED.
-      - If retry_count < max_retries: releases back to PENDING/QUEUED.
-    - If storage is provided and either storage_candidates is supplied or scan_prefix is set:
-      - Discovers or uses supplied storage keys.
-      - Verifies whether keys are referenced by any Paper record.
-      - If dry_run is False: deletes unreferenced orphan keys safely via await storage.delete.
-      - Never deletes keys referenced by a Paper.
+    Safety controls:
+    - Namespace isolation: scan_prefix must be within approved 'papers/' namespace.
+    - In-flight upload protection: objects modified < min_age_seconds are skipped.
+    - Bounded discovery: capped by max_keys to prevent memory exhaustion.
+    - Exact key normalization: matches paper storage paths across local/GCS/memory URIs.
     """
     now = datetime.now(tz=UTC)
     cutoff = datetime.fromtimestamp(now.timestamp() - lease_timeout_seconds, tz=UTC)
@@ -76,26 +98,44 @@ async def reconcile_stranded_resources_async(
     if not dry_run and stuck_jobs:
         db.commit()
 
-    # 2. Check storage candidates or discover them
+    # 2. Check storage candidates or discover them safely
     if storage:
-        candidates = storage_candidates
-        if candidates is None and scan_prefix is not None:
-            candidates = await storage.list_keys(prefix=scan_prefix)
+        candidates_with_mtime: list[tuple[str, datetime | None]] = []
 
-        if candidates:
-            report.storage_keys_scanned = len(candidates)
-            referenced_paths = set(p[0] for p in db.query(Paper.storage_path).all() if p[0])
-            for key in candidates:
-                is_referenced = any(
-                    key == ref or key.endswith(ref) or ref.endswith(key) for ref in referenced_paths
-                )
+        if storage_candidates is not None:
+            for k in storage_candidates[:max_keys]:
+                candidates_with_mtime.append((k, None))
+        elif scan_prefix is not None:
+            validated_prefix = validate_scan_prefix(scan_prefix)
+            candidates_with_mtime = await storage.list_objects(
+                prefix=validated_prefix, limit=max_keys
+            )
+
+        if candidates_with_mtime:
+            report.storage_keys_scanned = len(candidates_with_mtime)
+            # Fetch and normalize all referenced storage paths from DB
+            raw_referenced = [p[0] for p in db.query(Paper.storage_path).all() if p[0]]
+            referenced_paths = {normalize_storage_path(r) for r in raw_referenced}
+
+            for key, mtime in candidates_with_mtime:
+                norm_key = normalize_storage_path(key)
+
+                # If object is younger than min_age_seconds, it may be an in-flight upload!
+                if mtime is not None:
+                    age = (now - mtime).total_seconds()
+                    if age < min_age_seconds:
+                        report.skipped_in_flight_keys.append(key)
+                        continue
+
+                is_referenced = norm_key in referenced_paths
+
                 if not is_referenced:
                     report.orphaned_storage_keys.append(key)
                     if not dry_run:
                         try:
                             await storage.delete(key)
-                        except Exception:
-                            pass
+                        except Exception as del_err:
+                            report.deletion_errors.append(f"{key}: {del_err}")
 
     return report
 
@@ -107,6 +147,8 @@ def reconcile_stranded_resources(
     lease_timeout_seconds: int = 300,
     storage_candidates: list[str] | None = None,
     scan_prefix: str | None = None,
+    min_age_seconds: int = 900,
+    max_keys: int = 500,
 ) -> ReconciliationReport:
     """Synchronous wrapper for reconcile_stranded_resources_async."""
     try:
@@ -127,6 +169,8 @@ def reconcile_stranded_resources(
                     lease_timeout_seconds=lease_timeout_seconds,
                     storage_candidates=storage_candidates,
                     scan_prefix=scan_prefix,
+                    min_age_seconds=min_age_seconds,
+                    max_keys=max_keys,
                 ),
             ).result()
     else:
@@ -138,5 +182,7 @@ def reconcile_stranded_resources(
                 lease_timeout_seconds=lease_timeout_seconds,
                 storage_candidates=storage_candidates,
                 scan_prefix=scan_prefix,
+                min_age_seconds=min_age_seconds,
+                max_keys=max_keys,
             )
         )

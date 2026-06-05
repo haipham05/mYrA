@@ -1,5 +1,6 @@
 import asyncio
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -70,20 +71,29 @@ class LocalStorage(ObjectStorage):
             while chunk := f.read(chunk_size):
                 yield chunk
 
-    async def list_keys(self, prefix: str = "") -> list[str]:
-        def _scan() -> list[str]:
+    async def list_objects(
+        self, prefix: str = "", limit: int = 500
+    ) -> list[tuple[str, datetime | None]]:
+        def _scan() -> list[tuple[str, datetime | None]]:
             base = self.base_dir.resolve()
             if not base.exists():
                 return []
             results = []
-            for path in base.rglob("*"):
+            for path in sorted(base.rglob("*")):
                 if path.is_file():
                     rel = str(path.relative_to(base))
                     if not prefix or rel.startswith(prefix):
-                        results.append(rel)
+                        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+                        results.append((rel, mtime))
+                        if len(results) >= limit:
+                            break
             return results
 
         return await asyncio.to_thread(_scan)
+
+    async def list_keys(self, prefix: str = "", limit: int = 500) -> list[str]:
+        objs = await self.list_objects(prefix=prefix, limit=limit)
+        return [k for k, _ in objs]
 
 
 class MemoryStorage(ObjectStorage):
@@ -91,12 +101,14 @@ class MemoryStorage(ObjectStorage):
 
     def __init__(self) -> None:
         self._store: dict[str, bytes] = {}
+        self._timestamps: dict[str, datetime] = {}
 
     async def exists(self, key: str) -> bool:
         return key in self._store
 
     async def put(self, key: str, data: bytes, content_type: str = "application/pdf") -> str:
         self._store[key] = data
+        self._timestamps[key] = datetime.now(tz=UTC)
         return f"memory://{key}"
 
     async def get(self, key: str) -> bytes:
@@ -106,6 +118,23 @@ class MemoryStorage(ObjectStorage):
 
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
+        self._timestamps.pop(key, None)
 
-    async def list_keys(self, prefix: str = "") -> list[str]:
-        return [k for k in self._store.keys() if not prefix or k.startswith(prefix)]
+    def set_mtime(self, key: str, mtime: datetime) -> None:
+        """Helper to simulate aged/mature objects in tests."""
+        self._timestamps[key] = mtime
+
+    async def list_objects(
+        self, prefix: str = "", limit: int = 500
+    ) -> list[tuple[str, datetime | None]]:
+        results = []
+        for k in sorted(self._store.keys()):
+            if not prefix or k.startswith(prefix):
+                results.append((k, self._timestamps.get(k)))
+                if len(results) >= limit:
+                    break
+        return results
+
+    async def list_keys(self, prefix: str = "", limit: int = 500) -> list[str]:
+        objs = await self.list_objects(prefix=prefix, limit=limit)
+        return [k for k, _ in objs]

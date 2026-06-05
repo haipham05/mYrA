@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from typing import BinaryIO
 
 from app.storage.base import ObjectStorage
@@ -81,10 +82,16 @@ class GCSStorage(ObjectStorage):
         finally:
             await asyncio.to_thread(reader.close)
 
-    async def list_keys(self, prefix: str = "") -> list[str]:
-        def _list() -> list[str]:
+    async def list_objects(
+        self, prefix: str = "", limit: int = 500
+    ) -> list[tuple[str, datetime | None]]:
+        def _list() -> list[tuple[str, datetime | None]]:
             bucket = self._get_bucket()
-            blobs = bucket.list_blobs(prefix=prefix if prefix else None)
-            return [b.name for b in blobs]
+            blobs = bucket.list_blobs(prefix=prefix if prefix else None, max_results=limit)
+            return [(b.name, b.updated) for b in blobs]
 
         return await asyncio.to_thread(_list)
+
+    async def list_keys(self, prefix: str = "", limit: int = 500) -> list[str]:
+        objs = await self.list_objects(prefix=prefix, limit=limit)
+        return [k for k, _ in objs]

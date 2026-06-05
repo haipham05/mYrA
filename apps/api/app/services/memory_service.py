@@ -168,6 +168,7 @@ def consolidate_memory_candidate(
     db: Session,
     project_id: UUID,
     candidate: MemoryCreate,
+    embedding: list[float] | None = None,
 ) -> Memory:
     """Idempotently insert or supersede memory in the target project.
 
@@ -221,7 +222,9 @@ def consolidate_memory_candidate(
                 # If there is substantial topic overlap (e.g. "AURC", "ECE" or shared metric/model)
                 if overlap and (len(overlap) >= 2 or any(len(w) >= 4 for w in overlap)):
                     # New memory supersedes old memory
-                    new_mem = create_memory(db, project_id=project_id, memory_in=candidate)
+                    new_mem = create_memory(
+                        db, project_id=project_id, memory_in=candidate, embedding=embedding
+                    )
                     supersede_memory(
                         db,
                         old_memory=mem,
@@ -234,7 +237,7 @@ def consolidate_memory_candidate(
                     return new_mem
 
     # 3. Create fresh active memory
-    return create_memory(db, project_id=project_id, memory_in=candidate)
+    return create_memory(db, project_id=project_id, memory_in=candidate, embedding=embedding)
 
 
 def capture_conversation_memories(
@@ -267,6 +270,7 @@ def score_memory_relevance(
     memory: Memory,
     query_tokens: set[str],
     now: datetime,
+    query_embedding: list[float] | None = None,
 ) -> float:
     """Compute ranking score for a memory given a query."""
     score = 0.0
@@ -291,6 +295,20 @@ def score_memory_relevance(
         overlap = query_tokens.intersection(mem_tokens)
         score += len(overlap) * 2.5
 
+    # 5. Semantic vector similarity if query and memory embeddings exist
+    if query_embedding and memory.embedding:
+        try:
+            mem_emb = memory.embedding if isinstance(memory.embedding, list) else []
+            if len(mem_emb) == len(query_embedding):
+                dot_product = sum(a * b for a, b in zip(mem_emb, query_embedding, strict=False))
+                norm_a = math.sqrt(sum(a * a for a in mem_emb))
+                norm_b = math.sqrt(sum(b * b for b in query_embedding))
+                if norm_a > 0 and norm_b > 0:
+                    cosine = dot_product / (norm_a * norm_b)
+                    score += max(0.0, cosine) * 4.0
+        except Exception:
+            pass
+
     return score
 
 
@@ -300,6 +318,7 @@ def retrieve_project_memories(
     query: str,
     limit: int = 5,
     record_access: bool = True,
+    query_embedding: list[float] | None = None,
 ) -> list[Memory]:
     """Retrieve top-k active memories strictly scoped to the specified project."""
     active_memories, _ = list_memories(
@@ -314,7 +333,10 @@ def retrieve_project_memories(
     now = datetime.now(UTC)
     query_tokens = set(re.findall(r"\b[A-Za-z0-9_-]{3,}\b", query.lower()))
 
-    scored = [(score_memory_relevance(m, query_tokens, now), m) for m in active_memories]
+    scored = [
+        (score_memory_relevance(m, query_tokens, now, query_embedding=query_embedding), m)
+        for m in active_memories
+    ]
     scored.sort(key=lambda x: x[0], reverse=True)
 
     top_memories = [m for _, m in scored[:limit]]
