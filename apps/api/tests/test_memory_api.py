@@ -7,10 +7,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.crud.chat import create_conversation
 from app.db.base import Base
-from app.db.models import Message, Project
+from app.db.models import Memory, MemorySource, Message, Paper, PaperPage, Project
 from app.db.session import get_db
 from app.main import app
-from app.schemas.memory import MemoryStatus, MemoryType
+from app.schemas.memory import MemorySourceType, MemoryStatus, MemoryType
 
 
 @pytest.fixture
@@ -128,6 +128,14 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
         "is_pinned": True,
         "sources": [],
     }
+    # 7a. Missing expected_version yields 422
+    resp_no_ver = client.post(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede",
+        json=supersede_payload,
+    )
+    assert resp_no_ver.status_code == 422
+
+    # Version conflict on supersede (stale expected_version=1 vs current version=2)
     resp_conf = client.post(
         f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=1",
         json=supersede_payload,
@@ -145,7 +153,7 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
         "sources": [],
     }
     resp_same = client.post(
-        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede",
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=2",
         json=same_content_payload,
     )
     assert resp_same.status_code == 400
@@ -163,7 +171,7 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
 
     # 7d. Superseding an already superseded memory is rejected
     resp_again = client.post(
-        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede",
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=2",
         json=supersede_payload,
     )
     assert resp_again.status_code == 400
@@ -222,3 +230,144 @@ def test_memory_consolidation_endpoint(client: TestClient, db: Session) -> None:
     memories = resp.json()
     assert len(memories) >= 1
     assert any("lora" in m["content"].lower() for m in memories)
+
+
+def test_paper_fact_edit_api_rejects_unsupported_content(client: TestClient, db: Session) -> None:
+    """Prove that PATCH /memories/{id} with unsupported content returns 400 and preserves row."""
+    project = Project(name="Paper Fact API Project")
+    db.add(project)
+    db.commit()
+
+    paper = Paper(
+        project_id=project.id,
+        filename="comparison.pdf",
+        storage_path="papers/comparison.pdf",
+        document_sha256="hash_comp_123",
+        status="READY",
+    )
+    db.add(paper)
+    db.commit()
+
+    page = PaperPage(
+        paper_id=paper.id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text="In our benchmark, Method A is better than method B across all evaluations.",
+    )
+    db.add(page)
+    db.commit()
+
+    initial_embedding = [0.1, 0.2, 0.3]
+    mem = Memory(
+        project_id=project.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Valid Comparison Fact",
+        content="Method A is better than method B.",
+        confidence=1.0,
+        importance=0.9,
+        version=1,
+        embedding=initial_embedding,
+        embedding_vec=initial_embedding,
+    )
+    db.add(mem)
+    db.flush()
+
+    source = MemorySource(
+        memory_id=mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper.id,
+        page_number=1,
+        quote_text="Method A is better than method B",
+        document_sha256="hash_comp_123",
+    )
+    db.add(source)
+    db.commit()
+    db.refresh(mem)
+
+    # 1. Attempt to PATCH with reversed relation: "Method B is better than method A."
+    patch_payload = {
+        "version": 1,
+        "content": "Method B is better than method A.",
+    }
+    resp = client.patch(f"/api/v1/projects/{project.id}/memories/{mem.id}", json=patch_payload)
+    # Must return 400 Bad Request, NOT 500!
+    assert resp.status_code == 400
+    assert "not supported" in resp.json()["detail"].lower()
+
+    # 2. Verify in DB that memory content, version, and embedding remain strictly unchanged
+    resp_get = client.get(f"/api/v1/projects/{project.id}/memories/{mem.id}")
+    assert resp_get.status_code == 200
+    current_data = resp_get.json()
+    assert current_data["version"] == 1
+    assert current_data["content"] == "Method A is better than method B."
+
+
+def test_paper_fact_creation_api_rejects_mismatched_quote_with_opposite_nearby(
+    client: TestClient, db: Session
+) -> None:
+    project = Project(name="Mismatched Quote Project")
+    db.add(project)
+    db.commit()
+
+    paper = Paper(
+        project_id=project.id,
+        filename="opposite_sentences.pdf",
+        storage_path="papers/opposite_sentences.pdf",
+        document_sha256="hash_opp_456",
+        status="READY",
+    )
+    db.add(paper)
+    db.commit()
+
+    page = PaperPage(
+        paper_id=paper.id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text="Method A is better than method B. Method B is better than method A.",
+    )
+    db.add(page)
+    db.commit()
+
+    # 1. Attempt to create memory claiming B > A while citing A > B: must return HTTP 400
+    mismatched_payload = {
+        "memory_type": MemoryType.PAPER_FACT.value,
+        "title": "Claim B > A",
+        "content": "Method B is better than method A.",
+        "sources": [
+            {
+                "source_type": MemorySourceType.PAPER_CHUNK.value,
+                "paper_id": str(paper.id),
+                "page_number": 1,
+                "quote_text": "Method A is better than method B",
+                "document_sha256": "hash_opp_456",
+            }
+        ],
+    }
+    resp = client.post(f"/api/v1/projects/{project.id}/memories", json=mismatched_payload)
+    assert resp.status_code == 400
+    assert "not supported" in resp.json()["detail"].lower()
+
+    # 2. Accurately citing B > A succeeds with HTTP 201
+    accurate_payload = {
+        "memory_type": MemoryType.PAPER_FACT.value,
+        "title": "Claim B > A Accurately Cited",
+        "content": "Method B is better than method A.",
+        "sources": [
+            {
+                "source_type": MemorySourceType.PAPER_CHUNK.value,
+                "paper_id": str(paper.id),
+                "page_number": 1,
+                "quote_text": "Method B is better than method A",
+                "document_sha256": "hash_opp_456",
+            }
+        ],
+    }
+    resp_ok = client.post(f"/api/v1/projects/{project.id}/memories", json=accurate_payload)
+    assert resp_ok.status_code == 201
+    data = resp_ok.json()
+    assert data["content"] == "Method B is better than method A."
+    assert len(data["sources"]) == 1
+    assert data["sources"][0]["quote_text"] == "Method B is better than method A"

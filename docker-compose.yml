@@ -1,5 +1,6 @@
 services:
   api:
+    image: myra-api:latest
     build:
       context: ./apps/api
     env_file:
@@ -35,6 +36,7 @@ services:
         required: false
     volumes:
       - ./apps/api/app:/app/app
+      - ./apps/api/alembic:/app/alembic
       - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
     command: python -m app.worker
     depends_on:

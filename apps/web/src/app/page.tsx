@@ -6,7 +6,14 @@ import MemoryInspector from "@/components/MemoryInspector";
 import PaperUploader from "@/components/PaperUploader";
 import PdfViewer from "@/components/PdfViewer";
 import ProjectSelector from "@/components/ProjectSelector";
-import type { Citation, Conversation, Message, Paper, Project } from "@/types";
+import type {
+  Citation,
+  Conversation,
+  MemorySource,
+  Message,
+  Paper,
+  Project,
+} from "@/types";
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<"workspace" | "memory">(
@@ -210,6 +217,38 @@ export default function Home() {
       }
     } catch {
       setMessages([]);
+    }
+  };
+
+  // Jump from memory source to paper or conversation in workspace
+  const handleSelectMemorySource = (source: MemorySource) => {
+    setActiveTab("workspace");
+    if (source.source_type === "PAPER_CHUNK" && source.paper_id) {
+      const targetPaper = papers.find((p) => p.id === source.paper_id);
+      if (targetPaper) {
+        setSelectedPaper(targetPaper);
+      }
+      if (source.page_number && source.quote_text) {
+        setActiveCitation({
+          citation_index: 1,
+          evidence_id: `mem-src-${source.id}`,
+          paper_id: source.paper_id,
+          page_number: source.page_number,
+          bounding_boxes: [],
+          quote: source.quote_text,
+          document_sha256: source.document_sha256,
+          anchor_status: "unresolved",
+        });
+      }
+    } else if (source.source_type === "MESSAGE") {
+      if (source.conversation_id) {
+        const targetConv = conversations.find(
+          (c) => c.id === source.conversation_id,
+        );
+        if (targetConv) {
+          handleSelectConversation(targetConv);
+        }
+      }
     }
   };
 
@@ -455,6 +494,7 @@ export default function Home() {
             <MemoryInspector
               projectId={selectedProject?.id || null}
               apiUrl={apiUrl}
+              onSelectSource={handleSelectMemorySource}
             />
           </section>
         ) : (

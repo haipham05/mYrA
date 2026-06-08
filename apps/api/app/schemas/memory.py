@@ -42,6 +42,7 @@ class MemorySourceCreate(MemorySourceBase):
 class MemorySourceResponse(MemorySourceBase):
     id: UUID
     memory_id: UUID
+    conversation_id: UUID | None = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 

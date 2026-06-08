@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -152,11 +152,24 @@ async def trigger_reconciliation(
     dry_run: bool = True,
     scan_storage: bool = False,
     prefix: str = "papers/",
-    min_age_seconds: int = 900,
+    min_age_seconds: int = Query(
+        900,
+        ge=300,
+        description="Minimum age of orphaned storage objects in seconds before deletion",
+    ),
     confirm_destructive: bool = False,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Reconcile stranded resources (expired worker leases and unreferenced storage objects)."""
+    if min_age_seconds < 300:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"min_age_seconds must be at least 300 seconds (got {min_age_seconds}) "
+                "to protect in-flight uploads."
+            ),
+        )
+
     if scan_storage and not dry_run and not confirm_destructive:
         raise HTTPException(
             status_code=400,

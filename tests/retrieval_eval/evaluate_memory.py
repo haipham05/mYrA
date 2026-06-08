@@ -12,6 +12,7 @@ from app.crud.memory import list_memories
 from app.crud.paper import create_paper
 from app.crud.project import create_project
 from app.db.base import Base
+from app.db.models import PaperPage
 from app.schemas.memory import (
     MemoryCreate,
     MemorySourceCreate,
@@ -44,7 +45,7 @@ def run_memory_evaluation():
     project = create_project(db, ProjectCreate(name="Benchmark Evaluation Project"))
     foreign_proj = create_project(db, ProjectCreate(name="Foreign Unrelated Project"))
 
-    # Create dummy paper for paper fact provenance
+    # Create paper with verified page text for paper fact provenance
     paper = create_paper(
         db,
         project_id=project.id,
@@ -52,6 +53,15 @@ def run_memory_evaluation():
         storage_path="papers/benchmark_paper.pdf",
         status="READY",
     )
+    page4 = PaperPage(
+        paper_id=paper.id,
+        page_number=4,
+        width=612.0,
+        height=792.0,
+        raw_text="Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions.",
+    )
+    db.add(page4)
+    db.commit()
 
     # 3. Ingest labeled sequence
     # 3.1 Initial Decision 1
@@ -87,8 +97,8 @@ def run_memory_evaluation():
     # 3.4 Valid Paper Fact with verified paper quote
     cand_paper_fact = MemoryCreate(
         memory_type=MemoryType.PAPER_FACT,
-        title="Attention Layer Complexity",
-        content="Multi-head attention has O(n^2) computational complexity with respect to sequence length.",
+        title="Attention Representation Subspaces",
+        content="Multi-head attention allows the model to attend to information from different representation subspaces.",
         importance=0.8,
         confidence=1.0,
         sources=[
@@ -96,14 +106,17 @@ def run_memory_evaluation():
                 source_type=MemorySourceType.PAPER_CHUNK,
                 paper_id=paper.id,
                 page_number=4,
-                quote_text="Multi-head attention allows the model to jointly attend to information...",
+                quote_text="Multi-head attention allows the model to jointly attend to information from different representation subspaces",
             )
         ],
     )
-    mem_paper_fact = consolidate_memory_candidate(db, project_id=project.id, candidate=cand_paper_fact)
+    mem_paper_fact = consolidate_memory_candidate(
+        db, project_id=project.id, candidate=cand_paper_fact
+    )
 
     # 3.5 Attempted Invalid / Unsupported Paper Fact (must be rejected)
     rejected_unsupported_count = 0
+    # 3.5a Non-existent paper
     try:
         cand_forged = MemoryCreate(
             memory_type=MemoryType.PAPER_FACT,
@@ -118,6 +131,44 @@ def run_memory_evaluation():
             ],
         )
         consolidate_memory_candidate(db, project_id=project.id, candidate=cand_forged)
+    except ValueError:
+        rejected_unsupported_count += 1
+
+    # 3.5b Invented quote on existing paper
+    try:
+        cand_invented_quote = MemoryCreate(
+            memory_type=MemoryType.PAPER_FACT,
+            title="Invented Quote Claim",
+            content="Attention layers use quantum superposition.",
+            sources=[
+                MemorySourceCreate(
+                    source_type=MemorySourceType.PAPER_CHUNK,
+                    paper_id=paper.id,
+                    page_number=4,
+                    quote_text="quantum superposition in attention layers",
+                )
+            ],
+        )
+        consolidate_memory_candidate(db, project_id=project.id, candidate=cand_invented_quote)
+    except ValueError:
+        rejected_unsupported_count += 1
+
+    # 3.5c Real quote, but claim asserts unsupported concepts
+    try:
+        cand_unsupported_claim = MemoryCreate(
+            memory_type=MemoryType.PAPER_FACT,
+            title="Unsupported Claim",
+            content="Multi-head attention model proves quantum teleportation.",
+            sources=[
+                MemorySourceCreate(
+                    source_type=MemorySourceType.PAPER_CHUNK,
+                    paper_id=paper.id,
+                    page_number=4,
+                    quote_text="Multi-head attention allows the model to jointly attend to information",
+                )
+            ],
+        )
+        consolidate_memory_candidate(db, project_id=project.id, candidate=cand_unsupported_claim)
     except ValueError:
         rejected_unsupported_count += 1
 
@@ -162,7 +213,7 @@ def run_memory_evaluation():
             "description": "User preference recall",
         },
         {
-            "query": "What is the computational complexity of multi-head attention?",
+            "query": "How does multi-head attention attend to information from representation subspaces?",
             "expected_top_id": mem_paper_fact.id,
             "forbidden_ids": [],
             "description": "Paper evidence fact recall",
@@ -227,7 +278,7 @@ def run_memory_evaluation():
     print(f"  Supersession Resolution:           {'100.0% PASS' if supersession_verified else 'FAIL'}")
     print(f"  Superseded Invalidation Leak:      {forbidden_leak_count} occurrences (0 expected)")
     print(f"  Cross-Project Isolation Leak:      {foreign_leak_count} occurrences (0 expected)")
-    print(f"  Unsupported Paper Memory Reject:   {'100.0% PASS' if rejected_unsupported_count == 1 else 'FAIL'}")
+    print(f"  Unsupported Paper Memory Reject:   {'100.0% PASS' if rejected_unsupported_count == 3 else 'FAIL'}")
     print("=" * 70)
 
     assert r_at_1 == 100.0, f"Expected Recall@1 100%, got {r_at_1}%"
@@ -235,7 +286,7 @@ def run_memory_evaluation():
     assert supersession_verified, "Conflict supersession failed verification"
     assert forbidden_leak_count == 0, "Superseded memory leaked into active retrieval"
     assert foreign_leak_count == 0, "Foreign project memory leaked into scoped retrieval"
-    assert rejected_unsupported_count == 1, "Unsupported paper memory was not rejected"
+    assert rejected_unsupported_count == 3, f"Expected 3 unsupported paper memory rejections, got {rejected_unsupported_count}"
     print("\nAll memory benchmark assertions PASSED cleanly.")
 
 

@@ -118,6 +118,7 @@ export interface MemorySource {
   memory_id: string;
   source_type: MemorySourceType;
   message_id?: string | null;
+  conversation_id?: string | null;
   paper_id?: string | null;
   page_number?: number | null;
   quote_text?: string | null;

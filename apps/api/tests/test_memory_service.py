@@ -6,13 +6,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.crud.memory import (
     MemoryVersionConflictError,
+    atomic_create_and_supersede,
     create_memory,
     delete_memory,
     get_memory,
+    supersede_memory,
     update_memory,
 )
 from app.db.base import Base
-from app.db.models import Conversation, Message, Paper, Project
+from app.db.models import Conversation, Memory, MemorySource, Message, Paper, PaperPage, Project
 from app.schemas.memory import (
     MemoryCreate,
     MemorySourceCreate,
@@ -158,6 +160,25 @@ def test_idempotency_and_supersession(db: Session) -> None:
     assert mem1.version == 2
     assert any(h.action == "SUPERSEDED" for h in mem1.history)
 
+    # 3. Guard against self-supersession
+    with pytest.raises(ValueError, match="Cannot supersede memory with itself"):
+        supersede_memory(db, old_memory=mem2, new_memory=mem2)
+
+    # 4. Guard against same-content supersession
+    mem2_dup = create_memory(db, project_id=project.id, memory_in=cand2)
+    with pytest.raises(ValueError, match="Cannot supersede memory with identical content"):
+        supersede_memory(db, old_memory=mem2, new_memory=mem2_dup)
+
+    # 5. Guard against superseding already superseded/inactive memory
+    cand3 = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Third Decision",
+        content="New active decision.",
+    )
+    mem3 = create_memory(db, project_id=project.id, memory_in=cand3)
+    with pytest.raises(ValueError, match="must be ACTIVE"):
+        supersede_memory(db, old_memory=mem1, new_memory=mem3)
+
 
 def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
     project1 = Project(name="Project 1")
@@ -165,36 +186,487 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
     db.add_all([project1, project2])
     db.commit()
 
-    paper1 = Paper(
+    # Unready paper
+    unready_paper = Paper(
+        project_id=project1.id,
+        filename="unready.pdf",
+        storage_path="/papers/unready.pdf",
+        document_sha256="hash_unready",
+        status="PROCESSING",
+    )
+    # Ready paper with verified page text
+    ready_paper = Paper(
         project_id=project1.id,
         filename="attention.pdf",
-        storage_path="/fake/path",
-        document_sha256="abc123",
-        status="PROCESSED",
+        storage_path="/papers/attention.pdf",
+        document_sha256="hash_ready_123",
+        status="READY",
     )
-    db.add(paper1)
+    db.add_all([unready_paper, ready_paper])
     db.commit()
 
-    # 1. Paper fact referencing a paper in a DIFFERENT project should be rejected
-    forged_cand = MemoryCreate(
+    page1 = PaperPage(
+        paper_id=ready_paper.id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text="The Transformer model uses multi-head attention mechanism across sub-layers.",
+    )
+    db.add(page1)
+    db.commit()
+
+    # 1. Non-READY paper must be rejected
+    unready_cand = MemoryCreate(
         memory_type=MemoryType.PAPER_FACT,
-        title="Attention Paper Fact",
+        title="Unready Fact",
+        content="Fact from unready paper.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=unready_paper.id,
+                quote_text="some quote",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="must be 'READY'"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=unready_cand)
+
+    # 2. Paper fact referencing a paper in a DIFFERENT project must be rejected
+    foreign_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Foreign Project Fact",
         content="Transformer model uses multi-head attention.",
         sources=[
             MemorySourceCreate(
                 source_type=MemorySourceType.PAPER_CHUNK,
-                paper_id=paper1.id,
+                paper_id=ready_paper.id,
                 quote_text="multi-head attention mechanism",
             )
         ],
     )
     with pytest.raises(ValueError, match="does not exist in project"):
-        consolidate_memory_candidate(db, project_id=project2.id, candidate=forged_cand)
+        consolidate_memory_candidate(db, project_id=project2.id, candidate=foreign_cand)
 
-    # 2. Legitimate paper fact in same project succeeds
-    valid_mem = consolidate_memory_candidate(db, project_id=project1.id, candidate=forged_cand)
+    # 3. Invented quote not present in paper must be rejected
+    forged_quote_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Forged Quote Fact",
+        content="Transformer model uses quantum superposition.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                quote_text="quantum superposition in attention layers",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="Quote text was not found"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=forged_quote_cand)
+
+    # 4. Document SHA-256 mismatch must be rejected
+    mismatched_hash_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Hash Mismatch Fact",
+        content="Transformer model uses multi-head attention.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                quote_text="multi-head attention mechanism",
+                document_sha256="wrong_hash_xyz",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="Document SHA-256 mismatch"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=mismatched_hash_cand)
+
+    # 5. Legitimate paper fact with verified quote succeeds
+    valid_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Attention Paper Fact",
+        content="Transformer model uses multi-head attention mechanism across sub-layers.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=1,
+                quote_text=(
+                    "The Transformer model uses multi-head attention mechanism across sub-layers."
+                ),
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    valid_mem = consolidate_memory_candidate(db, project_id=project1.id, candidate=valid_cand)
     assert valid_mem.id is not None
     assert valid_mem.memory_type == MemoryType.PAPER_FACT.value
+
+    # 6. Prompt formatting revalidation: if paper becomes unready, fact is excluded
+    formatted_ready = format_memories_for_prompt([valid_mem], db=db)
+    assert "ESTABLISHED PAPER FACTS" in formatted_ready
+    assert "multi-head attention" in formatted_ready
+
+    ready_paper.status = "FAILED"
+    db.commit()
+    formatted_failed = format_memories_for_prompt([valid_mem], db=db)
+    assert "ESTABLISHED PAPER FACTS" not in formatted_failed
+
+    # 7. Real quote in paper, but claim asserts unsupported concepts
+    # (quantum teleportation counterexample)
+    ready_paper.status = "READY"
+    db.commit()
+    unsupported_claim_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Quantum Teleportation Claim",
+        content="The paper proves quantum teleportation.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=1,
+                quote_text="multi-head attention mechanism",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="not supported by cited quote"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=unsupported_claim_cand)
+
+    # 8. Misleading-but-real quote containing negation/contrast
+    misleading_text = (
+        "While quantum teleportation is fascinating, our work focuses strictly on transformers."
+    )
+    page2 = PaperPage(
+        paper_id=ready_paper.id,
+        page_number=2,
+        width=612.0,
+        height=792.0,
+        raw_text=misleading_text,
+    )
+    db.add(page2)
+    db.commit()
+
+    misleading_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Misleading Quote Fact",
+        content="The paper proves quantum teleportation.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=2,
+                quote_text=misleading_text,
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="not supported by cited quote"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=misleading_cand)
+
+    # 9. PATCH turning valid paper fact into unsupported claim is rejected
+    with pytest.raises(ValueError, match="not supported by cited source quote"):
+        update_memory(
+            db,
+            memory=valid_mem,
+            memory_update=MemoryUpdate(
+                version=1,
+                content="The paper proves quantum teleportation.",
+            ),
+        )
+
+    # 10. Reversed relation claim: "Method B is better than method A."
+    # vs quote "Method A is better than method B."
+    page3 = PaperPage(
+        paper_id=ready_paper.id,
+        page_number=3,
+        width=612.0,
+        height=792.0,
+        raw_text=(
+            "In our empirical evaluation, Method A is better than method B across all benchmarks."
+        ),
+    )
+    db.add(page3)
+    db.commit()
+
+    reversed_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Reversed Method Relation",
+        content="Method B is better than method A.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=3,
+                quote_text="Method A is better than method B",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="reverses entity roles, relations, or ordering"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=reversed_cand)
+
+    # 11. Swapped numbers claim: "accuracy decreased from 90% to 80%"
+    # vs quote "accuracy increased from 80% to 90%"
+    page4 = PaperPage(
+        paper_id=ready_paper.id,
+        page_number=4,
+        width=612.0,
+        height=792.0,
+        raw_text="The accuracy increased from 80% to 90% after fine-tuning.",
+    )
+    db.add(page4)
+    db.commit()
+
+    swapped_numbers_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Swapped Numbers Fact",
+        content="The accuracy decreased from 90% to 80% after fine-tuning.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=4,
+                quote_text="The accuracy increased from 80% to 90% after fine-tuning.",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    with pytest.raises(
+        ValueError, match="asserts opposite directional|inverts or alters the order"
+    ):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=swapped_numbers_cand)
+
+    # 12. Swapped numbers without antonym: "from 90 to 80" vs quote "from 80 to 90"
+    swapped_plain_nums = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Plain Swapped Numbers",
+        content="The score was from 90 to 80.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=4,
+                quote_text="The score was from 80 to 90.",
+            )
+        ],
+    )
+    page4.raw_text += " The score was from 80 to 90."
+    db.commit()
+    with pytest.raises(ValueError, match="inverts or alters the order of numerical values"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=swapped_plain_nums)
+
+    # 13. Genuinely supported relation claim succeeds and appears in prompt
+    supported_relation_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Verified Method Superiority",
+        content="Method A is better than method B.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=3,
+                quote_text="Method A is better than method B",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    supported_mem = consolidate_memory_candidate(
+        db, project_id=project1.id, candidate=supported_relation_cand
+    )
+    assert supported_mem.id is not None
+    formatted_supported = format_memories_for_prompt([supported_mem], db=db)
+    assert "ESTABLISHED PAPER FACTS" in formatted_supported
+    assert "Method A is better than method B" in formatted_supported
+
+    # And verify that a reversed fake memory object created directly in DB never enters prompt
+    reversed_fake_mem = Memory(
+        project_id=project1.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Reversed Fake Memory",
+        content="Method B is better than method A.",
+        sources=[
+            MemorySource(
+                source_type=MemorySourceType.PAPER_CHUNK.value,
+                paper_id=ready_paper.id,
+                page_number=3,
+                quote_text="Method A is better than method B",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    db.add(reversed_fake_mem)
+    db.commit()
+    formatted_reversed = format_memories_for_prompt([reversed_fake_mem], db=db)
+    assert "ESTABLISHED PAPER FACTS" not in formatted_reversed
+    assert "Method B is better than method A" not in formatted_reversed
+    db.delete(reversed_fake_mem)
+    db.commit()
+
+    # 14. Two opposite sentences on one page: citing X > Y must not establish Y > X,
+    # even if Y > X appears nearby on that same page.
+    page5 = PaperPage(
+        paper_id=ready_paper.id,
+        page_number=5,
+        width=612.0,
+        height=792.0,
+        raw_text="Method X is superior to method Y. Method Y is superior to method X.",
+    )
+    db.add(page5)
+    db.commit()
+
+    # Mismatched citation: claiming Y > X while citing X > Y must fail
+    mismatched_quote_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Contradictory Citation Fact",
+        content="Method Y is superior to method X.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=5,
+                quote_text="Method X is superior to method Y",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="reverses entity roles, relations, or ordering"):
+        consolidate_memory_candidate(db, project_id=project1.id, candidate=mismatched_quote_cand)
+
+    # Directly inserted mismatched record must be excluded from prompt formatting
+    mismatched_db_mem = Memory(
+        project_id=project1.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Mismatched DB Memory",
+        content="Method Y is superior to method X.",
+        sources=[
+            MemorySource(
+                source_type=MemorySourceType.PAPER_CHUNK.value,
+                paper_id=ready_paper.id,
+                page_number=5,
+                quote_text="Method X is superior to method Y",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    db.add(mismatched_db_mem)
+    db.commit()
+    formatted_mismatched = format_memories_for_prompt([mismatched_db_mem], db=db)
+    assert "ESTABLISHED PAPER FACTS" not in formatted_mismatched
+    assert "Method Y is superior to method X" not in formatted_mismatched
+    db.delete(mismatched_db_mem)
+    db.commit()
+
+    # Accurately cited fact: claiming Y > X while citing Y > X succeeds and formats
+    accurately_cited_cand = MemoryCreate(
+        memory_type=MemoryType.PAPER_FACT,
+        title="Accurately Cited Fact",
+        content="Method Y is superior to method X.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.PAPER_CHUNK,
+                paper_id=ready_paper.id,
+                page_number=5,
+                quote_text="Method Y is superior to method X",
+                document_sha256="hash_ready_123",
+            )
+        ],
+    )
+    accurate_mem = consolidate_memory_candidate(
+        db, project_id=project1.id, candidate=accurately_cited_cand
+    )
+    assert accurate_mem.id is not None
+    formatted_accurate = format_memories_for_prompt([accurate_mem], db=db)
+    assert "ESTABLISHED PAPER FACTS" in formatted_accurate
+    assert "Method Y is superior to method X" in formatted_accurate
+    assert 'Source quote: "Method Y is superior to method X' in formatted_accurate
+
+
+def test_atomic_supersession_transactional_integrity(db: Session) -> None:
+    project = Project(name="Atomic Project")
+    db.add(project)
+    db.commit()
+
+    cand1 = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Initial Choice",
+        content="Project decision: Use Adam optimizer.",
+    )
+    mem1 = create_memory(db, project_id=project.id, memory_in=cand1)
+    assert mem1.status == MemoryStatus.ACTIVE.value
+    assert mem1.version == 1
+
+    # 1. Version conflict on atomic_create_and_supersede
+    cand2 = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Second Choice",
+        content="Project decision: Use SGD optimizer.",
+    )
+    with pytest.raises(MemoryVersionConflictError, match="Version conflict"):
+        atomic_create_and_supersede(
+            db,
+            project_id=project.id,
+            old_memory_id=mem1.id,
+            expected_version=99,
+            new_memory_in=cand2,
+        )
+
+    # Ensure no partial rows or status change occurred
+    db.refresh(mem1)
+    assert mem1.status == MemoryStatus.ACTIVE.value
+    assert mem1.version == 1
+    mems = db.query(Memory).filter(Memory.project_id == project.id).all()
+    assert len(mems) == 1
+
+    # 2. Failure injection during atomic_create_and_supersede
+    original_commit = db.commit
+
+    def failing_commit():
+        raise RuntimeError("Simulated DB commit error")
+
+    db.commit = failing_commit
+    try:
+        with pytest.raises(RuntimeError, match="Simulated DB commit error"):
+            atomic_create_and_supersede(
+                db,
+                project_id=project.id,
+                old_memory_id=mem1.id,
+                expected_version=1,
+                new_memory_in=cand2,
+            )
+    finally:
+        db.commit = original_commit
+
+    # Verify rollback: old memory remains ACTIVE, exactly 1 memory exists!
+    db.refresh(mem1)
+    assert mem1.status == MemoryStatus.ACTIVE.value
+    assert mem1.version == 1
+    active_mems = (
+        db.query(Memory)
+        .filter(
+            Memory.project_id == project.id,
+            Memory.status == MemoryStatus.ACTIVE.value,
+        )
+        .all()
+    )
+    assert len(active_mems) == 1
+    total_mems = db.query(Memory).filter(Memory.project_id == project.id).all()
+    assert len(total_mems) == 1
+
+    # 3. Successful atomic supersession
+    old_res, new_res = atomic_create_and_supersede(
+        db,
+        project_id=project.id,
+        old_memory_id=mem1.id,
+        expected_version=1,
+        new_memory_in=cand2,
+    )
+    assert old_res.status == MemoryStatus.SUPERSEDED.value
+    assert old_res.version == 2
+    assert new_res.status == MemoryStatus.ACTIVE.value
+    assert new_res.version == 1
+    assert old_res.superseded_by_id == new_res.id
 
 
 def test_conversation_capture_and_scoped_retrieval(db: Session) -> None:
@@ -208,13 +680,23 @@ def test_conversation_capture_and_scoped_retrieval(db: Session) -> None:
     db.add_all([conv_a, conv_b])
     db.commit()
 
+    # Foreign conversation capture must be rejected
+    with pytest.raises(ValueError, match="not found in project"):
+        capture_conversation_memories(db, project_id=project_a.id, conversation_id=conv_b.id)
+
     # User message in Project A with decision and preference
     msg_a1 = Message(
         conversation_id=conv_a.id,
         role="user",
         content="Let's decide to use ViT over ResNet50. Also, please always provide bullet points.",
     )
-    db.add(msg_a1)
+    # Assistant message should NOT create a decision memory
+    msg_a_assistant = Message(
+        conversation_id=conv_a.id,
+        role="assistant",
+        content="We decided to choose ResNet101 over ViT as a recommendation.",
+    )
+    db.add_all([msg_a1, msg_a_assistant])
     db.commit()
 
     # User message in Project B with different decision
@@ -230,8 +712,11 @@ def test_conversation_capture_and_scoped_retrieval(db: Session) -> None:
     mems_a = capture_conversation_memories(db, project_a.id, conv_a.id)
     mems_b = capture_conversation_memories(db, project_b.id, conv_b.id)
 
-    assert len(mems_a) >= 2  # Decision on ViT and Preference on bullet points
-    assert len(mems_b) >= 1  # Decision on ResNet50
+    assert (
+        len(mems_a) == 2
+    )  # Decision on ViT and Preference on bullet points (NOT assistant ResNet101!)
+    assert not any("resnet101" in m.content.lower() for m in mems_a)
+    assert len(mems_b) == 1  # Decision on ResNet50
 
     # Scoped retrieval for Project A
     retrieved_a = retrieve_project_memories(

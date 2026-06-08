@@ -7,11 +7,10 @@ from sqlalchemy.orm import Session
 
 from app.crud.memory import (
     MemoryVersionConflictError,
-    create_memory,
+    atomic_create_and_supersede,
     delete_memory,
     get_memory,
     list_memories,
-    supersede_memory,
     update_memory,
 )
 from app.crud.project import get_project
@@ -135,6 +134,11 @@ def update_project_memory(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
         )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
 
     return MemoryResponse.model_validate(updated, from_attributes=True)
 
@@ -144,37 +148,14 @@ def supersede_project_memory(
     project_id: UUID,
     memory_id: UUID,
     new_memory_in: MemoryCreate,
-    expected_version: int | None = Query(default=None),
+    expected_version: int = Query(
+        ...,
+        description=(
+            "Current version of the memory being superseded (required for atomic concurrency)"
+        ),
+    ),
     db: Session = Depends(get_db),
 ) -> MemoryResponse:
-    old_mem = get_memory(db, memory_id=memory_id, project_id=project_id)
-    if not old_mem:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Memory {memory_id} not found in project {project_id}",
-        )
-
-    if old_mem.status != MemoryStatus.ACTIVE.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot supersede memory with status '{old_mem.status}'; must be ACTIVE.",
-        )
-
-    if expected_version is not None and old_mem.version != expected_version:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Version conflict: current version is {old_mem.version}, "
-                f"but expected {expected_version}"
-            ),
-        )
-
-    if new_memory_in.content.strip().lower() == old_mem.content.strip().lower():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot supersede memory with identical content.",
-        )
-
     try:
         validate_memory_candidate(db, project_id=project_id, candidate=new_memory_in)
         embedding = None
@@ -186,20 +167,31 @@ def supersede_project_memory(
         except Exception:
             embedding = None
 
-        new_mem = create_memory(
-            db, project_id=project_id, memory_in=new_memory_in, embedding=embedding
-        )
-        supersede_memory(
+        _old_mem, new_mem = atomic_create_and_supersede(
             db,
-            old_memory=old_mem,
-            new_memory=new_mem,
+            project_id=project_id,
+            old_memory_id=memory_id,
+            expected_version=expected_version,
+            new_memory_in=new_memory_in,
+            embedding=embedding,
             reason=f"Explicitly superseded by new decision: {new_memory_in.title}",
         )
-    except ValueError as e:
+    except MemoryVersionConflictError as e:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
+        ) from e
+    except ValueError as e:
+        detail = str(e)
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if "not found" in detail.lower()
+            else status.HTTP_400_BAD_REQUEST
         )
+        raise HTTPException(
+            status_code=status_code,
+            detail=detail,
+        ) from e
 
     return MemoryResponse.model_validate(new_mem, from_attributes=True)
 

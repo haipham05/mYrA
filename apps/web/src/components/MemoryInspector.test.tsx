@@ -225,4 +225,30 @@ describe("MemoryInspector Component", () => {
       screen.queryByText(/Reason: Initial decision/i),
     ).not.toBeInTheDocument();
   });
+
+  it("invokes onSelectSource callback when clicking provenance jump button", async () => {
+    const onSelectSource = vi.fn();
+    vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: mockMemories, total: 2 }),
+    } as Response);
+
+    render(
+      <MemoryInspector
+        projectId="proj-1"
+        apiUrl="http://127.0.0.1:8000"
+        onSelectSource={onSelectSource}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Decision: Choose AURC over ECE"),
+      ).toBeInTheDocument();
+    });
+
+    const jumpBtn = screen.getByRole("button", { name: /View Chat Message/i });
+    fireEvent.click(jumpBtn);
+    expect(onSelectSource).toHaveBeenCalledWith(mockMemories[0].sources[0]);
+  });
 });

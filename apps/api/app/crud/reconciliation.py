@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.db.models import Job, Paper
@@ -42,6 +43,9 @@ def validate_scan_prefix(prefix: str | None) -> str:
     return cleaned
 
 
+MIN_SAFE_ORPHAN_AGE_SECONDS = 300  # 5 minutes minimum floor to protect in-flight uploads
+
+
 async def reconcile_stranded_resources_async(
     db: Session,
     storage: ObjectStorage | None = None,
@@ -56,10 +60,18 @@ async def reconcile_stranded_resources_async(
 
     Safety controls:
     - Namespace isolation: scan_prefix must be within approved 'papers/' namespace.
-    - In-flight upload protection: objects modified < min_age_seconds are skipped.
+    - In-flight upload protection: min_age_seconds must be >= 300s; objects modified
+      < min_age_seconds or with unknown mtime are skipped.
+    - Point-in-time DB recheck: unreferenced candidates are rechecked against DB before deletion.
     - Bounded discovery: capped by max_keys to prevent memory exhaustion.
     - Exact key normalization: matches paper storage paths across local/GCS/memory URIs.
     """
+    if min_age_seconds < MIN_SAFE_ORPHAN_AGE_SECONDS:
+        raise ValueError(
+            f"min_age_seconds must be at least {MIN_SAFE_ORPHAN_AGE_SECONDS} seconds "
+            f"(got {min_age_seconds}) to guarantee in-flight uploads are not deleted."
+        )
+
     now = datetime.now(tz=UTC)
     cutoff = datetime.fromtimestamp(now.timestamp() - lease_timeout_seconds, tz=UTC)
     report = ReconciliationReport(dry_run=dry_run)
@@ -120,7 +132,12 @@ async def reconcile_stranded_resources_async(
             for key, mtime in candidates_with_mtime:
                 norm_key = normalize_storage_path(key)
 
-                # If object is younger than min_age_seconds, it may be an in-flight upload!
+                # If auto-discovering via scan_prefix and mtime is unknown, skip to protect
+                # in-flight uploads
+                if scan_prefix is not None and mtime is None:
+                    report.skipped_in_flight_keys.append(key)
+                    continue
+
                 if mtime is not None:
                     age = (now - mtime).total_seconds()
                     if age < min_age_seconds:
@@ -130,6 +147,47 @@ async def reconcile_stranded_resources_async(
                 is_referenced = norm_key in referenced_paths
 
                 if not is_referenced:
+                    # Point-in-time DB recheck right before deleting to avoid race conditions
+                    # with concurrent commits during the scan. Checks exact keys, normalized keys,
+                    # canonical gs:// and memory:// URIs, and active in-flight jobs.
+                    candidate_patterns = [
+                        Paper.storage_path == key,
+                        Paper.storage_path == norm_key,
+                        Paper.storage_path == f"/{norm_key}",
+                        Paper.storage_path == f"papers/{norm_key}",
+                        Paper.storage_path.like(f"gs://%/{norm_key}"),
+                        Paper.storage_path.like(f"memory://%/{norm_key}"),
+                        Paper.storage_path.like(f"file://%/{norm_key}"),
+                        Paper.storage_path.like(f"%/{norm_key}"),
+                        Paper.storage_path.like(f"%/{key.lstrip('/')}"),
+                    ]
+                    if hasattr(storage, "bucket_name") and getattr(storage, "bucket_name"):
+                        bucket = getattr(storage, "bucket_name")
+                        candidate_patterns.extend(
+                            [
+                                Paper.storage_path == f"gs://{bucket}/{norm_key}",
+                                Paper.storage_path == f"gs://{bucket}/{key.lstrip('/')}",
+                            ]
+                        )
+
+                    point_in_time_ref = db.query(Paper.id).filter(or_(*candidate_patterns)).first()
+                    if point_in_time_ref is None:
+                        active_job_ref = (
+                            db.query(Job.id)
+                            .join(Paper, Job.paper_id == Paper.id)
+                            .filter(
+                                Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+                                or_(*candidate_patterns),
+                            )
+                            .first()
+                        )
+                        if active_job_ref is not None:
+                            point_in_time_ref = active_job_ref
+
+                    if point_in_time_ref is not None:
+                        report.skipped_in_flight_keys.append(key)
+                        continue
+
                     report.orphaned_storage_keys.append(key)
                     if not dry_run:
                         try:

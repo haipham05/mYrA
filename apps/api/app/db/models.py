@@ -334,6 +334,10 @@ class MemorySource(Base):
     message: Mapped["Message | None"] = relationship()
     paper: Mapped["Paper | None"] = relationship()
 
+    @property
+    def conversation_id(self) -> UUID | None:
+        return self.message.conversation_id if self.message else None
+
 
 class MemoryAudit(Base):
     __tablename__ = "memory_audits"

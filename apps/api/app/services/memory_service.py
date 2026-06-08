@@ -6,12 +6,20 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.crud.memory import (
+    atomic_create_and_supersede,
     create_memory,
     list_memories,
     record_memory_access,
-    supersede_memory,
 )
-from app.db.models import Memory, Message, Paper
+from app.db.models import (
+    Conversation,
+    Memory,
+    Message,
+    Paper,
+    PaperChunk,
+    PaperElement,
+    PaperPage,
+)
 from app.schemas.memory import (
     MemoryCreate,
     MemorySourceCreate,
@@ -48,6 +56,400 @@ TERMINOLOGY_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
+
+COMMON_STOP_WORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "if",
+    "because",
+    "as",
+    "what",
+    "which",
+    "this",
+    "that",
+    "these",
+    "those",
+    "then",
+    "just",
+    "so",
+    "than",
+    "such",
+    "both",
+    "through",
+    "about",
+    "for",
+    "is",
+    "of",
+    "while",
+    "during",
+    "to",
+    "from",
+    "in",
+    "out",
+    "on",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "any",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "only",
+    "own",
+    "same",
+    "too",
+    "very",
+    "can",
+    "will",
+    "should",
+    "now",
+    "are",
+    "was",
+    "were",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "having",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "would",
+    "could",
+    "shall",
+    "our",
+    "their",
+    "its",
+    "we",
+    "they",
+    "it",
+    "i",
+    "you",
+    "he",
+    "she",
+    "him",
+    "her",
+    "us",
+    "them",
+    "model",
+    "paper",
+    "papers",
+    "author",
+    "authors",
+    "study",
+    "work",
+    "article",
+    "proves",
+    "prove",
+    "shows",
+    "show",
+    "demonstrates",
+    "demonstrate",
+    "presents",
+    "present",
+    "finds",
+    "find",
+    "proposes",
+    "propose",
+    "use",
+    "uses",
+    "used",
+    "using",
+    "across",
+    "between",
+    "with",
+    "into",
+}
+
+CONTRAST_OR_NEGATION_TERMS = {
+    "not",
+    "no",
+    "never",
+    "none",
+    "neither",
+    "nor",
+    "fails",
+    "fail",
+    "failed",
+    "failing",
+    "cannot",
+    "can't",
+    "won't",
+    "doesn't",
+    "didn't",
+    "isn't",
+    "aren't",
+    "without",
+    "unlikely",
+    "disprove",
+    "disproved",
+    "contrary",
+    "unlike",
+    "whereas",
+    "while",
+}
+
+
+def _check_claim_supported_by_text(claim: str, evidence: str) -> tuple[bool, str]:
+    clean_claim = claim.strip()
+    clean_evidence = evidence.strip()
+    if not clean_claim:
+        return False, "Claim is empty."
+    if not clean_evidence:
+        return False, "Evidence is empty."
+
+    token_pattern = r"\d+(?:\.\d+)?%?|[a-zA-Z0-9_-]+"
+    claim_tokens = re.findall(token_pattern, clean_claim.lower())
+    evidence_tokens = re.findall(token_pattern, clean_evidence.lower())
+
+    if not claim_tokens:
+        return False, "Claim contains no substantive factual terms."
+    if not evidence_tokens:
+        return False, "Evidence contains no valid tokens."
+
+    # 1. Negation and contrasting consistency
+    negation_patterns = [
+        r"\bnot\b",
+        r"\bno\b",
+        r"\bnever\b",
+        r"\bneither\b",
+        r"\bnor\b",
+        r"\bcannot\b",
+        r"\bcan't\b",
+        r"\bdid\s+not\b",
+        r"\bdidn't\b",
+        r"\bdoes\s+not\b",
+        r"\bdoesn't\b",
+        r"\bwas\s+not\b",
+        r"\bwasn't\b",
+        r"\bwithout\b",
+        r"\bfail\b",
+        r"\bfails\b",
+        r"\bfailed\b",
+        r"\bfailing\b",
+        r"\bfailure\b",
+        r"\bwhile\b",
+        r"\bwhereas\b",
+        r"\bunlike\b",
+        r"\bcontrary\b",
+        r"\bdisprove\b",
+        r"\bdisproved\b",
+    ]
+
+    def has_negation(text: str) -> bool:
+        t = text.lower()
+        return any(re.search(pat, t) is not None for pat in negation_patterns)
+
+    claim_neg = has_negation(clean_claim)
+    evidence_neg = has_negation(clean_evidence)
+    if evidence_neg and not claim_neg:
+        return (
+            False,
+            "Quote contains negation or contrasting clause that contradicts positive claim.",
+        )
+    if claim_neg and not evidence_neg:
+        return (
+            False,
+            "Claim asserts negation not supported by cited quote.",
+        )
+
+    # 2. Directional / Antonym opposition
+    opposites = [
+        (
+            {
+                "increase",
+                "increased",
+                "increasing",
+                "higher",
+                "gain",
+                "gains",
+                "gained",
+                "grow",
+                "growth",
+                "grew",
+            },
+            {
+                "decrease",
+                "decreased",
+                "decreasing",
+                "lower",
+                "loss",
+                "losses",
+                "lost",
+                "drop",
+                "dropped",
+                "dropping",
+                "reduce",
+                "reduced",
+                "reduction",
+            },
+        ),
+        (
+            {
+                "improve",
+                "improved",
+                "improving",
+                "better",
+                "superior",
+                "outperform",
+                "outperforms",
+                "outperformed",
+            },
+            {
+                "worsen",
+                "worsened",
+                "worsening",
+                "worse",
+                "inferior",
+                "underperform",
+                "underperforms",
+                "underperformed",
+            },
+        ),
+        ({"positive", "positives"}, {"negative", "negatives"}),
+        (
+            {"above", "exceed", "exceeds", "exceeded", "greater"},
+            {"below", "under", "less", "fewer"},
+        ),
+    ]
+    claim_token_set = set(claim_tokens)
+    evidence_token_set = set(evidence_tokens)
+    for group_a, group_b in opposites:
+        if (claim_token_set & group_a and evidence_token_set & group_b) or (
+            claim_token_set & group_b and evidence_token_set & group_a
+        ):
+            return (
+                False,
+                "Claim asserts opposite directional or comparative relationship to quote.",
+            )
+
+    # 3. Numeric values preservation and monotonic sequence
+    number_pattern = r"^\d+(?:\.\d+)?%?$"
+    claim_numbers = [t for t in claim_tokens if re.match(number_pattern, t)]
+    evidence_numbers = [t for t in evidence_tokens if re.match(number_pattern, t)]
+
+    if claim_numbers:
+        for num in claim_numbers:
+            if num not in evidence_numbers:
+                return False, f"Claim asserts numeric value '{num}' not present in quote."
+
+        num_pos = 0
+        for num in claim_numbers:
+            while num_pos < len(evidence_numbers) and evidence_numbers[num_pos] != num:
+                num_pos += 1
+            if num_pos == len(evidence_numbers):
+                return (
+                    False,
+                    "Claim inverts or alters the order of numerical values: "
+                    f"'{' '.join(claim_numbers)}' vs quote numbers.",
+                )
+            num_pos += 1
+
+    # 4. Substantive tokens extraction and grounding check
+    substantive_claim_tokens = [w for w in claim_tokens if w not in COMMON_STOP_WORDS]
+    if not substantive_claim_tokens:
+        return False, "Claim contains no substantive factual terms."
+
+    matched_tokens = [w for w in substantive_claim_tokens if w in evidence_token_set]
+    unmatched_tokens = [w for w in substantive_claim_tokens if w not in evidence_token_set]
+
+    # Foreign concept check
+    if unmatched_tokens:
+        unsupported_key_terms = [w for w in unmatched_tokens if len(w) >= 3]
+        if unsupported_key_terms:
+            return False, (
+                f"Claim introduces unsupported concepts not present in quote: "
+                f"{', '.join(unsupported_key_terms)}"
+            )
+
+    grounding_ratio = len(matched_tokens) / len(substantive_claim_tokens)
+    if grounding_ratio < 0.70:
+        return False, (
+            f"Insufficient grounding ratio ({grounding_ratio:.1%}): "
+            "claim concepts are not adequately supported by cited quote."
+        )
+
+    # 5. Monotonic token ordering to prevent entity role / relation reversal
+    order_check_tokens = [
+        t
+        for t in claim_tokens
+        if t in evidence_token_set
+        and (
+            t
+            not in {
+                "the",
+                "a",
+                "an",
+                "is",
+                "are",
+                "was",
+                "were",
+                "in",
+                "of",
+                "to",
+                "for",
+                "on",
+                "at",
+            }
+        )
+    ]
+
+    position = 0
+    for token in order_check_tokens:
+        while position < len(evidence_tokens) and evidence_tokens[position] != token:
+            position += 1
+        if position == len(evidence_tokens):
+            return (
+                False,
+                "Claim reverses entity roles, relations, or ordering of concepts: "
+                f"'{token}' not in monotonic sequence.",
+            )
+        position += 1
+
+    return True, "Claim is supported by quote."
+
+
+def verify_claim_supported_by_quote(
+    claim: str,
+    quote: str,
+    page_text: str | None = None,
+) -> tuple[bool, str]:
+    """Verify that a paper fact claim is textually grounded in and supported by the cited quote.
+
+    Enforces:
+    - Non-empty claim and quote
+    - Negation and contrast consistency
+    - Directional / antonym opposition prevention (increase vs decrease, better vs worse)
+    - Strict numeric preservation and monotonic sequence (e.g., 80 to 90 cannot be 90 to 80)
+    - Substantive concept grounding directly in the cited quote (>= 70%)
+    - Strict monotonic token ordering to prevent entity role reversal (e.g.,
+      'Method B is better than Method A' vs 'Method A is better than Method B')
+    - Rejection of foreign/unsupported concepts not present in quote
+    - Strict quote binding: the cited quote itself must support the claim. Surrounding
+      or adjacent page text cannot substitute for a mismatched or contradictory cited quote.
+
+    Returns (is_supported: bool, reason: str).
+    """
+    return _check_claim_supported_by_text(claim, quote)
 
 
 def extract_candidates_from_text(
@@ -164,6 +566,146 @@ def _extract_decision_keywords(text: str) -> set[str]:
     return {w for w in words if w not in stop_words}
 
 
+def validate_memory_candidate(
+    db: Session,
+    project_id: UUID,
+    candidate: MemoryCreate,
+) -> None:
+    """Validate memory candidate against project authority and paper/message sources.
+
+    Enforces:
+    - Secret redaction.
+    - Message sources must exist and belong to a conversation in the project.
+    - Paper facts and paper chunk sources require:
+      - Paper belongs to project.
+      - Paper status == 'READY'.
+      - Non-empty quote text.
+      - Matching document_sha256 if present.
+      - Exact quote text exists in page.raw_text, element text, or chunk content.
+    """
+    candidate.title = redact_secrets(candidate.title)
+    candidate.content = redact_secrets(candidate.content)
+
+    if candidate.memory_type == MemoryType.PAPER_FACT and not candidate.sources:
+        raise ValueError("Paper fact requires at least one paper source.")
+
+    for s in candidate.sources:
+        if s.source_type == MemorySourceType.MESSAGE and s.message_id:
+            msg = (
+                db.query(Message)
+                .join(Conversation, Message.conversation_id == Conversation.id)
+                .filter(Message.id == s.message_id, Conversation.project_id == project_id)
+                .first()
+            )
+            if not msg:
+                raise ValueError(
+                    f"Message {s.message_id} does not exist in project {project_id}; "
+                    "cannot forge message source memory."
+                )
+
+        if (
+            s.source_type == MemorySourceType.PAPER_CHUNK
+            or candidate.memory_type == MemoryType.PAPER_FACT
+        ):
+            if not s.paper_id:
+                raise ValueError("Paper source requires a valid paper_id.")
+            paper = (
+                db.query(Paper)
+                .filter(Paper.id == s.paper_id, Paper.project_id == project_id)
+                .first()
+            )
+            if not paper:
+                raise ValueError(
+                    f"Paper {s.paper_id} does not exist in project {project_id}; "
+                    "cannot forge paper fact memory."
+                )
+            if paper.status != "READY":
+                raise ValueError(
+                    f"Paper {s.paper_id} status is '{paper.status}'; "
+                    "must be 'READY' to record paper facts."
+                )
+            if not s.quote_text or not s.quote_text.strip():
+                raise ValueError("Paper fact requires valid non-empty quote text.")
+
+            if s.document_sha256 and paper.document_sha256:
+                if s.document_sha256 != paper.document_sha256:
+                    raise ValueError(
+                        f"Document SHA-256 mismatch for paper {s.paper_id}: "
+                        f"expected {paper.document_sha256}, got {s.document_sha256}."
+                    )
+            elif paper.document_sha256 and not s.document_sha256:
+                s.document_sha256 = paper.document_sha256
+
+            normalized_quote = s.quote_text.strip().lower()
+            quote_found = False
+            page_raw_text = None
+
+            if s.page_number is not None:
+                page = (
+                    db.query(PaperPage)
+                    .filter(
+                        PaperPage.paper_id == paper.id,
+                        PaperPage.page_number == s.page_number,
+                    )
+                    .first()
+                )
+                if page and page.raw_text and normalized_quote in page.raw_text.lower():
+                    quote_found = True
+                    page_raw_text = page.raw_text
+
+                if not quote_found:
+                    elements = (
+                        db.query(PaperElement)
+                        .filter(
+                            PaperElement.paper_id == paper.id,
+                            PaperElement.page_number == s.page_number,
+                        )
+                        .all()
+                    )
+                    page_element_text = " ".join(e.text for e in elements).lower()
+                    if normalized_quote in page_element_text:
+                        quote_found = True
+
+                if not quote_found:
+                    raise ValueError(
+                        f"Quote text was not found in paper {s.paper_id} on page {s.page_number}."
+                    )
+            else:
+                pages = db.query(PaperPage).filter(PaperPage.paper_id == paper.id).all()
+                for page in pages:
+                    if page.raw_text and normalized_quote in page.raw_text.lower():
+                        quote_found = True
+                        s.page_number = page.page_number
+                        page_raw_text = page.raw_text
+                        break
+
+                if not quote_found:
+                    elements = (
+                        db.query(PaperElement).filter(PaperElement.paper_id == paper.id).all()
+                    )
+                    all_elem_text = " ".join(e.text for e in elements).lower()
+                    if normalized_quote in all_elem_text:
+                        quote_found = True
+
+                if not quote_found:
+                    chunks = db.query(PaperChunk).filter(PaperChunk.paper_id == paper.id).all()
+                    all_chunk_text = " ".join(c.text for c in chunks).lower()
+                    if normalized_quote in all_chunk_text:
+                        quote_found = True
+
+                if not quote_found:
+                    raise ValueError(f"Quote text was not found anywhere in paper {s.paper_id}.")
+
+            if candidate.memory_type == MemoryType.PAPER_FACT:
+                is_supported, support_reason = verify_claim_supported_by_quote(
+                    candidate.content, s.quote_text, page_text=page_raw_text
+                )
+                if not is_supported:
+                    raise ValueError(
+                        f"Paper fact claim is not supported by cited quote: {support_reason}"
+                    )
+
+
 def consolidate_memory_candidate(
     db: Session,
     project_id: UUID,
@@ -174,31 +716,22 @@ def consolidate_memory_candidate(
 
     Enforces:
     - Secret redaction on all fields.
-    - Paper facts require verified paper in the project.
+    - Verified paper/message sources.
     - Idempotency: exact content matches return existing active memory.
     - Conflict resolution: decisions on the same topic supersede older active decisions.
+    - Semantic vector embedding generation.
     """
-    safe_title = redact_secrets(candidate.title)
-    safe_content = redact_secrets(candidate.content)
-    candidate.title = safe_title
-    candidate.content = safe_content
+    validate_memory_candidate(db, project_id=project_id, candidate=candidate)
+    safe_content = candidate.content
 
-    # If paper fact, verify paper exists and belongs to this project
-    if candidate.memory_type == MemoryType.PAPER_FACT:
-        for s in candidate.sources:
-            if s.source_type == MemorySourceType.PAPER_CHUNK and s.paper_id:
-                paper = (
-                    db.query(Paper)
-                    .filter(Paper.id == s.paper_id, Paper.project_id == project_id)
-                    .first()
-                )
-                if not paper:
-                    raise ValueError(
-                        f"Paper {s.paper_id} does not exist in project {project_id}; "
-                        "cannot forge paper fact memory."
-                    )
-                if not s.quote_text or not s.quote_text.strip():
-                    raise ValueError("Paper fact requires valid non-empty quote text.")
+    if embedding is None:
+        try:
+            from app.services.embedding import get_embedding_provider
+
+            provider = get_embedding_provider()
+            embedding = provider.embed_query(safe_content)
+        except Exception:
+            embedding = None
 
     # 1. Check exact content duplicate among active memories in this project
     existing_active, _ = list_memories(
@@ -221,14 +754,14 @@ def consolidate_memory_candidate(
                 overlap = cand_keywords.intersection(mem_keywords)
                 # If there is substantial topic overlap (e.g. "AURC", "ECE" or shared metric/model)
                 if overlap and (len(overlap) >= 2 or any(len(w) >= 4 for w in overlap)):
-                    # New memory supersedes old memory
-                    new_mem = create_memory(
-                        db, project_id=project_id, memory_in=candidate, embedding=embedding
-                    )
-                    supersede_memory(
+                    # New memory atomically supersedes old memory
+                    _old_mem, new_mem = atomic_create_and_supersede(
                         db,
-                        old_memory=mem,
-                        new_memory=new_mem,
+                        project_id=project_id,
+                        old_memory_id=mem.id,
+                        expected_version=mem.version,
+                        new_memory_in=candidate,
+                        embedding=embedding,
                         reason=(
                             "New decision supersedes prior choice on topic: "
                             f"{', '.join(sorted(overlap))}"
@@ -245,7 +778,15 @@ def capture_conversation_memories(
     project_id: UUID,
     conversation_id: UUID,
 ) -> list[Memory]:
-    """Extract and consolidate candidate memories from recent messages of a conversation."""
+    """Extract and consolidate candidate memories from committed user messages of a conversation."""
+    conv = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id, Conversation.project_id == project_id)
+        .first()
+    )
+    if not conv:
+        raise ValueError(f"Conversation {conversation_id} not found in project {project_id}.")
+
     messages = (
         db.query(Message)
         .filter(Message.conversation_id == conversation_id)
@@ -257,7 +798,9 @@ def capture_conversation_memories(
 
     created_memories: list[Memory] = []
     for msg in messages:
-        # We only extract decisions/preferences from user messages or assistant confirmations
+        # Only capture decisions and preferences from USER messages
+        if msg.role.upper() != "USER":
+            continue
         candidates = extract_candidates_from_text(msg.content, message_id=msg.id)
         for cand in candidates:
             mem = consolidate_memory_candidate(db, project_id=project_id, candidate=cand)
@@ -347,11 +890,12 @@ def retrieve_project_memories(
     return top_memories
 
 
-def format_memories_for_prompt(memories: list[Memory]) -> str:
+def format_memories_for_prompt(memories: list[Memory], db: Session | None = None) -> str:
     """Format memories into structured system prompt sections.
 
     Separates USER DECISIONS & PREFERENCES from VERIFIED PAPER EVIDENCE
     to prevent memory from masquerading as a paper citation.
+    Paper facts whose source paper is unready, deleted, or missing are excluded.
     """
     if not memories:
         return ""
@@ -368,14 +912,44 @@ def format_memories_for_prompt(memories: list[Memory]) -> str:
         elif m.memory_type == MemoryType.TERMINOLOGY:
             terminology.append(f"- {m.title}: {m.content}")
         elif m.memory_type == MemoryType.PAPER_FACT:
-            paper_source_info = ""
+            valid_sources = []
             for s in m.sources:
-                if s.source_type == MemorySourceType.PAPER_CHUNK.value and s.quote_text:
-                    paper_source_info = f' (Source quote: "{s.quote_text[:100]}...")'
-                    break
-            paper_facts.append(f"- {m.title}: {m.content}{paper_source_info}")
-        else:
-            general.append(f"- {m.title}: {m.content}")
+                if s.source_type == MemorySourceType.PAPER_CHUNK.value and s.paper_id:
+                    is_ready = False
+                    if db is not None:
+                        paper = db.query(Paper).filter(Paper.id == s.paper_id).first()
+                        if paper and paper.status == "READY":
+                            is_ready = True
+                    elif s.paper is not None:
+                        if s.paper.status == "READY":
+                            is_ready = True
+                    page_text = None
+                    if is_ready and s.quote_text:
+                        if db is not None and s.page_number is not None:
+                            page = (
+                                db.query(PaperPage)
+                                .filter(
+                                    PaperPage.paper_id == s.paper_id,
+                                    PaperPage.page_number == s.page_number,
+                                )
+                                .first()
+                            )
+                            if page:
+                                page_text = page.raw_text
+
+                        is_supp, _ = verify_claim_supported_by_quote(
+                            m.content, s.quote_text, page_text=page_text
+                        )
+                        if is_supp:
+                            valid_sources.append(s)
+
+            if valid_sources:
+                paper_source_info = ""
+                for s in valid_sources:
+                    if s.quote_text:
+                        paper_source_info = f' (Source quote: "{s.quote_text[:100]}...")'
+                        break
+                paper_facts.append(f"- {m.title}: {m.content}{paper_source_info}")
 
     sections = []
     if decision_prefs:

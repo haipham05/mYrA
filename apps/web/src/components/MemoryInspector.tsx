@@ -13,6 +13,7 @@ interface MemoryInspectorProps {
 export default function MemoryInspector({
   projectId,
   apiUrl,
+  onSelectSource,
   className = "",
 }: MemoryInspectorProps) {
   const [memories, setMemories] = useState<Memory[]>([]);
@@ -543,7 +544,7 @@ export default function MemoryInspector({
                     {mem.sources.map((s) => (
                       <div
                         key={s.id}
-                        className="flex items-center gap-1 pl-2 text-zinc-600"
+                        className="flex items-center gap-1.5 pl-2 text-zinc-600 flex-wrap"
                       >
                         <span className="font-semibold text-zinc-700">
                           {s.source_type === "MESSAGE"
@@ -562,6 +563,21 @@ export default function MemoryInspector({
                             (Page {s.page_number})
                           </span>
                         )}
+                        {onSelectSource && (s.paper_id || s.message_id) ? (
+                          <button
+                            type="button"
+                            onClick={() => onSelectSource(s)}
+                            className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 font-medium transition-colors"
+                          >
+                            {s.source_type === "PAPER_CHUNK"
+                              ? `View Paper Source${s.page_number ? ` (p. ${s.page_number})` : ""}`
+                              : "View Chat Message"}
+                          </button>
+                        ) : !s.paper_id && !s.message_id ? (
+                          <span className="text-[10px] text-zinc-400 italic">
+                            Source unavailable
+                          </span>
+                        ) : null}
                       </div>
                     ))}
                   </div>

@@ -185,6 +185,96 @@ def test_reconcile_auto_discover_storage_orphans():
         with pytest.raises(ValueError, match="non-empty path"):
             reconcile_stranded_resources(db, storage=storage, scan_prefix="")
 
+        # D. Rejection of unsafe min_age_seconds floor (< 300s)
+        with pytest.raises(ValueError, match="at least 300 seconds"):
+            reconcile_stranded_resources(
+                db, storage=storage, scan_prefix="papers/", min_age_seconds=0
+            )
+
+        with pytest.raises(ValueError, match="at least 300 seconds"):
+            reconcile_stranded_resources(
+                db, storage=storage, scan_prefix="papers/", min_age_seconds=-100
+            )
+
+        # E. Object with unknown mtime (None) survives confirmed destructive call
+        asyncio.run(storage.put("papers/unknown_mtime.pdf", b"Unknown mtime"))
+        # MemoryStorage sets timestamp by default; clear it to simulate unknown mtime
+        storage._timestamps.pop("papers/unknown_mtime.pdf", None)
+        report_unknown = reconcile_stranded_resources(
+            db, storage=storage, dry_run=False, scan_prefix="papers/", min_age_seconds=300
+        )
+        assert "papers/unknown_mtime.pdf" in report_unknown.skipped_in_flight_keys
+        assert "papers/unknown_mtime.pdf" not in report_unknown.orphaned_storage_keys
+        assert asyncio.run(storage.exists("papers/unknown_mtime.pdf")) is True
+
+        # F. Point-in-time DB recheck protects concurrent commit
+        asyncio.run(storage.put("papers/concurrent_commit.pdf", b"Concurrent"))
+        storage.set_mtime("papers/concurrent_commit.pdf", now - timedelta(seconds=1200))
+        # Create a paper row right as if committed concurrently during scan
+        create_paper_with_job(
+            db,
+            project_id=project.id,
+            filename="concurrent.pdf",
+            storage_path="papers/concurrent_commit.pdf",
+            document_sha256="hash_concurrent",
+            status=PaperStatus.PROCESSING,
+        )
+        report_concurrent = reconcile_stranded_resources(
+            db, storage=storage, dry_run=False, scan_prefix="papers/", min_age_seconds=300
+        )
+        assert "papers/concurrent_commit.pdf" not in report_concurrent.orphaned_storage_keys
+        assert asyncio.run(storage.exists("papers/concurrent_commit.pdf")) is True
+
+
+def test_reconcile_gcs_uri_concurrent_commit_race():
+    """Verify that committing a gs://bucket/papers/... path AFTER the initial snapshot survives."""
+    storage = MemoryStorage()
+    now = datetime.now(tz=UTC)
+
+    asyncio.run(storage.put("papers/gcs_race.pdf", b"GCS Race PDF"))
+    storage.set_mtime("papers/gcs_race.pdf", now - timedelta(seconds=1000))
+    asyncio.run(storage.put("papers/true_orphan.pdf", b"True Orphan PDF"))
+    storage.set_mtime("papers/true_orphan.pdf", now - timedelta(seconds=1000))
+
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="GCS Race Project"))
+
+        orig_query = db.query
+        snapshot_captured = False
+
+        def race_query(*args, **kwargs):
+            nonlocal snapshot_captured
+            # When point-in-time DB check queries Paper.id, simulate a concurrent
+            # paper upload committing a gs:// URI path to DB after the initial snapshot:
+            if not snapshot_captured and args and getattr(args[0], "key", None) == "id":
+                snapshot_captured = True
+                with SessionLocal() as db2:
+                    create_paper_with_job(
+                        db2,
+                        project_id=project.id,
+                        filename="gcs_race.pdf",
+                        storage_path="gs://my-bucket/papers/gcs_race.pdf",
+                        document_sha256="hash_gcs_race",
+                        status=PaperStatus.PROCESSING,
+                    )
+            return orig_query(*args, **kwargs)
+
+        db.query = race_query
+
+        report = reconcile_stranded_resources(
+            db, storage=storage, dry_run=False, scan_prefix="papers/", min_age_seconds=300
+        )
+
+        assert snapshot_captured is True
+        # GCS race object committed concurrently MUST survive!
+        assert "papers/gcs_race.pdf" in report.skipped_in_flight_keys
+        assert "papers/gcs_race.pdf" not in report.orphaned_storage_keys
+        assert asyncio.run(storage.exists("papers/gcs_race.pdf")) is True
+
+        # True orphan MUST be identified and deleted!
+        assert "papers/true_orphan.pdf" in report.orphaned_storage_keys
+        assert asyncio.run(storage.exists("papers/true_orphan.pdf")) is False
+
 
 def test_reconcile_api_endpoint(monkeypatch):
     """Prove that POST /api/v1/system/reconcile handles scan_storage flags and guards properly."""
@@ -223,9 +313,16 @@ def test_reconcile_api_endpoint(monkeypatch):
     assert res4.status_code == 400
     assert "confirm_destructive=true" in res4.json()["detail"]
 
-    # 5. Destructive run with confirmation succeeds and deletes orphan
+    # 5. min_age_seconds < 300 rejected with 400 / 422
+    res_unsafe_age = client.post("/api/v1/system/reconcile?min_age_seconds=0")
+    assert res_unsafe_age.status_code in (400, 422)
+
+    res_neg_age = client.post("/api/v1/system/reconcile?min_age_seconds=-50")
+    assert res_neg_age.status_code in (400, 422)
+
+    # 6. Destructive run with confirmation succeeds and deletes orphan
     res5 = client.post(
-        "/api/v1/system/reconcile?dry_run=false&scan_storage=true&confirm_destructive=true"
+        "/api/v1/system/reconcile?dry_run=false&scan_storage=true&confirm_destructive=true&min_age_seconds=300"
     )
     assert res5.status_code == 200
     assert asyncio.run(storage.exists("papers/orphan_api.pdf")) is False

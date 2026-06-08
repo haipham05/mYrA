@@ -183,15 +183,25 @@ class ChatService:
 
         evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
 
-        # 2b. Retrieve active project memories
+        # 2b. Retrieve active project memories with semantic scoring if available
+        query_embedding = None
+        try:
+            from app.services.embedding import get_embedding_provider
+
+            embed_provider = get_embedding_provider()
+            query_embedding = embed_provider.embed_query(question)
+        except Exception:
+            query_embedding = None
+
         project_memories = retrieve_project_memories(
             db=db,
             project_id=project_id,
             query=question,
             limit=5,
             record_access=True,
+            query_embedding=query_embedding,
         )
-        memory_block = format_memories_for_prompt(project_memories)
+        memory_block = format_memories_for_prompt(project_memories, db=db)
 
         # 3. Retrieve prior conversation history (bounded to last 6 messages)
         history_msgs = (
