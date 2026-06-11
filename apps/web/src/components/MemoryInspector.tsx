@@ -270,8 +270,19 @@ export default function MemoryInspector({
     )
       return;
     try {
+      const sourcesPayload =
+        formType === "PAPER_FACT" && supersedingMemory.sources
+          ? supersedingMemory.sources.map((s) => ({
+              source_type: s.source_type,
+              paper_id: s.paper_id,
+              page_number: s.page_number,
+              quote_text: s.quote_text,
+              document_sha256: s.document_sha256,
+            }))
+          : [];
+
       const res = await fetch(
-        `${apiUrl}/api/v1/projects/${projectId}/memories/${supersedingMemory.id}/supersede`,
+        `${apiUrl}/api/v1/projects/${projectId}/memories/${supersedingMemory.id}/supersede?expected_version=${supersedingMemory.version}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -282,13 +293,17 @@ export default function MemoryInspector({
             importance: formImportance,
             confidence: 1.0,
             is_pinned: supersedingMemory.is_pinned,
-            sources: [],
+            sources: sourcesPayload,
           }),
         },
       );
       if (res.ok) {
         setSupersedingMemory(null);
         fetchMemories();
+      } else if (res.status === 409) {
+        setFormConflictError(
+          "Stale version conflict: this memory was modified concurrently. Please reload and retry with the latest version.",
+        );
       } else {
         const data = await res.json().catch(() => ({}));
         setFormConflictError(data.detail || "Failed to supersede memory.");
@@ -811,11 +826,15 @@ export default function MemoryInspector({
             <div className="flex justify-between items-center border-b border-zinc-100 pb-3">
               <div>
                 <h3 className="text-sm font-semibold text-zinc-900">
-                  Supersede Decision
+                  Supersede{" "}
+                  {supersedingMemory.memory_type === "PAPER_FACT"
+                    ? "Paper Fact"
+                    : "Decision"}{" "}
+                  (v{supersedingMemory.version})
                 </h3>
                 <p className="text-xs text-zinc-500">
-                  The current decision will become SUPERSEDED and link to this
-                  new version.
+                  Current revision v{supersedingMemory.version} will become
+                  SUPERSEDED and link to this new version.
                 </p>
               </div>
               <button
@@ -826,6 +845,30 @@ export default function MemoryInspector({
                 ×
               </button>
             </div>
+
+            {supersedingMemory.memory_type === "PAPER_FACT" && (
+              <div className="p-2.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 space-y-1">
+                <div className="font-semibold text-[11px]">
+                  Preserved Paper Source:
+                </div>
+                {supersedingMemory.sources &&
+                supersedingMemory.sources.length > 0 ? (
+                  supersedingMemory.sources.map((src, i) => (
+                    <div key={src.id || i} className="italic text-[11px]">
+                      Page {src.page_number}: &ldquo;{src.quote_text}&rdquo;
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-[11px]">
+                    No paper source attached to original fact.
+                  </div>
+                )}
+                <div className="text-[10px] text-amber-700">
+                  Paper fact sources are preserved. The superseded claim must
+                  remain supported by the cited quote.
+                </div>
+              </div>
+            )}
 
             {formConflictError && (
               <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-700">

@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -14,11 +15,16 @@ from app.crud.memory import (
     update_memory,
 )
 from app.crud.project import get_project
+from app.db.models import Memory
 from app.db.session import get_db
+from app.schemas.evidence import AnchorStatus
 from app.schemas.memory import (
+    MemoryAuditResponse,
     MemoryCreate,
     MemoryListResponse,
     MemoryResponse,
+    MemorySourceResponse,
+    MemorySourceType,
     MemoryStatus,
     MemoryType,
     MemoryUpdate,
@@ -31,6 +37,59 @@ from app.services.memory_service import (
 
 logger = logging.getLogger("myra.api.memory")
 router = APIRouter(prefix="/projects/{project_id}/memories", tags=["memory"])
+
+
+def serialize_memory_with_resolved_sources(db: Session, mem: Memory) -> MemoryResponse:
+    sources_resp: list[MemorySourceResponse] = []
+    for s in mem.sources:
+        s_dict: dict[str, Any] = {
+            "id": s.id,
+            "memory_id": s.memory_id,
+            "source_type": s.source_type,
+            "message_id": s.message_id,
+            "conversation_id": s.conversation_id,
+            "paper_id": s.paper_id,
+            "page_number": s.page_number,
+            "quote_text": s.quote_text,
+            "document_sha256": s.document_sha256,
+            "created_at": s.created_at,
+            "anchor_status": AnchorStatus.UNRESOLVED,
+            "bounding_boxes": [],
+            "anchors": [],
+        }
+        if s.source_type == MemorySourceType.PAPER_CHUNK.value and s.paper_id:
+            from app.services.memory_service import resolve_paper_memory_source
+
+            ev, anchor, status = resolve_paper_memory_source(db, mem.project_id, s)
+            s_dict["anchor_status"] = status
+            if ev and anchor and status == AnchorStatus.VERIFIED:
+                s_dict["chunk_id"] = ev.chunk_id
+                s_dict["source_element_id"] = anchor.source_element_id
+                s_dict["source_char_start"] = anchor.source_char_start
+                s_dict["source_char_end"] = anchor.source_char_end
+                s_dict["parser_version"] = anchor.parser_version
+                s_dict["bounding_boxes"] = anchor.bounding_boxes
+                s_dict["anchors"] = [anchor]
+        sources_resp.append(MemorySourceResponse(**s_dict))
+
+    return MemoryResponse(
+        id=mem.id,
+        project_id=mem.project_id,
+        memory_type=mem.memory_type,
+        status=mem.status,
+        title=mem.title,
+        content=mem.content,
+        confidence=mem.confidence,
+        importance=mem.importance,
+        version=mem.version,
+        is_pinned=mem.is_pinned,
+        superseded_by_id=mem.superseded_by_id,
+        created_at=mem.created_at,
+        updated_at=mem.updated_at,
+        last_accessed_at=mem.last_accessed_at,
+        sources=sources_resp,
+        history=[MemoryAuditResponse.model_validate(h, from_attributes=True) for h in mem.history],
+    )
 
 
 class ConsolidateRequest(BaseModel):
@@ -67,7 +126,7 @@ def list_project_memories(
     )
 
     return MemoryListResponse(
-        items=[MemoryResponse.model_validate(m, from_attributes=True) for m in items],
+        items=[serialize_memory_with_resolved_sources(db, m) for m in items],
         total=total,
         limit=limit,
         offset=offset,
@@ -95,7 +154,7 @@ def create_project_memory(
             detail=str(e),
         )
 
-    return MemoryResponse.model_validate(mem, from_attributes=True)
+    return serialize_memory_with_resolved_sources(db, mem)
 
 
 @router.get("/{memory_id}", response_model=MemoryResponse)
@@ -110,7 +169,7 @@ def get_project_memory(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Memory {memory_id} not found in project {project_id}",
         )
-    return MemoryResponse.model_validate(mem, from_attributes=True)
+    return serialize_memory_with_resolved_sources(db, mem)
 
 
 @router.patch("/{memory_id}", response_model=MemoryResponse)
@@ -140,7 +199,7 @@ def update_project_memory(
             detail=str(e),
         )
 
-    return MemoryResponse.model_validate(updated, from_attributes=True)
+    return serialize_memory_with_resolved_sources(db, updated)
 
 
 @router.post("/{memory_id}/supersede", response_model=MemoryResponse)
@@ -193,7 +252,7 @@ def supersede_project_memory(
             detail=detail,
         ) from e
 
-    return MemoryResponse.model_validate(new_mem, from_attributes=True)
+    return serialize_memory_with_resolved_sources(db, new_mem)
 
 
 @router.delete("/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -240,4 +299,4 @@ def trigger_conversation_consolidation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         )
-    return [MemoryResponse.model_validate(m, from_attributes=True) for m in memories]
+    return [serialize_memory_with_resolved_sources(db, m) for m in memories]

@@ -7,7 +7,17 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.crud.chat import create_conversation
 from app.db.base import Base
-from app.db.models import Memory, MemorySource, Message, Paper, PaperPage, Project
+from app.db.models import (
+    ChunkElement,
+    Memory,
+    MemorySource,
+    Message,
+    Paper,
+    PaperChunk,
+    PaperElement,
+    PaperPage,
+    Project,
+)
 from app.db.session import get_db
 from app.main import app
 from app.schemas.memory import MemorySourceType, MemoryStatus, MemoryType
@@ -328,7 +338,29 @@ def test_paper_fact_creation_api_rejects_mismatched_quote_with_opposite_nearby(
         height=792.0,
         raw_text="Method A is better than method B. Method B is better than method A.",
     )
-    db.add(page)
+    elem = PaperElement(
+        paper_id=paper.id,
+        page_number=1,
+        element_index=0,
+        element_type="paragraph",
+        text="Method A is better than method B. Method B is better than method A.",
+        bbox_x_min=0.1,
+        bbox_y_min=0.1,
+        bbox_x_max=0.9,
+        bbox_y_max=0.2,
+        page_width=612.0,
+        page_height=792.0,
+        parser_version="docling_test",
+    )
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="Method A is better than method B. Method B is better than method A.",
+    )
+    db.add_all([page, elem, chunk])
+    db.flush()
+    db.add(ChunkElement(chunk_id=chunk.id, element_id=elem.id, order_index=0))
     db.commit()
 
     # 1. Attempt to create memory claiming B > A while citing A > B: must return HTTP 400

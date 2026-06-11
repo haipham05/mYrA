@@ -251,4 +251,97 @@ describe("MemoryInspector Component", () => {
     fireEvent.click(jumpBtn);
     expect(onSelectSource).toHaveBeenCalledWith(mockMemories[0].sources[0]);
   });
+
+  it("sends expected_version in supersede URL and refreshes list", async () => {
+    const fetchMock = vi
+      .spyOn(global, "fetch")
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: mockMemories, total: 2 }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ...mockMemories[0],
+          id: "mem-3",
+          version: 1,
+          status: "ACTIVE",
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: mockMemories, total: 2 }),
+      } as Response);
+
+    render(
+      <MemoryInspector projectId="proj-1" apiUrl="http://127.0.0.1:8000" />,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Decision: Choose AURC over ECE"),
+      ).toBeInTheDocument();
+    });
+
+    const supersedeBtns = screen.getAllByRole("button", { name: "Supersede" });
+    fireEvent.click(supersedeBtns[0]);
+
+    expect(screen.getByText(/Supersede Decision \(v1\)/i)).toBeInTheDocument();
+
+    const submitBtn = screen.getByRole("button", {
+      name: "Supersede Decision",
+    });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8000/api/v1/projects/proj-1/memories/mem-1/supersede?expected_version=1",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    });
+  });
+
+  it("displays stale version conflict error on 409 conflict during supersede", async () => {
+    vi.spyOn(global, "fetch")
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: mockMemories, total: 2 }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          detail: "MemoryVersionConflictError: Stale version",
+        }),
+      } as Response);
+
+    render(
+      <MemoryInspector projectId="proj-1" apiUrl="http://127.0.0.1:8000" />,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Decision: Choose AURC over ECE"),
+      ).toBeInTheDocument();
+    });
+
+    const supersedeBtns = screen.getAllByRole("button", { name: "Supersede" });
+    fireEvent.click(supersedeBtns[0]);
+
+    const submitBtn = screen.getByRole("button", {
+      name: "Supersede Decision",
+    });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          /Stale version conflict: this memory was modified concurrently/i,
+        ),
+      ).toBeInTheDocument();
+    });
+  });
 });

@@ -425,6 +425,7 @@ class HybridRetriever:
                 exact_quote = best_elem.text
                 parser_ver = best_elem.parser_version
 
+                page_text_cache: dict[int, str | None] = {}
                 for elem in source_elements:
                     elem_boxes: list[BoundingBox] = []
                     if elem.bbox_x_min is not None and elem.page_width and elem.page_height:
@@ -441,17 +442,35 @@ class HybridRetriever:
                         elem_boxes.append(box)
 
                     # Retrieve canonical page text to verify verbatim span
-                    page_record = (
-                        db.query(PaperPage)
-                        .filter(
-                            PaperPage.paper_id == chunk.paper_id,
-                            PaperPage.page_number == elem.page_number,
+                    if elem.page_number not in page_text_cache:
+                        page_record = (
+                            db.query(PaperPage)
+                            .filter(
+                                PaperPage.paper_id == chunk.paper_id,
+                                PaperPage.page_number == elem.page_number,
+                            )
+                            .first()
                         )
-                        .first()
-                    )
-                    page_text = (
-                        page_record.raw_text if page_record and page_record.raw_text else None
-                    )
+                        if page_record is None:
+                            page_text_cache[elem.page_number] = None
+                        else:
+                            p_text = page_record.raw_text
+                            if not p_text:
+                                # Fallback to ordered elements if raw_text was not saved
+                                page_elems = (
+                                    db.query(PaperElement)
+                                    .filter(
+                                        PaperElement.paper_id == chunk.paper_id,
+                                        PaperElement.page_number == elem.page_number,
+                                    )
+                                    .order_by(PaperElement.element_index)
+                                    .all()
+                                )
+                                if page_elems:
+                                    p_text = "\n\n".join(e.text for e in page_elems if e.text)
+                            page_text_cache[elem.page_number] = p_text
+
+                    page_text = page_text_cache[elem.page_number]
                     # Require valid document SHA-256 and parser version
                     elem_provenance = bool(
                         paper and paper.document_sha256 and elem.parser_version and page_text

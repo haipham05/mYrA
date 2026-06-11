@@ -234,10 +234,12 @@ export default function Home() {
           evidence_id: `mem-src-${source.id}`,
           paper_id: source.paper_id,
           page_number: source.page_number,
-          bounding_boxes: [],
+          bounding_boxes: source.bounding_boxes || [],
           quote: source.quote_text,
           document_sha256: source.document_sha256,
-          anchor_status: "unresolved",
+          parser_version: source.parser_version,
+          anchor_status: source.anchor_status || "unresolved",
+          anchors: source.anchors || [],
         });
       }
     } else if (source.source_type === "MESSAGE") {

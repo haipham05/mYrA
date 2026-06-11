@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.schemas.evidence import AnchorStatus, BoundingBox, CitationAnchor
+
 
 class MemoryType(StrEnum):
     DECISION = "DECISION"
@@ -30,6 +32,7 @@ class MemorySourceBase(BaseModel):
     source_type: MemorySourceType
     message_id: UUID | None = None
     paper_id: UUID | None = None
+    chunk_id: UUID | None = None
     page_number: int | None = None
     quote_text: str | None = None
     document_sha256: str | None = None
@@ -44,6 +47,13 @@ class MemorySourceResponse(MemorySourceBase):
     memory_id: UUID
     conversation_id: UUID | None = None
     created_at: datetime
+    source_element_id: UUID | None = None
+    source_char_start: int | None = None
+    source_char_end: int | None = None
+    parser_version: str | None = None
+    anchor_status: AnchorStatus = AnchorStatus.UNRESOLVED
+    bounding_boxes: list[BoundingBox] = Field(default_factory=list)
+    anchors: list[CitationAnchor] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
 

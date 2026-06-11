@@ -6,18 +6,222 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.crud.chat import add_message, get_conversation
-from app.db.models import Message
+from app.db.models import Memory, Message
 from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import AnchorStatus, Citation, CitationAnchor, EvidenceItem
+from app.schemas.memory import MemoryStatus, MemoryType
 from app.services.llm import get_llm_provider
 from app.services.memory_service import (
     capture_conversation_memories,
     format_memories_for_prompt,
+    resolve_paper_memory_source,
     retrieve_project_memories,
 )
 from app.services.retrieval import HybridRetriever
 
 logger = logging.getLogger("myra.chat")
+
+STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "if",
+    "because",
+    "as",
+    "what",
+    "which",
+    "this",
+    "that",
+    "these",
+    "those",
+    "then",
+    "just",
+    "so",
+    "than",
+    "such",
+    "both",
+    "through",
+    "about",
+    "for",
+    "is",
+    "of",
+    "while",
+    "during",
+    "to",
+    "from",
+    "in",
+    "out",
+    "on",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "any",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "too",
+    "very",
+    "can",
+    "will",
+    "don",
+    "should",
+    "now",
+    "i",
+    "we",
+    "our",
+    "ours",
+    "you",
+    "your",
+    "yours",
+    "he",
+    "she",
+    "it",
+    "they",
+    "them",
+    "their",
+    "theirs",
+    "me",
+    "him",
+    "her",
+    "us",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "having",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "would",
+    "could",
+    "project",
+    "decision",
+    "preference",
+}
+
+
+def is_attributed_to_memories(
+    sentence: str,
+    memories: list[Memory],
+) -> bool:
+    """Verify that an uncited sentence is directly supported by a decision/preference memory.
+
+    Rejects sentences that merely share a subject or entity (e.g. 'AURC cures cancer')
+    while having no support for the predicate or relationship in the stored decision.
+    """
+    valid_memories = [
+        m
+        for m in memories
+        if (getattr(m, "status", None) == MemoryStatus.ACTIVE.value or not hasattr(m, "status"))
+        and getattr(m, "memory_type", None) != MemoryType.PAPER_FACT.value
+    ]
+    if not valid_memories:
+        return False
+
+    sentence_clean = sentence.strip()
+    if not sentence_clean:
+        return False
+
+    norm_sentence = re.sub(r"\s+", " ", sentence_clean.lower())
+
+    for m in valid_memories:
+        mem_content = (m.content or "").strip()
+        mem_title = (m.title or "").strip()
+        if not mem_content:
+            continue
+
+        # 1. Exact or near-exact containment of the memory content in the sentence
+        norm_content = re.sub(r"\s+", " ", mem_content.lower()).rstrip(".?!")
+        if norm_content and norm_content in norm_sentence:
+            return True
+
+        # 2. Extract quotes from sentence (e.g., 'We chose "AURC over ECE"')
+        for match in re.finditer(r'["“]([^"”]+)["”]', sentence_clean):
+            quoted = match.group(1).strip()
+            if len(quoted.split()) >= 3 and (
+                check_claim_support(quoted, mem_content)
+                or (mem_title and check_claim_support(quoted, f"{mem_title}: {mem_content}"))
+            ):
+                return True
+
+        # 3. Strip conversational/discourse prefixes and check claim support against memory content
+        prefix_pattern = (
+            r"^(?:according to (?:our|the )?(?:project )?"
+            r"(?:decision|decisions|preference|preferences|memory)|"
+            r"as (?:per )?(?:the )?(?:project )?(?:decision|decisions|preference|preferences)|"
+            r"per (?:our|the) (?:decision|decisions|preference|preferences)|"
+            r"based on (?:our|the )?(?:project )?(?:decision|decisions|preference|preferences)|"
+            r"in (?:the )?(?:project )?(?:decision|decisions|preference|preferences)|"
+            r"for this project[,:]?|"
+            r"we have (?:decided|chosen|agreed|preferred)[,:]?|"
+            r"the project decision is that|"
+            r"as decided[,:]?|"
+            r"note that[,:]?|"
+            r"recall that[,:]?)\s*"
+        )
+        stripped = re.sub(prefix_pattern, "", sentence_clean, flags=re.IGNORECASE).strip()
+        if stripped and (
+            check_claim_support(stripped, mem_content)
+            or (mem_title and check_claim_support(stripped, f"{mem_title}: {mem_content}"))
+        ):
+            return True
+
+        # 4. Monotonic subsequence check with substantive coverage:
+        words = (stripped or sentence_clean).split()
+        for w_len in range(len(words), 2, -1):
+            for start_idx in range(len(words) - w_len + 1):
+                subphrase = " ".join(words[start_idx : start_idx + w_len])
+                sub_tokens = [
+                    t
+                    for t in re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", subphrase.lower())
+                    if t not in STOPWORDS
+                ]
+                if len(sub_tokens) >= 3 and (
+                    check_claim_support(subphrase, mem_content)
+                    or (mem_title and check_claim_support(subphrase, f"{mem_title}: {mem_content}"))
+                ):
+                    remainder = " ".join(words[:start_idx] + words[start_idx + w_len :])
+                    rem_tokens = [
+                        t
+                        for t in re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", remainder.lower())
+                        if t not in STOPWORDS
+                    ]
+                    mem_tokens = set(
+                        re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", f"{mem_title} {mem_content}".lower())
+                    )
+                    foreign_tokens = [t for t in rem_tokens if t not in mem_tokens]
+                    if len(foreign_tokens) <= 1:
+                        return True
+
+    return False
 
 
 def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
@@ -29,6 +233,10 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
     """
     if not claim_text.strip() or not evidence_quote.strip():
         return False
+
+    # Normalize decimal points separated by spaces (common in PDF extraction like "41 . 0")
+    claim_text = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", claim_text)
+    evidence_quote = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", evidence_quote)
 
     # Keep number/unit tokens intact: 90%, 90, and 90 mg are not interchangeable.
     token_pattern = r"\d+(?:\.\d+)?%?|[a-zA-Z]+"
@@ -103,11 +311,17 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
 
 def extract_verbatim_quoted_phrase(claim_text: str, evidence_quote: str) -> str | None:
     """Keep a model-quoted source phrase, never its unsupported surrounding prose."""
+    norm_evidence = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", evidence_quote)
     for match in re.finditer(r'["“]([^"”]+)["”]', claim_text):
         candidate = match.group(1).strip()
-        if len(re.findall(r"\b\w+\b", candidate)) < 3:
+        norm_candidate = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", candidate)
+        if len(re.findall(r"\b\w+\b", norm_candidate)) < 3:
             continue
-        source_match = re.search(re.escape(candidate), evidence_quote, flags=re.IGNORECASE)
+        candidate_tokens = re.findall(r"\w+|[^\w\s]", norm_candidate)
+        if not candidate_tokens:
+            continue
+        flex_pattern = r"\s*".join(re.escape(tok) for tok in candidate_tokens)
+        source_match = re.search(flex_pattern, norm_evidence, flags=re.IGNORECASE)
         if source_match is None:
             continue
         source_phrase = source_match.group(0)
@@ -181,8 +395,6 @@ class ChatService:
             query=question,
         )
 
-        evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
-
         # 2b. Retrieve active project memories with semantic scoring if available
         query_embedding = None
         try:
@@ -193,7 +405,7 @@ class ChatService:
         except Exception:
             query_embedding = None
 
-        project_memories = retrieve_project_memories(
+        raw_project_memories = retrieve_project_memories(
             db=db,
             project_id=project_id,
             query=question,
@@ -201,7 +413,50 @@ class ChatService:
             record_access=True,
             query_embedding=query_embedding,
         )
-        memory_block = format_memories_for_prompt(project_memories, db=db)
+
+        decision_preference_memories: list[Memory] = []
+        paper_fact_memories: list[Memory] = []
+
+        for mem in raw_project_memories:
+            # Foreign-project memories or non-active memories must never supply
+            # evidence or prompt context
+            if mem.project_id != project_id or mem.status != MemoryStatus.ACTIVE.value:
+                continue
+            if mem.memory_type == MemoryType.PAPER_FACT.value:
+                paper_fact_memories.append(mem)
+            else:
+                decision_preference_memories.append(mem)
+
+        # Resolve PAPER_FACT memory sources to verified EvidenceItem and CitationAnchor
+        existing_evidence_quotes = {e.quote.strip().lower() for e in evidence_items}
+        for p_mem in paper_fact_memories:
+            for src in p_mem.sources:
+                ev_item, anchor, status = resolve_paper_memory_source(db, project_id, src)
+                if status == AnchorStatus.VERIFIED and ev_item and anchor:
+                    if ev_item.quote.strip().lower() in existing_evidence_quotes:
+                        continue
+                    existing_evidence_quotes.add(ev_item.quote.strip().lower())
+                    new_id = f"E{len(evidence_items) + 1}"
+                    resolved_evidence = EvidenceItem(
+                        id=new_id,
+                        paper_id=ev_item.paper_id,
+                        paper_title=ev_item.paper_title,
+                        chunk_id=ev_item.chunk_id,
+                        quote=ev_item.quote,
+                        parent_context=ev_item.parent_context,
+                        page_number=ev_item.page_number,
+                        bounding_boxes=ev_item.bounding_boxes,
+                        source_element_ids=ev_item.source_element_ids,
+                        document_sha256=ev_item.document_sha256,
+                        parser_version=ev_item.parser_version,
+                        anchors=[anchor],
+                    )
+                    evidence_items.append(resolved_evidence)
+
+        evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
+        memory_block = format_memories_for_prompt(
+            decision_preference_memories, db=db, include_paper_facts=False
+        )
 
         # 3. Retrieve prior conversation history (bounded to last 6 messages)
         history_msgs = (
@@ -276,7 +531,10 @@ class ChatService:
         for sentence in raw_sentences:
             cite_matches = list(re.finditer(r"\[E(\d+)\]", sentence))
             if not cite_matches:
-                if not evidence_items or project_memories:
+                if is_attributed_to_memories(
+                    sentence,
+                    memories=decision_preference_memories,
+                ):
                     retained_sentences.append(sentence)
                 continue
 
@@ -357,7 +615,9 @@ class ChatService:
 
             retained_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
 
-        if retained_sentences and (validated_citations or project_memories or not evidence_items):
+        if retained_sentences and (
+            validated_citations or decision_preference_memories
+        ):
             formatted_answer = " ".join(retained_sentences)
         else:
             formatted_answer = (

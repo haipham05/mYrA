@@ -12,13 +12,23 @@ from app.crud.memory import (
     record_memory_access,
 )
 from app.db.models import (
+    ChunkElement,
     Conversation,
     Memory,
+    MemorySource,
     Message,
     Paper,
     PaperChunk,
     PaperElement,
     PaperPage,
+)
+from app.ingestion.parser import find_verbatim_span
+from app.schemas.evidence import (
+    AnchorStatus,
+    BoundingBox,
+    CitationAnchor,
+    CoordinateOrigin,
+    EvidenceItem,
 )
 from app.schemas.memory import (
     MemoryCreate,
@@ -566,6 +576,179 @@ def _extract_decision_keywords(text: str) -> set[str]:
     return {w for w in words if w not in stop_words}
 
 
+def resolve_paper_memory_source(
+    db: Session,
+    project_id: UUID,
+    source: MemorySource | MemorySourceCreate,
+) -> tuple[EvidenceItem | None, CitationAnchor | None, AnchorStatus]:
+    """Deterministically resolve a paper memory source to an M1-compatible verified EvidenceItem
+    and CitationAnchor.
+
+    Returns (EvidenceItem, CitationAnchor, AnchorStatus.VERIFIED) if unambiguous and verified,
+    or (None, None, AnchorStatus.UNRESOLVED) otherwise.
+    """
+    if (
+        not source.paper_id
+        or not source.page_number
+        or not source.quote_text
+        or not source.quote_text.strip()
+    ):
+        return None, None, AnchorStatus.UNRESOLVED
+
+    # 1. Verify paper ownership, status, and document SHA-256
+    paper = (
+        db.query(Paper).filter(Paper.id == source.paper_id, Paper.project_id == project_id).first()
+    )
+    if not paper or paper.status != "READY" or not paper.document_sha256:
+        return None, None, AnchorStatus.UNRESOLVED
+
+    if source.document_sha256 and source.document_sha256 != paper.document_sha256:
+        return None, None, AnchorStatus.UNRESOLVED
+
+    # 2. Locate matching PaperElement on this page
+    elements = (
+        db.query(PaperElement)
+        .filter(
+            PaperElement.paper_id == paper.id,
+            PaperElement.page_number == source.page_number,
+        )
+        .order_by(PaperElement.element_index)
+        .all()
+    )
+    if not elements:
+        return None, None, AnchorStatus.UNRESOLVED
+
+    # 3. Verify page text and locate unambiguous verbatim character span
+    page = (
+        db.query(PaperPage)
+        .filter(PaperPage.paper_id == paper.id, PaperPage.page_number == source.page_number)
+        .first()
+    )
+    page_text = page.raw_text if (page and page.raw_text) else ""
+    if not page_text and elements:
+        page_text = "\n\n".join(elem.text for elem in elements if elem.text)
+
+    if not page_text:
+        return None, None, AnchorStatus.UNRESOLVED
+
+    span = find_verbatim_span(page_text, source.quote_text.strip())
+    if span is None:
+        # Quote missing or ambiguous (multiple occurrences without offset)
+        return None, None, AnchorStatus.UNRESOLVED
+
+    start_char, end_char = span
+
+    best_elem: PaperElement | None = None
+    normalized_quote = source.quote_text.strip().lower()
+    for elem in elements:
+        if elem.text and normalized_quote in elem.text.strip().lower():
+            best_elem = elem
+            break
+
+    if best_elem is None:
+        # Match element by highest word overlap on this page
+        quote_words = set(re.findall(r"\w+", normalized_quote))
+        best_score = 0
+        for elem in elements:
+            if not elem.text:
+                continue
+            elem_words = set(re.findall(r"\w+", elem.text.lower()))
+            overlap = len(quote_words & elem_words)
+            if overlap > best_score:
+                best_score = overlap
+                best_elem = elem
+
+    if best_elem is None or not best_elem.parser_version:
+        return None, None, AnchorStatus.UNRESOLVED
+
+    # 4. Locate linked PaperChunk (child chunk)
+    chunk: PaperChunk | None = None
+    if getattr(source, "chunk_id", None):
+        chunk = (
+            db.query(PaperChunk)
+            .filter(PaperChunk.id == source.chunk_id, PaperChunk.paper_id == paper.id)
+            .first()
+        )
+        if not chunk:
+            return None, None, AnchorStatus.UNRESOLVED
+
+    if chunk is None:
+        chunk_elem = db.query(ChunkElement).filter(ChunkElement.element_id == best_elem.id).first()
+        if chunk_elem:
+            chunk = (
+                db.query(PaperChunk)
+                .filter(PaperChunk.id == chunk_elem.chunk_id, PaperChunk.paper_id == paper.id)
+                .first()
+            )
+
+    if chunk is None:
+        candidate_chunks = (
+            db.query(PaperChunk)
+            .filter(PaperChunk.paper_id == paper.id, PaperChunk.chunk_type == "child")
+            .all()
+        )
+        for c in candidate_chunks:
+            if c.text and normalized_quote in c.text.lower():
+                chunk = c
+                break
+
+    if chunk is None:
+        # Missing or deleted chunk
+        return None, None, AnchorStatus.UNRESOLVED
+
+    # 5. Extract bounding boxes from best_elem
+    bboxes: list[BoundingBox] = []
+    if best_elem.bbox_x_min is not None and best_elem.page_width and best_elem.page_height:
+        coord_origin = (
+            CoordinateOrigin(best_elem.coordinate_origin)
+            if best_elem.coordinate_origin
+            else CoordinateOrigin.TOP_LEFT
+        )
+        bboxes.append(
+            BoundingBox(
+                x_min=best_elem.bbox_x_min,
+                y_min=best_elem.bbox_y_min or 0.0,
+                x_max=best_elem.bbox_x_max or 0.0,
+                y_max=best_elem.bbox_y_max or 0.0,
+                page_width=best_elem.page_width,
+                page_height=best_elem.page_height,
+                origin=coord_origin,
+                rotation=best_elem.rotation or 0,
+            )
+        )
+
+    # 6. Construct verified CitationAnchor and EvidenceItem
+    anchor = CitationAnchor(
+        page_number=source.page_number,
+        source_element_id=best_elem.id,
+        exact_quote=source.quote_text.strip(),
+        source_char_start=start_char,
+        source_char_end=end_char,
+        document_sha256=paper.document_sha256,
+        parser_version=best_elem.parser_version,
+        anchor_status=AnchorStatus.VERIFIED,
+        bounding_boxes=bboxes,
+    )
+
+    source_id_str = str(getattr(source, "id", "mem"))
+    evidence_item = EvidenceItem(
+        id=f"mem-{source_id_str}",
+        paper_id=paper.id,
+        paper_title=paper.filename,
+        chunk_id=chunk.id,
+        quote=source.quote_text.strip(),
+        parent_context=chunk.text,
+        page_number=source.page_number,
+        bounding_boxes=bboxes,
+        source_element_ids=[best_elem.id],
+        document_sha256=paper.document_sha256,
+        parser_version=best_elem.parser_version,
+        anchors=[anchor],
+    )
+
+    return evidence_item, anchor, AnchorStatus.VERIFIED
+
+
 def validate_memory_candidate(
     db: Session,
     project_id: UUID,
@@ -576,12 +759,14 @@ def validate_memory_candidate(
     Enforces:
     - Secret redaction.
     - Message sources must exist and belong to a conversation in the project.
-    - Paper facts and paper chunk sources require:
+    - Paper facts require:
       - Paper belongs to project.
       - Paper status == 'READY'.
-      - Non-empty quote text.
+      - Non-empty quote text and valid page_number.
       - Matching document_sha256 if present.
-      - Exact quote text exists in page.raw_text, element text, or chunk content.
+      - Exact quote text has an unambiguous verified text span on the page
+        (resolve_paper_memory_source).
+      - Monotonic claim support strictly on the verified quote text.
     """
     candidate.title = redact_secrets(candidate.title)
     candidate.content = redact_secrets(candidate.content)
@@ -609,6 +794,7 @@ def validate_memory_candidate(
         ):
             if not s.paper_id:
                 raise ValueError("Paper source requires a valid paper_id.")
+
             paper = (
                 db.query(Paper)
                 .filter(Paper.id == s.paper_id, Paper.project_id == project_id)
@@ -637,73 +823,45 @@ def validate_memory_candidate(
                 s.document_sha256 = paper.document_sha256
 
             normalized_quote = s.quote_text.strip().lower()
-            quote_found = False
-            page_raw_text = None
 
-            if s.page_number is not None:
-                page = (
-                    db.query(PaperPage)
-                    .filter(
-                        PaperPage.paper_id == paper.id,
-                        PaperPage.page_number == s.page_number,
-                    )
-                    .first()
-                )
-                if page and page.raw_text and normalized_quote in page.raw_text.lower():
-                    quote_found = True
-                    page_raw_text = page.raw_text
-
-                if not quote_found:
-                    elements = (
-                        db.query(PaperElement)
-                        .filter(
-                            PaperElement.paper_id == paper.id,
-                            PaperElement.page_number == s.page_number,
-                        )
-                        .all()
-                    )
-                    page_element_text = " ".join(e.text for e in elements).lower()
-                    if normalized_quote in page_element_text:
-                        quote_found = True
-
-                if not quote_found:
-                    raise ValueError(
-                        f"Quote text was not found in paper {s.paper_id} on page {s.page_number}."
-                    )
-            else:
+            # Infer page_number if omitted, or validate presence
+            if s.page_number is None:
                 pages = db.query(PaperPage).filter(PaperPage.paper_id == paper.id).all()
-                for page in pages:
-                    if page.raw_text and normalized_quote in page.raw_text.lower():
-                        quote_found = True
-                        s.page_number = page.page_number
-                        page_raw_text = page.raw_text
-                        break
-
-                if not quote_found:
-                    elements = (
-                        db.query(PaperElement).filter(PaperElement.paper_id == paper.id).all()
+                matching_pages = [
+                    p for p in pages if p.raw_text and normalized_quote in p.raw_text.lower()
+                ]
+                if len(matching_pages) == 1:
+                    s.page_number = matching_pages[0].page_number
+                elif len(matching_pages) == 0:
+                    raise ValueError(f"Quote text was not found in paper {s.paper_id}.")
+                else:
+                    raise ValueError(
+                        f"Quote text is ambiguous across multiple pages in paper {s.paper_id}; "
+                        "specify page_number."
                     )
-                    all_elem_text = " ".join(e.text for e in elements).lower()
-                    if normalized_quote in all_elem_text:
-                        quote_found = True
-
-                if not quote_found:
-                    chunks = db.query(PaperChunk).filter(PaperChunk.paper_id == paper.id).all()
-                    all_chunk_text = " ".join(c.text for c in chunks).lower()
-                    if normalized_quote in all_chunk_text:
-                        quote_found = True
-
-                if not quote_found:
-                    raise ValueError(f"Quote text was not found anywhere in paper {s.paper_id}.")
+            elif s.page_number < 1:
+                raise ValueError("Paper source requires a valid page_number >= 1.")
 
             if candidate.memory_type == MemoryType.PAPER_FACT:
                 is_supported, support_reason = verify_claim_supported_by_quote(
-                    candidate.content, s.quote_text, page_text=page_raw_text
+                    candidate.content, s.quote_text.strip(), page_text=None
                 )
                 if not is_supported:
                     raise ValueError(
                         f"Paper fact claim is not supported by cited quote: {support_reason}"
                     )
+
+            ev, anchor, status = resolve_paper_memory_source(db, project_id, s)
+            if status != AnchorStatus.VERIFIED or not ev or not anchor:
+                raise ValueError(
+                    f"Paper fact cited quote has no unambiguous verified text span "
+                    f"on page {s.page_number} of paper {s.paper_id}."
+                )
+
+            if not s.document_sha256 and anchor.document_sha256:
+                s.document_sha256 = anchor.document_sha256
+            if not getattr(s, "chunk_id", None) and ev.chunk_id:
+                s.chunk_id = ev.chunk_id
 
 
 def consolidate_memory_candidate(
@@ -890,12 +1048,18 @@ def retrieve_project_memories(
     return top_memories
 
 
-def format_memories_for_prompt(memories: list[Memory], db: Session | None = None) -> str:
+def format_memories_for_prompt(
+    memories: list[Memory],
+    db: Session | None = None,
+    include_paper_facts: bool = True,
+) -> str:
     """Format memories into structured system prompt sections.
 
     Separates USER DECISIONS & PREFERENCES from VERIFIED PAPER EVIDENCE
     to prevent memory from masquerading as a paper citation.
     Paper facts whose source paper is unready, deleted, or missing are excluded.
+    If include_paper_facts is False, paper facts are omitted so they can be routed
+    as verified EvidenceItems in the evidence pipeline.
     """
     if not memories:
         return ""
@@ -911,34 +1075,21 @@ def format_memories_for_prompt(memories: list[Memory], db: Session | None = None
             decision_prefs.append(f"- {pin_badge}{m.title}: {m.content}")
         elif m.memory_type == MemoryType.TERMINOLOGY:
             terminology.append(f"- {m.title}: {m.content}")
-        elif m.memory_type == MemoryType.PAPER_FACT:
+        elif m.memory_type == MemoryType.PAPER_FACT and include_paper_facts:
             valid_sources = []
             for s in m.sources:
                 if s.source_type == MemorySourceType.PAPER_CHUNK.value and s.paper_id:
-                    is_ready = False
                     if db is not None:
-                        paper = db.query(Paper).filter(Paper.id == s.paper_id).first()
-                        if paper and paper.status == "READY":
-                            is_ready = True
-                    elif s.paper is not None:
-                        if s.paper.status == "READY":
-                            is_ready = True
-                    page_text = None
-                    if is_ready and s.quote_text:
-                        if db is not None and s.page_number is not None:
-                            page = (
-                                db.query(PaperPage)
-                                .filter(
-                                    PaperPage.paper_id == s.paper_id,
-                                    PaperPage.page_number == s.page_number,
-                                )
-                                .first()
+                        ev, anchor, status = resolve_paper_memory_source(db, m.project_id, s)
+                        if status == AnchorStatus.VERIFIED and ev and anchor:
+                            is_supp, _ = verify_claim_supported_by_quote(
+                                m.content, s.quote_text.strip(), page_text=None
                             )
-                            if page:
-                                page_text = page.raw_text
-
+                            if is_supp:
+                                valid_sources.append(s)
+                    elif s.paper is not None and s.paper.status == "READY":
                         is_supp, _ = verify_claim_supported_by_quote(
-                            m.content, s.quote_text, page_text=page_text
+                            m.content, s.quote_text.strip(), page_text=None
                         )
                         if is_supp:
                             valid_sources.append(s)

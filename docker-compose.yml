@@ -12,6 +12,7 @@ services:
       - ./apps/api/app:/app/app
       - ./apps/api/alembic:/app/alembic
       - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - ${HOME}/.cache/huggingface/hub:/root/.cache/huggingface/hub:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   web:
@@ -38,6 +39,7 @@ services:
       - ./apps/api/app:/app/app
       - ./apps/api/alembic:/app/alembic
       - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - ${HOME}/.cache/huggingface/hub:/root/.cache/huggingface/hub:ro
     command: python -m app.worker
     depends_on:
       - api

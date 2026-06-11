@@ -1,5 +1,5 @@
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine
@@ -8,7 +8,16 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.crud.chat import create_conversation
 from app.crud.memory import create_memory, list_memories
 from app.db.base import Base
-from app.db.models import Project
+from app.db.models import (
+    ChunkElement,
+    Memory,
+    MemorySource,
+    Paper,
+    PaperChunk,
+    PaperElement,
+    PaperPage,
+    Project,
+)
 from app.schemas.evidence import (
     AnchorStatus,
     BoundingBox,
@@ -17,6 +26,7 @@ from app.schemas.evidence import (
 )
 from app.schemas.memory import (
     MemoryCreate,
+    MemorySourceType,
     MemoryStatus,
     MemoryType,
 )
@@ -205,3 +215,426 @@ async def test_post_turn_memory_capture_and_supersession_in_chat(db: Session) ->
     active_mems, _ = list_memories(db, project_id=project.id, status=MemoryStatus.ACTIVE)
     assert any("swin" in m.content.lower() for m in active_mems)
     assert not any(m.id == vit_mem.id for m in active_mems)
+
+
+def setup_ingested_paper(
+    db: Session,
+    project_id: UUID,
+    doc_sha256: str = "hash_doc_123",
+    status: str = "READY",
+    page_text: str = "The Transformer model uses multi-head attention mechanism across sub-layers.",
+    page_number: int = 1,
+) -> tuple[Paper, PaperPage, PaperElement, PaperChunk]:
+    paper = Paper(
+        project_id=project_id,
+        filename="transformer.pdf",
+        storage_path="papers/transformer.pdf",
+        document_sha256=doc_sha256,
+        status=status,
+    )
+    db.add(paper)
+    db.flush()
+
+    page = PaperPage(
+        paper_id=paper.id,
+        page_number=page_number,
+        width=612.0,
+        height=792.0,
+        raw_text=page_text,
+    )
+    elem = PaperElement(
+        paper_id=paper.id,
+        page_number=page_number,
+        element_index=0,
+        element_type="paragraph",
+        text=page_text,
+        bbox_x_min=0.1,
+        bbox_y_min=0.1,
+        bbox_x_max=0.9,
+        bbox_y_max=0.2,
+        page_width=612.0,
+        page_height=792.0,
+        parser_version="docling_test",
+    )
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text=page_text,
+    )
+    db.add_all([page, elem, chunk])
+    db.flush()
+    db.add(ChunkElement(chunk_id=chunk.id, element_id=elem.id, order_index=0))
+    db.commit()
+    return paper, page, elem, chunk
+
+
+@pytest.mark.anyio
+async def test_unresolvable_paper_memory_does_not_publish_uncited_answer(db: Session) -> None:
+    project = Project(name="Unresolvable Memory Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Unresolvable Query")
+
+    # Paper exists but is FAILED (unready)
+    paper, _, _, _ = setup_ingested_paper(db, project_id=project.id, status="FAILED")
+
+    # Paper fact memory points to unready paper
+    mem = Memory(
+        project_id=project.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Unresolvable Fact",
+        content="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        confidence=0.9,
+        importance=0.8,
+        version=1,
+    )
+    db.add(mem)
+    db.flush()
+
+    src = MemorySource(
+        memory_id=mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper.id,
+        page_number=1,
+        quote_text="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        document_sha256=paper.document_sha256,
+    )
+    db.add(src)
+    db.commit()
+
+    mock_llm = AsyncMock()
+    # Mock LLM generates uncited factual response
+    mock_llm.generate.return_value = (
+        "The Transformer model uses multi-head attention mechanism across sub-layers."
+    )
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What mechanism does Transformer use?",
+        )
+
+    # Must NOT publish the uncited factual assertion
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_verified_paper_memory_routes_through_evidence_and_citations(db: Session) -> None:
+    project = Project(name="Verified Paper Memory Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Verified Fact Query")
+    quote = "The Transformer model uses multi-head attention mechanism across sub-layers."
+    paper, _, _, _ = setup_ingested_paper(
+        db, project_id=project.id, status="READY", page_text=quote
+    )
+
+    mem = Memory(
+        project_id=project.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Transformer Multi-Head Attention",
+        content="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        confidence=1.0,
+        importance=0.9,
+        version=1,
+    )
+    db.add(mem)
+    db.flush()
+
+    src = MemorySource(
+        memory_id=mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper.id,
+        page_number=1,
+        quote_text=quote,
+        document_sha256=paper.document_sha256,
+    )
+    db.add(src)
+    db.commit()
+
+    mock_llm = AsyncMock()
+    # LLM accurately cites E1 (routed from the resolved verified paper fact memory)
+    mock_llm.generate.return_value = f"{quote.rstrip('.')} [E1]."
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What mechanism does Transformer use?",
+        )
+
+    # Verified paper fact must publish with citation [1]
+    assert "[1]" in resp.content
+    assert f"{quote.rstrip('.')} [1]." in resp.content
+    assert len(resp.citations) == 1
+    assert resp.citations[0].paper_id == paper.id
+    assert resp.citations[0].page_number == 1
+    assert resp.citations[0].anchor_status == AnchorStatus.VERIFIED
+    assert resp.citations[0].quote == quote
+
+
+@pytest.mark.anyio
+async def test_archived_stale_or_foreign_project_memories_cannot_supply_evidence(
+    db: Session,
+) -> None:
+    project_a = Project(name="Project A")
+    project_b = Project(name="Project B")
+    db.add_all([project_a, project_b])
+    db.commit()
+
+    conv = create_conversation(db, project_id=project_a.id, title="Project A Query")
+    quote = "The Transformer model uses multi-head attention mechanism across sub-layers."
+
+    # Paper in Project A
+    paper_a, _, _, _ = setup_ingested_paper(
+        db, project_id=project_a.id, status="READY", page_text=quote
+    )
+    # Paper in Project B
+    paper_b, _, _, _ = setup_ingested_paper(
+        db, project_id=project_b.id, status="READY", page_text=quote
+    )
+
+    # 1. Archived memory in Project A
+    archived_mem = Memory(
+        project_id=project_a.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ARCHIVED.value,
+        title="Archived Fact",
+        content="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        version=1,
+    )
+    # 2. Stale memory in Project A (document_sha256 mismatch)
+    stale_mem = Memory(
+        project_id=project_a.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Stale Fact",
+        content="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        version=1,
+    )
+    # 3. Foreign memory in Project B
+    foreign_mem = Memory(
+        project_id=project_b.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Foreign Fact",
+        content="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        version=1,
+    )
+    db.add_all([archived_mem, stale_mem, foreign_mem])
+    db.flush()
+
+    src_archived = MemorySource(
+        memory_id=archived_mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper_a.id,
+        page_number=1,
+        quote_text=quote,
+        document_sha256=paper_a.document_sha256,
+    )
+    src_stale = MemorySource(
+        memory_id=stale_mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper_a.id,
+        page_number=1,
+        quote_text=quote,
+        document_sha256="stale_outdated_hash_456",
+    )
+    src_foreign = MemorySource(
+        memory_id=foreign_mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper_b.id,
+        page_number=1,
+        quote_text=quote,
+        document_sha256=paper_b.document_sha256,
+    )
+    db.add_all([src_archived, src_stale, src_foreign])
+    db.commit()
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = f"{quote} [E1]."
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What mechanism does Transformer use?",
+        )
+
+    # Archived, stale, and foreign memories must NOT supply evidence; E1 was not registered
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_zero_citation_paper_answer_regression_rejected(db: Session) -> None:
+    project = Project(name="Zero Citation Regression Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Zero Citation Query")
+    quote = "The Transformer model uses multi-head attention mechanism across sub-layers."
+    paper, _, _, _ = setup_ingested_paper(
+        db, project_id=project.id, status="READY", page_text=quote
+    )
+
+    mem = Memory(
+        project_id=project.id,
+        memory_type=MemoryType.PAPER_FACT.value,
+        status=MemoryStatus.ACTIVE.value,
+        title="Transformer Fact",
+        content="The Transformer model uses multi-head attention mechanism across sub-layers.",
+        confidence=1.0,
+        importance=0.9,
+        version=1,
+    )
+    db.add(mem)
+    db.flush()
+
+    src = MemorySource(
+        memory_id=mem.id,
+        source_type=MemorySourceType.PAPER_CHUNK.value,
+        paper_id=paper.id,
+        page_number=1,
+        quote_text=quote,
+        document_sha256=paper.document_sha256,
+    )
+    db.add(src)
+    db.commit()
+
+    mock_llm = AsyncMock()
+    # LLM hallucinates an answer to the paper question with ZERO citations
+    mock_llm.generate.return_value = (
+        "The Transformer model uses multi-head attention mechanism across sub-layers."
+    )
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What mechanism does Transformer use?",
+        )
+
+    # Must be rejected because paper fact has 0 citations!
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_false_decision_claim_sharing_subject_is_rejected(db: Session) -> None:
+    """Ensure arbitrary claims sharing one subject with a decision (e.g. 'AURC cures cancer') are rejected."""
+    project = Project(name="False Claim Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="False Claim Conv")
+
+    # Stored active decision
+    mem_in = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Calibration Metric Decision",
+        content="We chose AURC over ECE for calibration.",
+        importance=0.9,
+        confidence=1.0,
+    )
+    create_memory(db, project_id=project.id, memory_in=mem_in)
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = "AURC cures cancer."
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What does AURC do?",
+        )
+
+    # False claim sharing 'AURC' must be abstained/rejected!
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_legitimate_decision_claim_retained_without_fake_citation(
+    db: Session,
+) -> None:
+    """Ensure legitimate decision sentences are retained without paper citations."""
+    project = Project(name="Legit Decision Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Legit Decision Conv")
+
+    # Stored active decision
+    mem_in = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Calibration Metric Choice",
+        content="We chose AURC over ECE for calibration.",
+        importance=0.9,
+        confidence=1.0,
+    )
+    create_memory(db, project_id=project.id, memory_in=mem_in)
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = (
+        "According to our project decisions, we chose AURC over ECE for calibration."
+    )
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What metric did we choose for calibration?",
+        )
+
+    assert resp.content == (
+        "According to our project decisions, we chose AURC over ECE for calibration."
+    )
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_uncommitted_turn_candidate_does_not_authorize_uncited_answer(
+    db: Session,
+) -> None:
+    """Ensure uncommitted turn text does not authorize uncited answers when no memory is saved."""
+    project = Project(name="Turn Candidate Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Turn Candidate Conv")
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = "We chose AURC over ECE for calibration."
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="We decided to use AURC over ECE for calibration.",
+        )
+
+    # No saved decision exists in database yet, so uncited answer must NOT be authorized!
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0

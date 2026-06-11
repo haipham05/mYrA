@@ -14,7 +14,19 @@ from app.crud.memory import (
     update_memory,
 )
 from app.db.base import Base
-from app.db.models import Conversation, Memory, MemorySource, Message, Paper, PaperPage, Project
+from app.db.models import (
+    ChunkElement,
+    Conversation,
+    Memory,
+    MemorySource,
+    Message,
+    Paper,
+    PaperChunk,
+    PaperElement,
+    PaperPage,
+    Project,
+)
+from app.schemas.evidence import AnchorStatus
 from app.schemas.memory import (
     MemoryCreate,
     MemorySourceCreate,
@@ -28,6 +40,7 @@ from app.services.memory_service import (
     consolidate_memory_candidate,
     extract_candidates_from_text,
     format_memories_for_prompt,
+    resolve_paper_memory_source,
     retrieve_project_memories,
 )
 
@@ -205,15 +218,47 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
     db.add_all([unready_paper, ready_paper])
     db.commit()
 
-    page1 = PaperPage(
-        paper_id=ready_paper.id,
-        page_number=1,
-        width=612.0,
-        height=792.0,
-        raw_text="The Transformer model uses multi-head attention mechanism across sub-layers.",
+    def add_page_element_chunk(paper_id, page_no: int, text: str) -> PaperPage:
+        page = PaperPage(
+            paper_id=paper_id,
+            page_number=page_no,
+            width=612.0,
+            height=792.0,
+            raw_text=text,
+        )
+        elem = PaperElement(
+            paper_id=paper_id,
+            element_index=page_no * 10,
+            element_type="paragraph",
+            text=text,
+            page_number=page_no,
+            bbox_x_min=50.0,
+            bbox_y_min=100.0,
+            bbox_x_max=550.0,
+            bbox_y_max=200.0,
+            page_width=612.0,
+            page_height=792.0,
+            coordinate_origin="TOP_LEFT",
+            rotation=0,
+            parser_version="docling-test",
+        )
+        chunk = PaperChunk(
+            paper_id=paper_id,
+            chunk_type="child",
+            chunk_index=page_no,
+            text=text,
+        )
+        db.add_all([page, elem, chunk])
+        db.flush()
+        db.add(ChunkElement(chunk_id=chunk.id, element_id=elem.id, order_index=0))
+        db.commit()
+        return page
+
+    add_page_element_chunk(
+        ready_paper.id,
+        1,
+        "The Transformer model uses multi-head attention mechanism across sub-layers.",
     )
-    db.add(page1)
-    db.commit()
 
     # 1. Non-READY paper must be rejected
     unready_cand = MemoryCreate(
@@ -336,15 +381,7 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
     misleading_text = (
         "While quantum teleportation is fascinating, our work focuses strictly on transformers."
     )
-    page2 = PaperPage(
-        paper_id=ready_paper.id,
-        page_number=2,
-        width=612.0,
-        height=792.0,
-        raw_text=misleading_text,
-    )
-    db.add(page2)
-    db.commit()
+    add_page_element_chunk(ready_paper.id, 2, misleading_text)
 
     misleading_cand = MemoryCreate(
         memory_type=MemoryType.PAPER_FACT,
@@ -376,17 +413,11 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
 
     # 10. Reversed relation claim: "Method B is better than method A."
     # vs quote "Method A is better than method B."
-    page3 = PaperPage(
-        paper_id=ready_paper.id,
-        page_number=3,
-        width=612.0,
-        height=792.0,
-        raw_text=(
-            "In our empirical evaluation, Method A is better than method B across all benchmarks."
-        ),
+    add_page_element_chunk(
+        ready_paper.id,
+        3,
+        "In our empirical evaluation, Method A is better than method B across all benchmarks.",
     )
-    db.add(page3)
-    db.commit()
 
     reversed_cand = MemoryCreate(
         memory_type=MemoryType.PAPER_FACT,
@@ -407,15 +438,9 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
 
     # 11. Swapped numbers claim: "accuracy decreased from 90% to 80%"
     # vs quote "accuracy increased from 80% to 90%"
-    page4 = PaperPage(
-        paper_id=ready_paper.id,
-        page_number=4,
-        width=612.0,
-        height=792.0,
-        raw_text="The accuracy increased from 80% to 90% after fine-tuning.",
+    page4 = add_page_element_chunk(
+        ready_paper.id, 4, "The accuracy increased from 80% to 90% after fine-tuning."
     )
-    db.add(page4)
-    db.commit()
 
     swapped_numbers_cand = MemoryCreate(
         memory_type=MemoryType.PAPER_FACT,
@@ -505,15 +530,9 @@ def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:
 
     # 14. Two opposite sentences on one page: citing X > Y must not establish Y > X,
     # even if Y > X appears nearby on that same page.
-    page5 = PaperPage(
-        paper_id=ready_paper.id,
-        page_number=5,
-        width=612.0,
-        height=792.0,
-        raw_text="Method X is superior to method Y. Method Y is superior to method X.",
+    add_page_element_chunk(
+        ready_paper.id, 5, "Method X is superior to method Y. Method Y is superior to method X."
     )
-    db.add(page5)
-    db.commit()
 
     # Mismatched citation: claiming Y > X while citing X > Y must fail
     mismatched_quote_cand = MemoryCreate(
@@ -738,3 +757,177 @@ def test_conversation_capture_and_scoped_retrieval(db: Session) -> None:
     formatted = format_memories_for_prompt(retrieved_a)
     assert "PROJECT DECISIONS & USER PREFERENCES" in formatted
     assert "ViT" in formatted
+
+
+def test_paper_memory_source_resolution(db: Session) -> None:
+    """Test 4.F1: Deterministic M1-compatible paper memory source resolution and edge cases."""
+    project1 = Project(name="Resolution Project 1")
+    project2 = Project(name="Resolution Project 2")
+    db.add_all([project1, project2])
+    db.commit()
+
+    paper = Paper(
+        project_id=project1.id,
+        filename="transformer.pdf",
+        storage_path="/papers/transformer.pdf",
+        document_sha256="doc_hash_abc123",
+        status="READY",
+    )
+    db.add(paper)
+    db.commit()
+
+    page_text = "The Transformer relies entirely on an attention mechanism to model dependencies."
+    page1 = PaperPage(
+        paper_id=paper.id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text=page_text,
+    )
+    elem1 = PaperElement(
+        paper_id=paper.id,
+        element_index=0,
+        element_type="paragraph",
+        text=page_text,
+        page_number=1,
+        bbox_x_min=72.0,
+        bbox_y_min=100.0,
+        bbox_x_max=540.0,
+        bbox_y_max=150.0,
+        page_width=612.0,
+        page_height=792.0,
+        coordinate_origin="TOP_LEFT",
+        rotation=0,
+        parser_version="docling-2.0",
+    )
+    chunk1 = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text=page_text,
+    )
+    db.add_all([page1, elem1, chunk1])
+    db.flush()
+    chunk_elem1 = ChunkElement(chunk_id=chunk1.id, element_id=elem1.id, order_index=0)
+    db.add(chunk_elem1)
+    db.commit()
+
+    # 1. Valid quote resolves to expected chunk, element, character start/end, and VERIFIED anchor
+    valid_source = MemorySourceCreate(
+        source_type=MemorySourceType.PAPER_CHUNK,
+        paper_id=paper.id,
+        page_number=1,
+        quote_text="attention mechanism",
+        document_sha256="doc_hash_abc123",
+    )
+    ev, anchor, status = resolve_paper_memory_source(db, project1.id, valid_source)
+    assert status == AnchorStatus.VERIFIED
+    assert ev is not None
+    assert anchor is not None
+    assert ev.chunk_id == chunk1.id
+    assert ev.paper_id == paper.id
+    assert anchor.source_element_id == elem1.id
+    assert anchor.page_number == 1
+    assert anchor.parser_version == "docling-2.0"
+    assert anchor.document_sha256 == "doc_hash_abc123"
+    assert anchor.source_char_start == page_text.index("attention mechanism")
+    assert anchor.source_char_end == anchor.source_char_start + len("attention mechanism")
+    assert len(anchor.bounding_boxes) == 1
+
+    # 2. Wrong project must NOT resolve
+    ev_wrong_proj, anchor_wrong_proj, status_wrong_proj = resolve_paper_memory_source(
+        db, project2.id, valid_source
+    )
+    assert status_wrong_proj == AnchorStatus.UNRESOLVED
+    assert ev_wrong_proj is None
+    assert anchor_wrong_proj is None
+
+    # 3. Changed document hash must NOT resolve
+    stale_hash_source = MemorySourceCreate(
+        source_type=MemorySourceType.PAPER_CHUNK,
+        paper_id=paper.id,
+        page_number=1,
+        quote_text="attention mechanism",
+        document_sha256="stale_outdated_hash_456",
+    )
+    ev_stale, _, status_stale = resolve_paper_memory_source(db, project1.id, stale_hash_source)
+    assert status_stale == AnchorStatus.UNRESOLVED
+    assert ev_stale is None
+
+    # 4. Wrong page must NOT resolve
+    wrong_page_source = MemorySourceCreate(
+        source_type=MemorySourceType.PAPER_CHUNK,
+        paper_id=paper.id,
+        page_number=99,
+        quote_text="attention mechanism",
+        document_sha256="doc_hash_abc123",
+    )
+    ev_wrong_page, _, status_wrong_page = resolve_paper_memory_source(
+        db, project1.id, wrong_page_source
+    )
+    assert status_wrong_page == AnchorStatus.UNRESOLVED
+    assert ev_wrong_page is None
+
+    # 5. Ambiguous / duplicate quote on page must NOT resolve
+    page2 = PaperPage(
+        paper_id=paper.id,
+        page_number=2,
+        width=612.0,
+        height=792.0,
+        raw_text="Attention is key. Attention is all we need. Attention is crucial.",
+    )
+    elem2 = PaperElement(
+        paper_id=paper.id,
+        element_index=1,
+        element_type="paragraph",
+        text="Attention is key. Attention is all we need. Attention is crucial.",
+        page_number=2,
+        parser_version="docling-2.0",
+    )
+    chunk2 = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=1,
+        text="Attention is key. Attention is all we need. Attention is crucial.",
+    )
+    db.add_all([page2, elem2, chunk2])
+    db.flush()
+    db.add(ChunkElement(chunk_id=chunk2.id, element_id=elem2.id, order_index=0))
+    db.commit()
+
+    ambig_source = MemorySourceCreate(
+        source_type=MemorySourceType.PAPER_CHUNK,
+        paper_id=paper.id,
+        page_number=2,
+        quote_text="Attention",
+        document_sha256="doc_hash_abc123",
+    )
+    ev_ambig, _, status_ambig = resolve_paper_memory_source(db, project1.id, ambig_source)
+    assert status_ambig == AnchorStatus.UNRESOLVED
+    assert ev_ambig is None
+
+    # 6. Unready paper must NOT resolve
+    paper.status = "PROCESSING"
+    db.commit()
+    ev_unready, _, status_unready = resolve_paper_memory_source(db, project1.id, valid_source)
+    assert status_unready == AnchorStatus.UNRESOLVED
+    assert ev_unready is None
+
+    # Restore ready status for remaining checks
+    paper.status = "READY"
+    db.commit()
+
+    # 7. Deleted chunk must NOT resolve
+    db.delete(chunk_elem1)
+    db.delete(chunk1)
+    db.commit()
+    ev_no_chunk, _, status_no_chunk = resolve_paper_memory_source(db, project1.id, valid_source)
+    assert status_no_chunk == AnchorStatus.UNRESOLVED
+    assert ev_no_chunk is None
+
+    # 8. Deleted element must NOT resolve
+    db.delete(elem1)
+    db.commit()
+    ev_no_elem, _, status_no_elem = resolve_paper_memory_source(db, project1.id, valid_source)
+    assert status_no_elem == AnchorStatus.UNRESOLVED
+    assert ev_no_elem is None

@@ -123,6 +123,14 @@ export interface MemorySource {
   page_number?: number | null;
   quote_text?: string | null;
   document_sha256?: string | null;
+  chunk_id?: string | null;
+  source_element_id?: string | null;
+  source_char_start?: number | null;
+  source_char_end?: number | null;
+  parser_version?: string | null;
+  anchor_status?: AnchorStatus | null;
+  bounding_boxes?: BoundingBox[];
+  anchors?: CitationAnchor[];
   created_at: string;
 }
 
