@@ -75,9 +75,6 @@ STOPWORDS = {
     "most",
     "other",
     "some",
-    "no",
-    "nor",
-    "not",
     "only",
     "own",
     "same",
@@ -85,7 +82,6 @@ STOPWORDS = {
     "very",
     "can",
     "will",
-    "don",
     "should",
     "now",
     "i",
@@ -127,6 +123,67 @@ STOPWORDS = {
     "preference",
 }
 
+DISCOURSE_PREFIX_TOKENS = {
+    "according",
+    "to",
+    "our",
+    "the",
+    "project",
+    "decision",
+    "decisions",
+    "preference",
+    "preferences",
+    "memory",
+    "memories",
+    "as",
+    "per",
+    "based",
+    "on",
+    "in",
+    "for",
+    "this",
+    "we",
+    "have",
+    "decided",
+    "chosen",
+    "agreed",
+    "preferred",
+    "is",
+    "was",
+    "that",
+    "note",
+    "recall",
+    "states",
+    "stated",
+    "says",
+    "said",
+}
+
+NEGATION_PATTERNS = [
+    r"\bnot\b",
+    r"\bno\b",
+    r"\bnever\b",
+    r"\bneither\b",
+    r"\bnor\b",
+    r"\bcannot\b",
+    r"\bcan't\b",
+    r"\bdid\s+not\b",
+    r"\bdidn't\b",
+    r"\bdoes\s+not\b",
+    r"\bdoesn't\b",
+    r"\bwas\s+not\b",
+    r"\bwasn't\b",
+    r"\bwithout\b",
+    r"\bfailed\b",
+    r"\bfails\b",
+    r"\bfailure\b",
+]
+
+
+def _has_negation(text: str) -> bool:
+    t = text.lower()
+    return any(re.search(pat, t) is not None for pat in NEGATION_PATTERNS)
+
 
 def is_attributed_to_memories(
     sentence: str,
@@ -134,8 +191,11 @@ def is_attributed_to_memories(
 ) -> bool:
     """Verify that an uncited sentence is directly supported by a decision/preference memory.
 
-    Rejects sentences that merely share a subject or entity (e.g. 'AURC cures cancer')
-    while having no support for the predicate or relationship in the stored decision.
+    Rejects sentences that:
+    - Merely share an entity or subject (e.g. 'AURC cures cancer')
+    - Contain unsupported trailing/leading clauses or modifiers (e.g. '...mistakenly')
+    - Invert or negate the memory polarity (e.g. 'We did not choose AURC')
+    - Contain ungrounded foreign tokens outside standard discourse framing
     """
     valid_memories = [
         m
@@ -150,7 +210,25 @@ def is_attributed_to_memories(
     if not sentence_clean:
         return False
 
-    norm_sentence = re.sub(r"\s+", " ", sentence_clean.lower())
+    sentence_neg = _has_negation(sentence_clean)
+
+    prefix_pattern = (
+        r"^(?:"
+        r"(?:according to|as per|per|based on|in)\s+"
+        r"(?:(?:our|the)\s+)?(?:project\s+)?(?:decisions?|preferences?|memory)|"
+        r"(?:according to|as per|per|based on|in)\s+(?:(?:our|the)\s+)?project|"
+        r"for\s+(?:this|our|the)\s+project|"
+        r"in\s+(?:our|the)\s+project|"
+        r"project\s+(?:decision|preference|note)|"
+        r"decision|"
+        r"we\s+have\s+(?:decided|chosen|agreed|preferred)|"
+        r"our\s+(?:project\s+)?(?:decision|preference)\s+(?:is|was)(?:\s+that)?|"
+        r"the\s+project\s+decision\s+is\s+that|"
+        r"as\s+decided|"
+        r"note\s+that|"
+        r"recall\s+that)[,:]?\s*"
+    )
+    stripped = re.sub(prefix_pattern, "", sentence_clean, flags=re.IGNORECASE).strip()
 
     for m in valid_memories:
         mem_content = (m.content or "").strip()
@@ -158,68 +236,73 @@ def is_attributed_to_memories(
         if not mem_content:
             continue
 
-        # 1. Exact or near-exact containment of the memory content in the sentence
-        norm_content = re.sub(r"\s+", " ", mem_content.lower()).rstrip(".?!")
-        if norm_content and norm_content in norm_sentence:
-            return True
-
-        # 2. Extract quotes from sentence (e.g., 'We chose "AURC over ECE"')
-        for match in re.finditer(r'["“]([^"”]+)["”]', sentence_clean):
-            quoted = match.group(1).strip()
-            if len(quoted.split()) >= 3 and (
-                check_claim_support(quoted, mem_content)
-                or (mem_title and check_claim_support(quoted, f"{mem_title}: {mem_content}"))
-            ):
-                return True
-
-        # 3. Strip conversational/discourse prefixes and check claim support against memory content
-        prefix_pattern = (
-            r"^(?:according to (?:our|the )?(?:project )?"
-            r"(?:decision|decisions|preference|preferences|memory)|"
-            r"as (?:per )?(?:the )?(?:project )?(?:decision|decisions|preference|preferences)|"
-            r"per (?:our|the) (?:decision|decisions|preference|preferences)|"
-            r"based on (?:our|the )?(?:project )?(?:decision|decisions|preference|preferences)|"
-            r"in (?:the )?(?:project )?(?:decision|decisions|preference|preferences)|"
-            r"for this project[,:]?|"
-            r"we have (?:decided|chosen|agreed|preferred)[,:]?|"
-            r"the project decision is that|"
-            r"as decided[,:]?|"
-            r"note that[,:]?|"
-            r"recall that[,:]?)\s*"
+        clean_mem_content = (
+            re.sub(prefix_pattern, "", mem_content, flags=re.IGNORECASE).strip() or mem_content
         )
-        stripped = re.sub(prefix_pattern, "", sentence_clean, flags=re.IGNORECASE).strip()
-        if stripped and (
-            check_claim_support(stripped, mem_content)
-            or (mem_title and check_claim_support(stripped, f"{mem_title}: {mem_content}"))
+
+        # 1. Negation polarity check
+        mem_neg = _has_negation(mem_content)
+        if sentence_neg != mem_neg:
+            continue
+
+        # 2. Check foreign substantive tokens in the whole sentence
+        # Every substantive token in the sentence MUST be covered by memory content/title
+        # or recognized discourse framing. Zero foreign substantive tokens permitted!
+        sentence_tokens = [
+            t
+            for t in re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", stripped.lower())
+            if t not in DISCOURSE_PREFIX_TOKENS and t not in STOPWORDS
+        ]
+        mem_tokens = set(
+            re.findall(
+                r"\b[a-zA-Z0-9_-]{2,}\b",
+                f"{mem_title} {mem_content} {clean_mem_content}".lower(),
+            )
+        )
+        foreign_tokens = [t for t in sentence_tokens if t not in mem_tokens]
+        if foreign_tokens:
+            continue
+
+        # 3. Exact equality of normalized content (ignoring case, spaces, and punctuation)
+        norm_content = re.sub(r"\s+", " ", clean_mem_content.lower()).rstrip(".?!")
+        norm_stripped = re.sub(r"\s+", " ", stripped.lower()).rstrip(".?!")
+        if norm_content and (
+            norm_content == norm_stripped
+            or norm_content == re.sub(r"^we\s+", "", norm_stripped)
+            or re.sub(r"^we\s+", "", norm_content) == norm_stripped
         ):
             return True
 
-        # 4. Monotonic subsequence check with substantive coverage:
-        words = (stripped or sentence_clean).split()
-        for w_len in range(len(words), 2, -1):
-            for start_idx in range(len(words) - w_len + 1):
-                subphrase = " ".join(words[start_idx : start_idx + w_len])
-                sub_tokens = [
-                    t
-                    for t in re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", subphrase.lower())
-                    if t not in STOPWORDS
-                ]
-                if len(sub_tokens) >= 3 and (
-                    check_claim_support(subphrase, mem_content)
-                    or (mem_title and check_claim_support(subphrase, f"{mem_title}: {mem_content}"))
+        # 4. Check quoted clause: if sentence wraps memory in quotes,
+        # ensure the quote is supported and the unquoted remainder has zero foreign tokens
+        quote_matches = list(re.finditer(r'["“]([^"”]+)["”]', sentence_clean))
+        if quote_matches:
+            for match in quote_matches:
+                quoted = match.group(1).strip()
+                if len(quoted.split()) >= 3 and (
+                    check_claim_support(quoted, mem_content)
+                    or check_claim_support(quoted, clean_mem_content)
+                    or (mem_title and check_claim_support(quoted, f"{mem_title}: {mem_content}"))
                 ):
-                    remainder = " ".join(words[:start_idx] + words[start_idx + w_len :])
+                    remainder = (
+                        sentence_clean[: match.start()] + " " + sentence_clean[match.end() :]
+                    )
                     rem_tokens = [
                         t
                         for t in re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", remainder.lower())
-                        if t not in STOPWORDS
+                        if t not in DISCOURSE_PREFIX_TOKENS and t not in STOPWORDS
                     ]
-                    mem_tokens = set(
-                        re.findall(r"\b[a-zA-Z0-9_-]{2,}\b", f"{mem_title} {mem_content}".lower())
-                    )
-                    foreign_tokens = [t for t in rem_tokens if t not in mem_tokens]
-                    if len(foreign_tokens) <= 1:
+                    if not [t for t in rem_tokens if t not in mem_tokens]:
                         return True
+
+        # 5. Check claim support on stripped sentence
+        if stripped and (
+            check_claim_support(stripped, mem_content)
+            or check_claim_support(stripped, clean_mem_content)
+            or check_claim_support(re.sub(r"^we\s+", "", stripped), clean_mem_content)
+            or (mem_title and check_claim_support(stripped, f"{mem_title}: {mem_content}"))
+        ):
+            return True
 
     return False
 
@@ -615,9 +698,7 @@ class ChatService:
 
             retained_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
 
-        if retained_sentences and (
-            validated_citations or decision_preference_memories
-        ):
+        if retained_sentences and (validated_citations or decision_preference_memories):
             formatted_answer = " ".join(retained_sentences)
         else:
             formatted_answer = (

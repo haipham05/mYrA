@@ -882,15 +882,6 @@ def consolidate_memory_candidate(
     validate_memory_candidate(db, project_id=project_id, candidate=candidate)
     safe_content = candidate.content
 
-    if embedding is None:
-        try:
-            from app.services.embedding import get_embedding_provider
-
-            provider = get_embedding_provider()
-            embedding = provider.embed_query(safe_content)
-        except Exception:
-            embedding = None
-
     # 1. Check exact content duplicate among active memories in this project
     existing_active, _ = list_memories(
         db,
@@ -900,8 +891,17 @@ def consolidate_memory_candidate(
     )
     for mem in existing_active:
         if mem.content.strip().lower() == safe_content.strip().lower():
-            # Exact duplicate: return existing memory (idempotent)
+            # Exact duplicate: return existing memory (idempotent, skips embedding call)
             return mem
+
+    if embedding is None:
+        try:
+            from app.services.embedding import get_embedding_provider
+
+            provider = get_embedding_provider()
+            embedding = provider.embed_query(safe_content)
+        except Exception:
+            embedding = None
 
     # 2. Check conflict / supersession for DECISION and PREFERENCE types
     if candidate.memory_type in (MemoryType.DECISION, MemoryType.PREFERENCE):

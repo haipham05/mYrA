@@ -156,7 +156,21 @@ test.describe("Milestone 4 — Long-Term Research Memory Journey", () => {
     });
 
     await page.route("**/api/v1/projects/*/conversations*", async (route) => {
-      await route.fulfill({ status: 200, json: { items: [], total: 0 } });
+      if (route.request().method() === "POST") {
+        await route.fulfill({
+          status: 200,
+          json: {
+            id: "mock-conv-e2e",
+            project_id: project1.id,
+            title: "Workspace Chat",
+            is_archived: false,
+            message_count: 0,
+            created_at: new Date().toISOString(),
+          },
+        });
+      } else {
+        await route.fulfill({ status: 200, json: { items: [], total: 0 } });
+      }
     });
 
     // Mock Memory Endpoints

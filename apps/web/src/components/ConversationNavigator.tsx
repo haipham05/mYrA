@@ -105,8 +105,8 @@ export default function ConversationNavigator({
               No conversations
             </option>
           ) : (
-            conversations.map((c) => (
-              <option key={c.id} value={c.id}>
+            conversations.map((c, idx) => (
+              <option key={c.id || `conv-${idx}`} value={c.id || ""}>
                 {c.title || "Untitled Chat"}
                 {c.is_archived ? " [Archived]" : ""}
                 {c.message_count !== undefined ? ` (${c.message_count})` : ""}

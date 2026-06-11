@@ -19,6 +19,7 @@ export default function MemoryInspector({
   const [memories, setMemories] = useState<Memory[]>([]);
   const [total, setTotal] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Filters
@@ -61,6 +62,7 @@ export default function MemoryInspector({
         }
         return;
       }
+      setIsLoading(true);
       try {
         const params = new URLSearchParams();
         if (typeFilter !== "ALL") params.append("memory_type", typeFilter);
@@ -122,6 +124,9 @@ export default function MemoryInspector({
       } else if (res.status === 409) {
         setError("Concurrent edit conflict while toggling pin. Refreshed.");
         fetchMemories();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setError(err.detail || "Failed to update pin status.");
       }
     } catch {
       setError("Network error while updating pin status.");
@@ -137,6 +142,9 @@ export default function MemoryInspector({
       );
       if (res.ok) {
         fetchMemories();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setError(err.detail || "Failed to archive memory.");
       }
     } catch {
       setError("Network error while archiving memory.");
@@ -152,6 +160,9 @@ export default function MemoryInspector({
       );
       if (res.ok) {
         fetchMemories();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setError(err.detail || "Failed to delete memory.");
       }
     } catch {
       setError("Network error while deleting memory.");
@@ -190,7 +201,9 @@ export default function MemoryInspector({
 
   const handleSaveCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!projectId || !formTitle.trim() || !formContent.trim()) return;
+    if (!projectId || !formTitle.trim() || !formContent.trim() || isSubmitting)
+      return;
+    setIsSubmitting(true);
     try {
       const res = await fetch(
         `${apiUrl}/api/v1/projects/${projectId}/memories`,
@@ -217,6 +230,8 @@ export default function MemoryInspector({
       }
     } catch {
       setFormConflictError("Network error while creating memory.");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -226,9 +241,11 @@ export default function MemoryInspector({
       !projectId ||
       !editingMemory ||
       !formTitle.trim() ||
-      !formContent.trim()
+      !formContent.trim() ||
+      isSubmitting
     )
       return;
+    setIsSubmitting(true);
     try {
       const res = await fetch(
         `${apiUrl}/api/v1/projects/${projectId}/memories/${editingMemory.id}`,
@@ -257,6 +274,8 @@ export default function MemoryInspector({
       }
     } catch {
       setFormConflictError("Network error while updating memory.");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -266,9 +285,22 @@ export default function MemoryInspector({
       !projectId ||
       !supersedingMemory ||
       !formTitle.trim() ||
-      !formContent.trim()
+      !formContent.trim() ||
+      isSubmitting
     )
       return;
+
+    if (
+      formContent.trim().toLowerCase() ===
+      supersedingMemory.content.trim().toLowerCase()
+    ) {
+      setFormConflictError(
+        "Content must be modified to supersede this memory. To change title or attributes without modifying content, use Edit instead.",
+      );
+      return;
+    }
+
+    setIsSubmitting(true);
     try {
       const sourcesPayload =
         formType === "PAPER_FACT" && supersedingMemory.sources
@@ -310,6 +342,8 @@ export default function MemoryInspector({
       }
     } catch {
       setFormConflictError("Network error while superseding memory.");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -670,10 +704,14 @@ export default function MemoryInspector({
             )}
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="create-type"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 Memory Type
               </label>
               <select
+                id="create-type"
                 value={formType}
                 onChange={(e) => setFormType(e.target.value as MemoryType)}
                 className="w-full text-xs px-3 py-1.5 border border-zinc-300 rounded-md"
@@ -686,10 +724,14 @@ export default function MemoryInspector({
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="create-title"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 Title
               </label>
               <input
+                id="create-title"
                 type="text"
                 required
                 value={formTitle}
@@ -700,10 +742,14 @@ export default function MemoryInspector({
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="create-content"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 Content
               </label>
               <textarea
+                id="create-content"
                 required
                 rows={4}
                 value={formContent}
@@ -723,9 +769,10 @@ export default function MemoryInspector({
               </button>
               <button
                 type="submit"
-                className="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white hover:bg-blue-700 font-medium"
+                disabled={isSubmitting}
+                className="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 font-medium"
               >
-                Create Memory
+                {isSubmitting ? "Creating..." : "Create Memory"}
               </button>
             </div>
           </form>
@@ -752,6 +799,27 @@ export default function MemoryInspector({
               </button>
             </div>
 
+            {editingMemory.memory_type === "PAPER_FACT" && (
+              <div className="p-2.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 space-y-1">
+                <div className="font-semibold text-[11px]">
+                  Cited Paper Source:
+                </div>
+                {editingMemory.sources && editingMemory.sources.length > 0 ? (
+                  editingMemory.sources.map((src, i) => (
+                    <div key={src.id || i} className="italic text-[11px]">
+                      Page {src.page_number}: &ldquo;{src.quote_text}&rdquo;
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-[11px]">No paper source attached.</div>
+                )}
+                <div className="text-[10px] text-amber-700">
+                  Edits to paper facts must remain supported by the cited source
+                  quote.
+                </div>
+              </div>
+            )}
+
             {formConflictError && (
               <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-700">
                 {formConflictError}
@@ -759,10 +827,14 @@ export default function MemoryInspector({
             )}
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="edit-title"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 Title
               </label>
               <input
+                id="edit-title"
                 type="text"
                 required
                 value={formTitle}
@@ -772,10 +844,14 @@ export default function MemoryInspector({
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="edit-content"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 Content
               </label>
               <textarea
+                id="edit-content"
                 required
                 rows={4}
                 value={formContent}
@@ -785,10 +861,14 @@ export default function MemoryInspector({
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="edit-reason"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 Edit Reason / Note (Audit Log)
               </label>
               <input
+                id="edit-reason"
                 type="text"
                 value={formReason}
                 onChange={(e) => setFormReason(e.target.value)}
@@ -807,9 +887,10 @@ export default function MemoryInspector({
               </button>
               <button
                 type="submit"
-                className="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white hover:bg-blue-700 font-medium"
+                disabled={isSubmitting}
+                className="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 font-medium"
               >
-                Save Changes
+                {isSubmitting ? "Saving..." : "Save Changes"}
               </button>
             </div>
           </form>
@@ -877,10 +958,14 @@ export default function MemoryInspector({
             )}
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="supersede-title"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 New Title
               </label>
               <input
+                id="supersede-title"
                 type="text"
                 required
                 value={formTitle}
@@ -890,10 +975,14 @@ export default function MemoryInspector({
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-zinc-700 mb-1">
+              <label
+                htmlFor="supersede-content"
+                className="block text-xs font-medium text-zinc-700 mb-1"
+              >
                 New Content / Rationale
               </label>
               <textarea
+                id="supersede-content"
                 required
                 rows={4}
                 value={formContent}
@@ -912,9 +1001,16 @@ export default function MemoryInspector({
               </button>
               <button
                 type="submit"
-                className="px-3 py-1.5 text-xs rounded-md bg-orange-600 text-white hover:bg-orange-700 font-medium"
+                disabled={isSubmitting}
+                className="px-3 py-1.5 text-xs rounded-md bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 font-medium"
               >
-                Supersede Decision
+                {isSubmitting
+                  ? "Superseding..."
+                  : `Supersede ${
+                      supersedingMemory.memory_type === "PAPER_FACT"
+                        ? "Paper Fact"
+                        : "Decision"
+                    }`}
               </button>
             </div>
           </form>

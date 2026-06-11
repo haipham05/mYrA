@@ -537,7 +537,9 @@ async def test_zero_citation_paper_answer_regression_rejected(db: Session) -> No
 
 @pytest.mark.anyio
 async def test_false_decision_claim_sharing_subject_is_rejected(db: Session) -> None:
-    """Ensure arbitrary claims sharing one subject with a decision (e.g. 'AURC cures cancer') are rejected."""
+    """Ensure arbitrary claims sharing one subject with a decision
+    (e.g. 'AURC cures cancer') are rejected.
+    """
     project = Project(name="False Claim Project")
     db.add(project)
     db.commit()
@@ -636,5 +638,141 @@ async def test_uncommitted_turn_candidate_does_not_authorize_uncited_answer(
         )
 
     # No saved decision exists in database yet, so uncited answer must NOT be authorized!
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_unsupported_suffix_clause_is_rejected(db: Session) -> None:
+    """Ensure sentences with supported prefix but unsupported suffix clause are rejected."""
+    project = Project(name="Suffix Test Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Suffix Test Conv")
+    mem_in = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Calibration Metric Decision",
+        content="We chose AURC over ECE for calibration.",
+        importance=0.9,
+        confidence=1.0,
+    )
+    create_memory(db, project_id=project.id, memory_in=mem_in)
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = (
+        "We chose AURC over ECE for calibration, and AURC cures cancer."
+    )
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What did we decide about AURC?",
+        )
+
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_quoted_wrapper_with_unsupported_prose_is_rejected(db: Session) -> None:
+    """Ensure quoted memories surrounded by unsupported substantive prose are rejected."""
+    project = Project(name="Quote Wrapper Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Quote Wrapper Conv")
+    mem_in = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Calibration Metric Decision",
+        content="We chose AURC over ECE for calibration.",
+        importance=0.9,
+        confidence=1.0,
+    )
+    create_memory(db, project_id=project.id, memory_in=mem_in)
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = (
+        'Our note says "We chose AURC over ECE for calibration" and AURC cures cancer.'
+    )
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What does our note say?",
+        )
+
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_negation_inversion_of_decision_is_rejected(db: Session) -> None:
+    """Ensure direct negation of a project decision is rejected and abstained."""
+    project = Project(name="Negation Test Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Negation Test Conv")
+    mem_in = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Calibration Metric Decision",
+        content="We chose AURC over ECE for calibration.",
+        importance=0.9,
+        confidence=1.0,
+    )
+    create_memory(db, project_id=project.id, memory_in=mem_in)
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = "We did not choose AURC over ECE for calibration."
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="Did we choose AURC for calibration?",
+        )
+
+    assert "Insufficient evidence available in the uploaded papers" in resp.content
+    assert len(resp.citations) == 0
+
+
+@pytest.mark.anyio
+async def test_single_foreign_modifier_is_rejected(db: Session) -> None:
+    """Ensure arbitrary single foreign token modifiers (e.g. 'mistakenly') are rejected."""
+    project = Project(name="Foreign Modifier Project")
+    db.add(project)
+    db.commit()
+
+    conv = create_conversation(db, project_id=project.id, title="Modifier Test Conv")
+    mem_in = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Calibration Metric Decision",
+        content="We chose AURC over ECE for calibration.",
+        importance=0.9,
+        confidence=1.0,
+    )
+    create_memory(db, project_id=project.id, memory_in=mem_in)
+
+    mock_llm = AsyncMock()
+    mock_llm.generate.return_value = "We chose AURC over ECE for calibration mistakenly."
+    mock_llm.model_name = "test-deepseek"
+
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        chat_service = ChatService()
+        resp = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="How did we choose AURC?",
+        )
+
     assert "Insufficient evidence available in the uploaded papers" in resp.content
     assert len(resp.citations) == 0

@@ -68,7 +68,10 @@ def get_memory(
 ) -> Memory | None:
     query = (
         db.query(Memory)
-        .options(joinedload(Memory.sources), joinedload(Memory.history))
+        .options(
+            joinedload(Memory.sources).joinedload(MemorySource.message),
+            joinedload(Memory.history),
+        )
         .filter(Memory.id == memory_id)
     )
     if project_id is not None:
@@ -106,7 +109,10 @@ def list_memories(
     total = db.query(func.count(Memory.id)).filter(*base_filter).scalar() or 0
     items = (
         db.query(Memory)
-        .options(joinedload(Memory.sources), joinedload(Memory.history))
+        .options(
+            joinedload(Memory.sources).joinedload(MemorySource.message),
+            joinedload(Memory.history),
+        )
         .filter(*base_filter)
         .order_by(
             Memory.is_pinned.desc(),
@@ -176,16 +182,6 @@ def update_memory(
                     "Cannot update paper fact: new content is not supported by cited source quote."
                 )
 
-            try:
-                from app.services.embedding import get_embedding_provider
-
-                provider = get_embedding_provider()
-                new_vec = provider.embed_query(memory_update.content)
-                locked_mem.embedding = new_vec
-                locked_mem.embedding_vec = new_vec
-            except Exception:
-                pass
-
     old_content = locked_mem.content
     actions = []
 
@@ -196,6 +192,15 @@ def update_memory(
     if memory_update.content is not None and memory_update.content != locked_mem.content:
         locked_mem.content = memory_update.content
         actions.append("CONTENT_UPDATED")
+        try:
+            from app.services.embedding import get_embedding_provider
+
+            provider = get_embedding_provider()
+            new_vec = provider.embed_query(memory_update.content)
+            locked_mem.embedding = new_vec
+            locked_mem.embedding_vec = new_vec
+        except Exception:
+            pass
 
     if memory_update.status is not None:
         status_val = (

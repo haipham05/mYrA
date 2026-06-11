@@ -288,6 +288,13 @@ describe("MemoryInspector Component", () => {
 
     expect(screen.getByText(/Supersede Decision \(v1\)/i)).toBeInTheDocument();
 
+    const contentInput = screen.getByRole("textbox", {
+      name: "New Content / Rationale",
+    });
+    fireEvent.change(contentInput, {
+      target: { value: "Switching to Brier score for better calibration." },
+    });
+
     const submitBtn = screen.getByRole("button", {
       name: "Supersede Decision",
     });
@@ -301,6 +308,38 @@ describe("MemoryInspector Component", () => {
           headers: { "Content-Type": "application/json" },
         }),
       );
+    });
+  });
+
+  it("displays client validation error when attempting to supersede with identical content", async () => {
+    vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: mockMemories, total: 2 }),
+    } as Response);
+
+    render(
+      <MemoryInspector projectId="proj-1" apiUrl="http://127.0.0.1:8000" />,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Decision: Choose AURC over ECE"),
+      ).toBeInTheDocument();
+    });
+
+    const supersedeBtns = screen.getAllByRole("button", { name: "Supersede" });
+    fireEvent.click(supersedeBtns[0]);
+
+    const submitBtn = screen.getByRole("button", {
+      name: "Supersede Decision",
+    });
+    // Submit without modifying content
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Content must be modified to supersede this memory/i),
+      ).toBeInTheDocument();
     });
   });
 
@@ -330,6 +369,13 @@ describe("MemoryInspector Component", () => {
 
     const supersedeBtns = screen.getAllByRole("button", { name: "Supersede" });
     fireEvent.click(supersedeBtns[0]);
+
+    const contentInput = screen.getByRole("textbox", {
+      name: "New Content / Rationale",
+    });
+    fireEvent.change(contentInput, {
+      target: { value: "Switching to Brier score for better calibration." },
+    });
 
     const submitBtn = screen.getByRole("button", {
       name: "Supersede Decision",

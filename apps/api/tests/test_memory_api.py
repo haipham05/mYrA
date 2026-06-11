@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -403,3 +403,46 @@ def test_paper_fact_creation_api_rejects_mismatched_quote_with_opposite_nearby(
     assert data["content"] == "Method B is better than method A."
     assert len(data["sources"]) == 1
     assert data["sources"][0]["quote_text"] == "Method B is better than method A"
+
+
+def test_decision_content_edit_updates_vector_embedding(client: TestClient, db: Session) -> None:
+    """Ensure that editing a decision memory's content recomputes its embedding."""
+    from unittest.mock import MagicMock, patch
+
+    project = Project(name="Embedding Update Project")
+    db.add(project)
+    db.commit()
+
+    # 1. Create a decision memory
+    payload = {
+        "memory_type": MemoryType.DECISION.value,
+        "title": "Initial Decision",
+        "content": "Initial decision content.",
+        "importance": 0.8,
+        "confidence": 1.0,
+        "sources": [],
+    }
+    resp = client.post(f"/api/v1/projects/{project.id}/memories", json=payload)
+    assert resp.status_code == 201
+    mem_id = resp.json()["id"]
+
+    mock_embed = MagicMock()
+    mock_embed.embed_query.return_value = [0.123, 0.456, 0.789]
+
+    with patch("app.services.embedding.get_embedding_provider", return_value=mock_embed):
+        patch_resp = client.patch(
+            f"/api/v1/projects/{project.id}/memories/{mem_id}",
+            json={
+                "content": "Updated decision content with new rationale.",
+                "version": 1,
+            },
+        )
+        assert patch_resp.status_code == 200
+        mock_embed.embed_query.assert_called_once_with(
+            "Updated decision content with new rationale."
+        )
+
+    # Verify db record has the new embedding
+    mem_db = db.query(Memory).filter(Memory.id == UUID(mem_id)).first()
+    assert mem_db is not None
+    assert mem_db.embedding == [0.123, 0.456, 0.789]

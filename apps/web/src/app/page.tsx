@@ -131,9 +131,10 @@ export default function Home() {
             },
           );
           if (createConvRes.ok) {
-            activeConv = await createConvRes.json();
-            if (activeConv) {
-              convList = [activeConv];
+            const created: Conversation = await createConvRes.json();
+            if (created && created.id) {
+              activeConv = created;
+              convList = [created];
             }
           }
         }

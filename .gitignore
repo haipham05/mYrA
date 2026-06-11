@@ -6,6 +6,8 @@
 [Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
 [Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
 [Cc][Ll][Aa][Uu][Dd][Ee][Ss].[Mm][Dd]
+.agent/
+.agents/
 
 # Local design, milestone, and planning documents (any directory or letter case)
 *[Ss][Yy][Ss][Tt][Ee][Mm]*[Dd][Ee][Ss][Ii][Gg][Nn]*.[Mm][Dd]
