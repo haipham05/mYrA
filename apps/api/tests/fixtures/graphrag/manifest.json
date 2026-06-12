@@ -1,0 +1,856 @@
+{
+  "ontology_version": "1.0.0",
+  "allowed_entities": [
+    "Paper",
+    "Author",
+    "Institution",
+    "Task",
+    "Method",
+    "Model",
+    "Dataset",
+    "Metric",
+    "Result",
+    "Claim",
+    "Limitation",
+    "Concept"
+  ],
+  "allowed_predicates": [
+    "EVALUATED_ON",
+    "ACHIEVES_RESULT",
+    "PROPOSES_METHOD",
+    "USES_MODEL",
+    "CONTRADICTS",
+    "EXTENDS",
+    "AUTHORED_BY",
+    "AFFILIATED_WITH"
+  ],
+  "allowed_qualifiers": [
+    "dataset",
+    "split",
+    "metric",
+    "unit",
+    "numeric_value",
+    "polarity",
+    "comparison_condition",
+    "task",
+    "uncertainty"
+  ],
+  "quality_gates": {
+    "local_checks": [
+      "./.venv/bin/pytest apps/api/tests/test_graphrag_fixtures.py",
+      "./.venv/bin/ruff format --check apps/api/",
+      "./.venv/bin/ruff check apps/api/"
+    ],
+    "coverage_threshold": 80.0,
+    "cloud_checks": {
+      "status": "UNTESTED",
+      "allowed_project_id": "0f726c17-4f23-4914-ab0a-aefb31f05745",
+      "allowed_paper": "attention.pdf",
+      "isolation_required": true
+    }
+  },
+  "projects": {
+    "project_a": {
+      "id": "a0000000-0000-0000-0000-000000000001",
+      "name": "NLP Calibration",
+      "description": "Investigation of confidence calibration, expected calibration error (ECE), and adversarial attack robustness in language and vision representations.",
+      "papers": [
+        {
+          "id": "a1111111-1111-1111-1111-111111111111",
+          "filename": "calibration_neural_networks.pdf",
+          "title": "On Calibration of Modern Neural Networks",
+          "document_sha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "entities": [
+            {
+              "id": "proj_a:paper:a1",
+              "name": "On Calibration of Modern Neural Networks",
+              "type": "Paper"
+            },
+            {
+              "id": "proj_a:author:chuan_guo",
+              "name": "Chuan Guo",
+              "type": "Author"
+            },
+            {
+              "id": "proj_a:institution:cornell",
+              "name": "Cornell University",
+              "type": "Institution"
+            },
+            {
+              "id": "proj_a:concept:ece",
+              "name": "Expected Calibration Error",
+              "type": "Concept",
+              "acronym": "ECE",
+              "expansion": "Expected Calibration Error"
+            },
+            {
+              "id": "proj_a:concept:asr",
+              "name": "Attack Success Rate",
+              "type": "Concept",
+              "acronym": "ASR",
+              "expansion": "Attack Success Rate"
+            },
+            {
+              "id": "proj_a:method:aurc",
+              "name": "AURC",
+              "type": "Method"
+            },
+            {
+              "id": "proj_a:dataset:imagenet",
+              "name": "ImageNet",
+              "type": "Dataset"
+            },
+            {
+              "id": "proj_a:method:temperature_scaling",
+              "name": "Temperature Scaling",
+              "type": "Method"
+            },
+            {
+              "id": "proj_a:metric:ece",
+              "name": "ECE",
+              "type": "Metric"
+            },
+            {
+              "id": "proj_a:result:a1_ts_imagenet",
+              "name": "2.1% ECE",
+              "type": "Result"
+            }
+          ],
+          "relationships": [
+            {
+              "fact_id": "proj_a:fact:a1_authored_by",
+              "subject": {
+                "id": "proj_a:paper:a1",
+                "name": "On Calibration of Modern Neural Networks",
+                "type": "Paper"
+              },
+              "predicate": "AUTHORED_BY",
+              "object": {
+                "id": "proj_a:author:chuan_guo",
+                "name": "Chuan Guo",
+                "type": "Author"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "a1111111-1111-1111-1111-111111111111",
+                "page_number": 1,
+                "chunk_id": "a1111111-1111-1111-1111-c00000000001",
+                "element_id": "a1111111-1111-1111-1111-e00000000001",
+                "exact_quote": "On Calibration of Modern Neural Networks",
+                "char_start": 0,
+                "char_end": 40
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a1_aurc_evaluated_on_imagenet",
+              "subject": {
+                "id": "proj_a:method:aurc",
+                "name": "AURC",
+                "type": "Method"
+              },
+              "predicate": "EVALUATED_ON",
+              "object": {
+                "id": "proj_a:dataset:imagenet",
+                "name": "ImageNet",
+                "type": "Dataset"
+              },
+              "qualifiers": {
+                "task": "confidence_calibration"
+              },
+              "provenance": {
+                "paper_id": "a1111111-1111-1111-1111-111111111111",
+                "page_number": 2,
+                "chunk_id": "a1111111-1111-1111-1111-c00000000002",
+                "element_id": "a1111111-1111-1111-1111-e00000000006",
+                "exact_quote": "We evaluate AURC on ImageNet calibration.",
+                "char_start": 31,
+                "char_end": 72
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a1_ts_achieves_result_ece",
+              "subject": {
+                "id": "proj_a:method:temperature_scaling",
+                "name": "Temperature Scaling",
+                "type": "Method"
+              },
+              "predicate": "ACHIEVES_RESULT",
+              "object": {
+                "id": "proj_a:result:a1_ts_imagenet",
+                "name": "2.1% ECE",
+                "type": "Result"
+              },
+              "qualifiers": {
+                "dataset": "ImageNet",
+                "metric": "ECE",
+                "numeric_value": 2.1,
+                "unit": "%",
+                "polarity": "POSITIVE"
+              },
+              "provenance": {
+                "paper_id": "a1111111-1111-1111-1111-111111111111",
+                "page_number": 2,
+                "chunk_id": "a1111111-1111-1111-1111-c00000000003",
+                "element_id": "a1111111-1111-1111-1111-e00000000008",
+                "exact_quote": "Temperature scaling achieves an ECE of 2.1% on ImageNet.",
+                "char_start": 195,
+                "char_end": 251
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a1_proposes_ece_concept",
+              "subject": {
+                "id": "proj_a:paper:a1",
+                "name": "On Calibration of Modern Neural Networks",
+                "type": "Paper"
+              },
+              "predicate": "PROPOSES_METHOD",
+              "object": {
+                "id": "proj_a:concept:ece",
+                "name": "Expected Calibration Error",
+                "type": "Concept"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "a1111111-1111-1111-1111-111111111111",
+                "page_number": 1,
+                "chunk_id": "a1111111-1111-1111-1111-c00000000001",
+                "element_id": "a1111111-1111-1111-1111-e00000000002",
+                "exact_quote": "Expected Calibration Error (ECE) is measured across all benchmarks to assess post-processing probability alignment.",
+                "char_start": 133,
+                "char_end": 248
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a1_mentions_asr_concept",
+              "subject": {
+                "id": "proj_a:paper:a1",
+                "name": "On Calibration of Modern Neural Networks",
+                "type": "Paper"
+              },
+              "predicate": "PROPOSES_METHOD",
+              "object": {
+                "id": "proj_a:concept:asr",
+                "name": "Attack Success Rate",
+                "type": "Concept"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "a1111111-1111-1111-1111-111111111111",
+                "page_number": 1,
+                "chunk_id": "a1111111-1111-1111-1111-c00000000001",
+                "element_id": "a1111111-1111-1111-1111-e00000000002",
+                "exact_quote": "Adversarial perturbations degrade calibration without reducing the attack success rate (ASR).",
+                "char_start": 344,
+                "char_end": 437
+              }
+            }
+          ]
+        },
+        {
+          "id": "a2222222-2222-2222-2222-222222222222",
+          "filename": "limitations_temperature_scaling.pdf",
+          "title": "Limitations of Temperature Scaling under Severe Distribution Shift",
+          "document_sha256": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+          "entities": [
+            {
+              "id": "proj_a:paper:a2",
+              "name": "Limitations of Temperature Scaling under Severe Distribution Shift",
+              "type": "Paper"
+            },
+            {
+              "id": "proj_a:author:dan_hendrycks",
+              "name": "Dan Hendrycks",
+              "type": "Author"
+            },
+            {
+              "id": "proj_a:institution:berkeley",
+              "name": "UC Berkeley",
+              "type": "Institution"
+            },
+            {
+              "id": "proj_a:method:temperature_scaling",
+              "name": "Temperature Scaling",
+              "type": "Method"
+            },
+            {
+              "id": "proj_a:dataset:imagenet",
+              "name": "ImageNet",
+              "type": "Dataset"
+            },
+            {
+              "id": "proj_a:dataset:cifar100",
+              "name": "CIFAR-100",
+              "type": "Dataset"
+            },
+            {
+              "id": "proj_a:metric:ece",
+              "name": "ECE",
+              "type": "Metric"
+            },
+            {
+              "id": "proj_a:result:a2_ts_imagenet_failure",
+              "name": "8.5% ECE",
+              "type": "Result"
+            },
+            {
+              "id": "proj_a:result:a2_ts_cifar",
+              "name": "5.4% ECE",
+              "type": "Result"
+            },
+            {
+              "id": "proj_a:concept:asr",
+              "name": "Attack Success Rate",
+              "type": "Concept",
+              "acronym": "ASR",
+              "expansion": "Attack Success Rate"
+            }
+          ],
+          "relationships": [
+            {
+              "fact_id": "proj_a:fact:a2_authored_by",
+              "subject": {
+                "id": "proj_a:paper:a2",
+                "name": "Limitations of Temperature Scaling under Severe Distribution Shift",
+                "type": "Paper"
+              },
+              "predicate": "AUTHORED_BY",
+              "object": {
+                "id": "proj_a:author:dan_hendrycks",
+                "name": "Dan Hendrycks",
+                "type": "Author"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "a2222222-2222-2222-2222-222222222222",
+                "page_number": 1,
+                "chunk_id": "a2222222-2222-2222-2222-c00000000001",
+                "element_id": "a2222222-2222-2222-2222-e00000000001",
+                "exact_quote": "Limitations of Temperature Scaling under Severe Distribution Shift",
+                "char_start": 0,
+                "char_end": 66
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a2_ts_contradicts_imagenet_ece",
+              "subject": {
+                "id": "proj_a:method:temperature_scaling",
+                "name": "Temperature Scaling",
+                "type": "Method"
+              },
+              "predicate": "ACHIEVES_RESULT",
+              "object": {
+                "id": "proj_a:result:a2_ts_imagenet_failure",
+                "name": "8.5% ECE",
+                "type": "Result"
+              },
+              "qualifiers": {
+                "dataset": "ImageNet",
+                "metric": "ECE",
+                "numeric_value": 8.5,
+                "unit": "%",
+                "polarity": "NEGATIVE"
+              },
+              "provenance": {
+                "paper_id": "a2222222-2222-2222-2222-222222222222",
+                "page_number": 2,
+                "chunk_id": "a2222222-2222-2222-2222-c00000000002",
+                "element_id": "a2222222-2222-2222-2222-e00000000006",
+                "exact_quote": "Temperature scaling fails to converge, yielding an ECE of 8.5% on ImageNet.",
+                "char_start": 28,
+                "char_end": 103
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a2_ts_achieves_cifar100_ece",
+              "subject": {
+                "id": "proj_a:method:temperature_scaling",
+                "name": "Temperature Scaling",
+                "type": "Method"
+              },
+              "predicate": "ACHIEVES_RESULT",
+              "object": {
+                "id": "proj_a:result:a2_ts_cifar",
+                "name": "5.4% ECE",
+                "type": "Result"
+              },
+              "qualifiers": {
+                "dataset": "CIFAR-100",
+                "metric": "ECE",
+                "numeric_value": 5.4,
+                "unit": "%",
+                "polarity": "POSITIVE"
+              },
+              "provenance": {
+                "paper_id": "a2222222-2222-2222-2222-222222222222",
+                "page_number": 2,
+                "chunk_id": "a2222222-2222-2222-2222-c00000000003",
+                "element_id": "a2222222-2222-2222-2222-e00000000008",
+                "exact_quote": "Temperature scaling achieves an ECE of 5.4% on CIFAR-100.",
+                "char_start": 218,
+                "char_end": 275
+              }
+            },
+            {
+              "fact_id": "proj_a:fact:a2_evaluates_asr",
+              "subject": {
+                "id": "proj_a:paper:a2",
+                "name": "Limitations of Temperature Scaling under Severe Distribution Shift",
+                "type": "Paper"
+              },
+              "predicate": "PROPOSES_METHOD",
+              "object": {
+                "id": "proj_a:concept:asr",
+                "name": "Attack Success Rate",
+                "type": "Concept"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "a2222222-2222-2222-2222-222222222222",
+                "page_number": 1,
+                "chunk_id": "a2222222-2222-2222-2222-c00000000001",
+                "element_id": "a2222222-2222-2222-2222-e00000000002",
+                "exact_quote": "We evaluate the attack success rate (ASR) across adversarial validation splits to quantify vulnerability.",
+                "char_start": 197,
+                "char_end": 302
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "project_b": {
+      "id": "b0000000-0000-0000-0000-000000000002",
+      "name": "Speech Recognition",
+      "description": "End-to-end automatic speech recognition (ASR) with conformer and branchformer architectures, energy-based confidence estimation, and LibriSpeech benchmarking.",
+      "papers": [
+        {
+          "id": "b1111111-1111-1111-1111-111111111111",
+          "filename": "conformer_speech_recognition.pdf",
+          "title": "Conformer: Convolution-augmented Transformer for Speech Recognition",
+          "document_sha256": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+          "entities": [
+            {
+              "id": "proj_b:paper:b1",
+              "name": "Conformer: Convolution-augmented Transformer for Speech Recognition",
+              "type": "Paper"
+            },
+            {
+              "id": "proj_b:author:anmol_gulati",
+              "name": "Anmol Gulati",
+              "type": "Author"
+            },
+            {
+              "id": "proj_b:institution:google",
+              "name": "Google LLC",
+              "type": "Institution"
+            },
+            {
+              "id": "proj_b:model:conformer",
+              "name": "Conformer",
+              "type": "Model"
+            },
+            {
+              "id": "proj_b:dataset:librispeech",
+              "name": "LibriSpeech",
+              "type": "Dataset"
+            },
+            {
+              "id": "proj_b:metric:wer",
+              "name": "WER",
+              "type": "Metric"
+            },
+            {
+              "id": "proj_b:result:b1_wer_clean",
+              "name": "4.3% WER",
+              "type": "Result"
+            },
+            {
+              "id": "proj_b:concept:asr",
+              "name": "Automatic Speech Recognition",
+              "type": "Concept",
+              "acronym": "ASR",
+              "expansion": "Automatic Speech Recognition"
+            },
+            {
+              "id": "proj_b:concept:ece",
+              "name": "Energy-based Confidence Estimation",
+              "type": "Concept",
+              "acronym": "ECE",
+              "expansion": "Energy-based Confidence Estimation"
+            }
+          ],
+          "relationships": [
+            {
+              "fact_id": "proj_b:fact:b1_proposes_conformer",
+              "subject": {
+                "id": "proj_b:paper:b1",
+                "name": "Conformer: Convolution-augmented Transformer for Speech Recognition",
+                "type": "Paper"
+              },
+              "predicate": "PROPOSES_METHOD",
+              "object": {
+                "id": "proj_b:model:conformer",
+                "name": "Conformer",
+                "type": "Model"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "b1111111-1111-1111-1111-111111111111",
+                "page_number": 1,
+                "chunk_id": "b1111111-1111-1111-1111-c00000000001",
+                "element_id": "b1111111-1111-1111-1111-e00000000001",
+                "exact_quote": "Conformer: Convolution-augmented Transformer for Speech Recognition",
+                "char_start": 0,
+                "char_end": 67
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b1_evaluates_on_librispeech",
+              "subject": {
+                "id": "proj_b:model:conformer",
+                "name": "Conformer",
+                "type": "Model"
+              },
+              "predicate": "EVALUATED_ON",
+              "object": {
+                "id": "proj_b:dataset:librispeech",
+                "name": "LibriSpeech",
+                "type": "Dataset"
+              },
+              "qualifiers": {
+                "task": "speech_recognition"
+              },
+              "provenance": {
+                "paper_id": "b1111111-1111-1111-1111-111111111111",
+                "page_number": 2,
+                "chunk_id": "b1111111-1111-1111-1111-c00000000002",
+                "element_id": "b1111111-1111-1111-1111-e00000000006",
+                "exact_quote": "We evaluate Conformer on LibriSpeech.",
+                "char_start": 23,
+                "char_end": 60
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b1_achieves_result_wer",
+              "subject": {
+                "id": "proj_b:model:conformer",
+                "name": "Conformer",
+                "type": "Model"
+              },
+              "predicate": "ACHIEVES_RESULT",
+              "object": {
+                "id": "proj_b:result:b1_wer_clean",
+                "name": "4.3% WER",
+                "type": "Result"
+              },
+              "qualifiers": {
+                "dataset": "LibriSpeech",
+                "split": "test-clean",
+                "metric": "WER",
+                "numeric_value": 4.3,
+                "unit": "%",
+                "polarity": "POSITIVE"
+              },
+              "provenance": {
+                "paper_id": "b1111111-1111-1111-1111-111111111111",
+                "page_number": 2,
+                "chunk_id": "b1111111-1111-1111-1111-c00000000003",
+                "element_id": "b1111111-1111-1111-1111-e00000000008",
+                "exact_quote": "Conformer achieves a WER of 4.3% on LibriSpeech test-clean.",
+                "char_start": 179,
+                "char_end": 238
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b1_concept_asr",
+              "subject": {
+                "id": "proj_b:paper:b1",
+                "name": "Conformer: Convolution-augmented Transformer for Speech Recognition",
+                "type": "Paper"
+              },
+              "predicate": "USES_MODEL",
+              "object": {
+                "id": "proj_b:concept:asr",
+                "name": "Automatic Speech Recognition",
+                "type": "Concept"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "b1111111-1111-1111-1111-111111111111",
+                "page_number": 1,
+                "chunk_id": "b1111111-1111-1111-1111-c00000000001",
+                "element_id": "b1111111-1111-1111-1111-e00000000002",
+                "exact_quote": "Automatic speech recognition (ASR) models have seen dramatic improvements with Transformer and CNN architectures.",
+                "char_start": 69,
+                "char_end": 182
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b1_concept_ece",
+              "subject": {
+                "id": "proj_b:paper:b1",
+                "name": "Conformer: Convolution-augmented Transformer for Speech Recognition",
+                "type": "Paper"
+              },
+              "predicate": "USES_MODEL",
+              "object": {
+                "id": "proj_b:concept:ece",
+                "name": "Energy-based Confidence Estimation",
+                "type": "Concept"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "b1111111-1111-1111-1111-111111111111",
+                "page_number": 1,
+                "chunk_id": "b1111111-1111-1111-1111-c00000000001",
+                "element_id": "b1111111-1111-1111-1111-e00000000002",
+                "exact_quote": "Energy-based Confidence Estimation (ECE) is applied to prune acoustic hypothesis search in beam decoding.",
+                "char_start": 183,
+                "char_end": 288
+              }
+            }
+          ]
+        },
+        {
+          "id": "b2222222-2222-2222-2222-222222222222",
+          "filename": "branchformer_speech_recognition.pdf",
+          "title": "Branchformer: Parallel MLP-Attention Architectures for Speech Recognition",
+          "document_sha256": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "entities": [
+            {
+              "id": "proj_b:paper:b2",
+              "name": "Branchformer: Parallel MLP-Attention Architectures for Speech Recognition",
+              "type": "Paper"
+            },
+            {
+              "id": "proj_b:author:yifan_peng",
+              "name": "Yifan Peng",
+              "type": "Author"
+            },
+            {
+              "id": "proj_b:institution:cmu",
+              "name": "Carnegie Mellon University",
+              "type": "Institution"
+            },
+            {
+              "id": "proj_b:model:branchformer",
+              "name": "Branchformer",
+              "type": "Model"
+            },
+            {
+              "id": "proj_b:model:conformer",
+              "name": "Conformer",
+              "type": "Model"
+            },
+            {
+              "id": "proj_b:dataset:librispeech",
+              "name": "LibriSpeech",
+              "type": "Dataset"
+            },
+            {
+              "id": "proj_b:metric:wer",
+              "name": "WER",
+              "type": "Metric"
+            },
+            {
+              "id": "proj_b:result:b2_wer_clean",
+              "name": "4.1% WER",
+              "type": "Result"
+            },
+            {
+              "id": "proj_b:concept:asr",
+              "name": "Automatic Speech Recognition",
+              "type": "Concept",
+              "acronym": "ASR",
+              "expansion": "Automatic Speech Recognition"
+            }
+          ],
+          "relationships": [
+            {
+              "fact_id": "proj_b:fact:b2_extends_conformer",
+              "subject": {
+                "id": "proj_b:model:branchformer",
+                "name": "Branchformer",
+                "type": "Model"
+              },
+              "predicate": "EXTENDS",
+              "object": {
+                "id": "proj_b:model:conformer",
+                "name": "Conformer",
+                "type": "Model"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "b2222222-2222-2222-2222-222222222222",
+                "page_number": 1,
+                "chunk_id": "b2222222-2222-2222-2222-c00000000002",
+                "element_id": "b2222222-2222-2222-2222-e00000000004",
+                "exact_quote": "Branchformer extends Conformer with parallel attention and convolutional branches.",
+                "char_start": 350,
+                "char_end": 432
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b2_evaluates_on_librispeech",
+              "subject": {
+                "id": "proj_b:model:branchformer",
+                "name": "Branchformer",
+                "type": "Model"
+              },
+              "predicate": "EVALUATED_ON",
+              "object": {
+                "id": "proj_b:dataset:librispeech",
+                "name": "LibriSpeech",
+                "type": "Dataset"
+              },
+              "qualifiers": {
+                "task": "speech_recognition"
+              },
+              "provenance": {
+                "paper_id": "b2222222-2222-2222-2222-222222222222",
+                "page_number": 2,
+                "chunk_id": "b2222222-2222-2222-2222-c00000000003",
+                "element_id": "b2222222-2222-2222-2222-e00000000006",
+                "exact_quote": "We evaluate Branchformer on LibriSpeech.",
+                "char_start": 25,
+                "char_end": 65
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b2_achieves_result_wer",
+              "subject": {
+                "id": "proj_b:model:branchformer",
+                "name": "Branchformer",
+                "type": "Model"
+              },
+              "predicate": "ACHIEVES_RESULT",
+              "object": {
+                "id": "proj_b:result:b2_wer_clean",
+                "name": "4.1% WER",
+                "type": "Result"
+              },
+              "qualifiers": {
+                "dataset": "LibriSpeech",
+                "split": "test-clean",
+                "metric": "WER",
+                "numeric_value": 4.1,
+                "unit": "%",
+                "polarity": "POSITIVE"
+              },
+              "provenance": {
+                "paper_id": "b2222222-2222-2222-2222-222222222222",
+                "page_number": 2,
+                "chunk_id": "b2222222-2222-2222-2222-c00000000004",
+                "element_id": "b2222222-2222-2222-2222-e00000000008",
+                "exact_quote": "Branchformer achieves a WER of 4.1% on LibriSpeech test-clean.",
+                "char_start": 181,
+                "char_end": 243
+              }
+            },
+            {
+              "fact_id": "proj_b:fact:b2_streaming_asr",
+              "subject": {
+                "id": "proj_b:paper:b2",
+                "name": "Branchformer: Parallel MLP-Attention Architectures for Speech Recognition",
+                "type": "Paper"
+              },
+              "predicate": "USES_MODEL",
+              "object": {
+                "id": "proj_b:concept:asr",
+                "name": "Automatic Speech Recognition",
+                "type": "Concept"
+              },
+              "qualifiers": {},
+              "provenance": {
+                "paper_id": "b2222222-2222-2222-2222-222222222222",
+                "page_number": 1,
+                "chunk_id": "b2222222-2222-2222-2222-c00000000001",
+                "element_id": "b2222222-2222-2222-2222-e00000000002",
+                "exact_quote": "The proposed streaming ASR baseline achieves low latency under 100ms.",
+                "char_start": 165,
+                "char_end": 234
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "cross_paper_benchmarks": {
+    "contradiction_pairs": [
+      {
+        "name": "temperature_scaling_imagenet_contradiction",
+        "paper_1_id": "a1111111-1111-1111-1111-111111111111",
+        "paper_2_id": "a2222222-2222-2222-2222-222222222222",
+        "claim_1": "Temperature scaling achieves an ECE of 2.1% on ImageNet.",
+        "claim_2": "Temperature scaling fails to converge, yielding an ECE of 8.5% on ImageNet.",
+        "is_contradiction": true,
+        "common_method": "Temperature Scaling",
+        "common_dataset": "ImageNet",
+        "common_metric": "ECE",
+        "value_1": 2.1,
+        "value_2": 8.5,
+        "reason": "Both papers report ECE for Temperature Scaling on ImageNet; Paper A1 reports 2.1% (positive) while Paper A2 reports 8.5% and failure to converge (negative)."
+      }
+    ],
+    "non_contradiction_pairs": [
+      {
+        "name": "temperature_scaling_different_datasets",
+        "paper_1_id": "a1111111-1111-1111-1111-111111111111",
+        "paper_2_id": "a2222222-2222-2222-2222-222222222222",
+        "claim_1": "Temperature scaling achieves an ECE of 2.1% on ImageNet.",
+        "claim_2": "Temperature scaling achieves an ECE of 5.4% on CIFAR-100.",
+        "is_contradiction": false,
+        "common_method": "Temperature Scaling",
+        "dataset_1": "ImageNet",
+        "dataset_2": "CIFAR-100",
+        "common_metric": "ECE",
+        "reason": "Claims evaluate different datasets (ImageNet vs CIFAR-100); distinct performance outcomes do not constitute a contradiction."
+      }
+    ],
+    "acronym_disambiguations": [
+      {
+        "acronym": "ASR",
+        "project_a_expansion": "Attack Success Rate",
+        "project_b_expansion": "Automatic Speech Recognition",
+        "project_a_entity_id": "proj_a:concept:asr",
+        "project_b_entity_id": "proj_b:concept:asr",
+        "must_merge": false,
+        "note": "Shared acronym across projects with completely distinct domain meanings."
+      },
+      {
+        "acronym": "ECE",
+        "project_a_expansion": "Expected Calibration Error",
+        "project_b_expansion": "Energy-based Confidence Estimation",
+        "project_a_entity_id": "proj_a:concept:ece",
+        "project_b_entity_id": "proj_b:concept:ece",
+        "must_merge": false,
+        "note": "Shared acronym across projects; calibration error in NLP vs confidence pruning in Speech."
+      }
+    ],
+    "method_dataset_relations": [
+      {
+        "project_id": "a0000000-0000-0000-0000-000000000001",
+        "paper_id": "a1111111-1111-1111-1111-111111111111",
+        "method": "AURC",
+        "dataset": "ImageNet",
+        "exact_quote": "We evaluate AURC on ImageNet calibration."
+      },
+      {
+        "project_id": "b0000000-0000-0000-0000-000000000002",
+        "paper_id": "b1111111-1111-1111-1111-111111111111",
+        "method": "Conformer",
+        "dataset": "LibriSpeech",
+        "exact_quote": "We evaluate Conformer on LibriSpeech."
+      },
+      {
+        "project_id": "b0000000-0000-0000-0000-000000000002",
+        "paper_id": "b2222222-2222-2222-2222-222222222222",
+        "method": "Branchformer",
+        "dataset": "LibriSpeech",
+        "exact_quote": "We evaluate Branchformer on LibriSpeech."
+      }
+    ]
+  }
+}
