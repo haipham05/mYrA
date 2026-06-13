@@ -6,6 +6,8 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -35,6 +37,8 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
     volumes:
       - ./apps/api/app:/app/app
       - ./apps/api/alembic:/app/alembic
@@ -43,3 +47,24 @@ services:
     command: python -m app.worker
     depends_on:
       - api
+
+  neo4j:
+    image: neo4j:5.26.0-community
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=${NEO4J_AUTH:-none}
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  neo4j_data:
+

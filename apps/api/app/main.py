@@ -144,6 +144,8 @@ async def system_status() -> dict[str, Any]:
         "storage_backend": "gcs" if current_settings.gcs_bucket_name else "local",
         "max_upload_size_bytes": current_settings.max_upload_size_bytes,
         "max_pdf_pages": current_settings.max_pdf_pages,
+        "graphrag_enabled": current_settings.graphrag_enabled,
+        "neo4j_configured": bool(current_settings.neo4j_uri),
     }
 
 

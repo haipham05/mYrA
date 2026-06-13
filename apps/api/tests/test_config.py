@@ -19,6 +19,13 @@ def test_settings_read_environment(monkeypatch) -> None:
     monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://custom.deepseek.com")
     monkeypatch.setenv("MYRA_MAX_UPLOAD_SIZE_BYTES", "10485760")
     monkeypatch.setenv("MYRA_MAX_PDF_PAGES", "50")
+    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
+    monkeypatch.setenv("NEO4J_URI", "bolt://localhost:7687")
+    monkeypatch.setenv("NEO4J_USER", "neo4j")
+    monkeypatch.setenv("NEO4J_PASSWORD", "secret-password")
+    monkeypatch.setenv("NEO4J_DATABASE", "custom_graph")
+    monkeypatch.setenv("NEO4J_TIMEOUT_SECONDS", "15.5")
+    monkeypatch.setenv("MYRA_GRAPH_BATCH_LIMIT", "100")
 
     settings = Settings.from_environment()
 
@@ -35,6 +42,46 @@ def test_settings_read_environment(monkeypatch) -> None:
     assert settings.deepseek_base_url == "https://custom.deepseek.com"
     assert settings.max_upload_size_bytes == 10485760
     assert settings.max_pdf_pages == 50
+    assert settings.graphrag_enabled is True
+    assert settings.neo4j_uri == "bolt://localhost:7687"
+    assert settings.neo4j_user == "neo4j"
+    assert settings.neo4j_password == "secret-password"
+    assert settings.neo4j_database == "custom_graph"
+    assert settings.neo4j_timeout_seconds == 15.5
+    assert settings.graph_batch_limit == 100
+
+
+def test_settings_defaults_when_env_vars_absent(monkeypatch) -> None:
+    for var in [
+        "MYRA_GRAPHRAG_ENABLED",
+        "NEO4J_URI",
+        "NEO4J_USER",
+        "NEO4J_PASSWORD",
+        "NEO4J_DATABASE",
+        "NEO4J_TIMEOUT_SECONDS",
+        "MYRA_GRAPH_BATCH_LIMIT",
+    ]:
+        monkeypatch.delenv(var, raising=False)
+
+    settings = Settings.from_environment()
+
+    assert settings.graphrag_enabled is False
+    assert settings.neo4j_uri is None
+    assert settings.neo4j_user is None
+    assert settings.neo4j_password is None
+    assert settings.neo4j_database == "neo4j"
+    assert settings.neo4j_timeout_seconds == 10.0
+    assert settings.graph_batch_limit == 50
+
+
+def test_graphrag_enabled_boolean_parsing(monkeypatch) -> None:
+    for val in ("true", "True", "1", "yes", "YES"):
+        monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", val)
+        assert Settings.from_environment().graphrag_enabled is True
+
+    for val in ("false", "False", "0", "no", "anything_else"):
+        monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", val)
+        assert Settings.from_environment().graphrag_enabled is False
 
 
 def test_log_formatter_emits_json() -> None:

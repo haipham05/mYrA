@@ -24,6 +24,13 @@ class Settings(BaseModel):
     max_upload_size_bytes: int = 50 * 1024 * 1024
     max_pdf_pages: int = 150
     check_migration_compatibility: bool = True
+    graphrag_enabled: bool = False
+    neo4j_uri: str | None = None
+    neo4j_user: str | None = None
+    neo4j_password: str | None = None
+    neo4j_database: str = "neo4j"
+    neo4j_timeout_seconds: float = 10.0
+    graph_batch_limit: int = 50
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -60,4 +67,22 @@ class Settings(BaseModel):
                 "1",
                 "yes",
             )
+        if graphrag_enabled := os.getenv("MYRA_GRAPHRAG_ENABLED"):
+            values["graphrag_enabled"] = graphrag_enabled.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if neo4j_uri := os.getenv("NEO4J_URI"):
+            values["neo4j_uri"] = neo4j_uri
+        if neo4j_user := os.getenv("NEO4J_USER"):
+            values["neo4j_user"] = neo4j_user
+        if neo4j_password := os.getenv("NEO4J_PASSWORD"):
+            values["neo4j_password"] = neo4j_password
+        if neo4j_database := os.getenv("NEO4J_DATABASE"):
+            values["neo4j_database"] = neo4j_database
+        if neo4j_timeout := os.getenv("NEO4J_TIMEOUT_SECONDS"):
+            values["neo4j_timeout_seconds"] = float(neo4j_timeout)
+        if graph_batch_limit := os.getenv("MYRA_GRAPH_BATCH_LIMIT"):
+            values["graph_batch_limit"] = int(graph_batch_limit)
         return cls.model_validate(values)

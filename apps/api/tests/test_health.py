@@ -36,6 +36,48 @@ def test_system_status_reports_config_without_secrets() -> None:
     assert data["status"] == "ok"
     assert data["provider"] == "deepseek"
     assert isinstance(data["deepseek_configured"], bool)
+    assert isinstance(data["graphrag_enabled"], bool)
+    assert isinstance(data["neo4j_configured"], bool)
     assert data["storage_backend"] in ("gcs", "local")
     assert "api_key" not in str(data)
     assert "secret" not in str(data).lower()
+    assert "password" not in str(data).lower()
+    assert "neo4j_uri" not in data
+    assert "neo4j_password" not in data
+    assert "neo4j_user" not in data
+
+
+def test_system_status_with_neo4j_configured_hides_secrets(monkeypatch) -> None:
+    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
+    monkeypatch.setenv("NEO4J_URI", "bolt://127.0.0.1:7687")
+    monkeypatch.setenv("NEO4J_USER", "neo4j_admin")
+    monkeypatch.setenv("NEO4J_PASSWORD", "super_secret_neo4j_password_123")
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/system/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["graphrag_enabled"] is True
+    assert data["neo4j_configured"] is True
+    assert isinstance(data["graphrag_enabled"], bool)
+    assert isinstance(data["neo4j_configured"], bool)
+    assert "super_secret_neo4j_password_123" not in response.text
+    assert "bolt://" not in response.text
+    assert "neo4j_admin" not in response.text
+    assert "password" not in response.text.lower()
+
+
+def test_system_status_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("MYRA_GRAPHRAG_ENABLED", raising=False)
+    monkeypatch.delenv("NEO4J_URI", raising=False)
+    monkeypatch.delenv("NEO4J_USER", raising=False)
+    monkeypatch.delenv("NEO4J_PASSWORD", raising=False)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/system/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["graphrag_enabled"] is False
+    assert data["neo4j_configured"] is False
