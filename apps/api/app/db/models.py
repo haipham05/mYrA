@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+import sqlalchemy as sa
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -355,3 +356,98 @@ class MemoryAudit(Base):
     )
 
     memory: Mapped["Memory"] = relationship(back_populates="history")
+
+
+class GraphEvent(Base):
+    __tablename__ = "graph_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "paper_id", "generation_id", "action", name="uq_graph_events_paper_generation_action"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    action: Mapped[str] = mapped_column(
+        String(50), default="UPSERT", server_default="UPSERT", nullable=False
+    )
+    generation_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    ontology_version: Mapped[str] = mapped_column(
+        String(50), default="1.0.0", server_default="1.0.0", nullable=False
+    )
+    extractor_version: Mapped[str] = mapped_column(
+        String(50), default="1.0.0", server_default="1.0.0", nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(50), default="PENDING", server_default="PENDING", nullable=False, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=sa.func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        server_default=sa.func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped["Project"] = relationship()
+    snapshots: Mapped[list["GraphFactSnapshot"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan"
+    )
+
+
+class GraphFactSnapshot(Base):
+    __tablename__ = "graph_fact_snapshots"
+
+    fact_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    generation_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    event_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("graph_events.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    subject_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    subject_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    predicate: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    object_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    object_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    qualifiers: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    # Provenance fields (verified source fields, NOT raw LLM response or full PDF text)
+    chunk_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    element_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    char_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    exact_quote: Mapped[str] = mapped_column(Text, nullable=False)
+    document_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    validation_version: Mapped[str] = mapped_column(
+        String(50), default="1.0.0", server_default="1.0.0", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=sa.func.now(), nullable=False
+    )
+
+    event: Mapped["GraphEvent | None"] = relationship(back_populates="snapshots")
+    project: Mapped["Project"] = relationship()

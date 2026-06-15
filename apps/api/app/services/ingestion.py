@@ -5,6 +5,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import Settings
+from app.crud.graph import create_or_enqueue_graph_event
 from app.crud.job import LostJobLeaseError, fence_job_for_publish, get_job, update_job_progress
 from app.crud.paper import get_paper
 from app.db.models import ChunkElement, PaperChunk, PaperElement, PaperPage
@@ -42,13 +44,19 @@ class IngestionPipeline:
         self,
         parser: DocumentParser | None = None,
         chunker: DocumentChunker | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self.parser = parser or DocumentParser()
         self.chunker = chunker or DocumentChunker()
+        self.settings = settings or Settings.from_environment()
 
     async def process_paper(
-        self, db: Session, paper_id: UUID, job_id: UUID, worker_id: str | None = None
+        self, db: Session, paper_id: UUID | str, job_id: UUID | str, worker_id: str | None = None
     ) -> None:
+        if isinstance(paper_id, str):
+            paper_id = UUID(paper_id)
+        if isinstance(job_id, str):
+            job_id = UUID(job_id)
         paper = get_paper(db, paper_id)
         job = get_job(db, job_id)
         if not paper or not job:
@@ -186,6 +194,13 @@ class IngestionPipeline:
             paper.page_count = len(parse_result.pages)
             paper.status = PaperStatus.READY
             paper.error_message = None
+            if getattr(self.settings, "graphrag_enabled", False):
+                create_or_enqueue_graph_event(
+                    db=db,
+                    project_id=paper.project_id,
+                    paper_id=paper.id,
+                    action="UPSERT",
+                )
             job.status = JobStatus.COMPLETED
             job.stage = JobStage.COMPLETED
             job.progress = 1.0

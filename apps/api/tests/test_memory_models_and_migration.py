@@ -87,7 +87,7 @@ def test_memory_migration_and_cascade_lifecycle():
 
         engine = create_engine(db_url)
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "f1a2b3c4d5e6"
+        assert current_rev in heads
         check_schema_compatibility(engine)
 
         session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)

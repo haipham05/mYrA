@@ -3,12 +3,18 @@ import asyncio
 import logging
 import os
 import signal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from app.config import Settings
+from app.crud.graph import (
+    claim_next_graph_event,
+    release_graph_event,
+    renew_graph_event_lease,
+)
 from app.crud.job import claim_next_job, release_job, renew_job_lease
 from app.db.session import SessionLocal
 from app.logging import configure_logging
+from app.services.graphrag.processor import GraphEventProcessor
 from app.services.ingestion import IngestionPipeline
 
 logger = logging.getLogger("myra.worker")
@@ -30,6 +36,7 @@ async def run_worker(
     logger.info("worker_started", extra={"worker_id": worker_id})
 
     pipeline = IngestionPipeline()
+    processor = GraphEventProcessor(settings=settings)
     running = True
     active_processing_task: asyncio.Task | None = None
 
@@ -40,8 +47,11 @@ async def run_worker(
         if active_processing_task and not active_processing_task.done():
             active_processing_task.cancel()
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
+    try:
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except (ValueError, AttributeError):
+        pass
 
     async def _heartbeat(
         job_id, worker_id: str, processing_task: asyncio.Task, interval: float = 60.0
@@ -52,6 +62,20 @@ async def run_worker(
                 with SessionLocal() as h_db:
                     if not renew_job_lease(h_db, job_id, worker_id=worker_id):
                         logger.warning("job_lease_lost", extra={"job_id": str(job_id)})
+                        processing_task.cancel()
+                        return
+            except Exception:
+                pass
+
+    async def _graph_heartbeat(
+        event_id: UUID, worker_id: str, processing_task: asyncio.Task, interval: float = 60.0
+    ):
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                with SessionLocal() as h_db:
+                    if not renew_graph_event_lease(h_db, event_id, worker_id=worker_id):
+                        logger.warning("graph_event_lease_lost", extra={"event_id": str(event_id)})
                         processing_task.cancel()
                         return
             except Exception:
@@ -85,11 +109,24 @@ async def run_worker(
                     await processing_task
                 except asyncio.CancelledError:
                     db.rollback()
-                    if not running:
+                    current_task = asyncio.current_task()
+                    is_stopping = (not running) or (
+                        current_task is not None
+                        and getattr(current_task, "cancelling", lambda: 0)() > 0
+                    )
+                    if is_stopping:
+                        running = False
                         with SessionLocal() as r_db:
                             release_job(r_db, job.id, worker_id=worker_id)
                         logger.info("released_job_on_shutdown", extra={"job_id": str(job.id)})
+                        raise
                 finally:
+                    if not processing_task.done():
+                        processing_task.cancel()
+                        try:
+                            await processing_task
+                        except asyncio.CancelledError:
+                            pass
                     heartbeat_task.cancel()
                     active_processing_task = None
                     try:
@@ -101,6 +138,68 @@ async def run_worker(
                 if once:
                     break
                 continue
+
+            # If no ingestion job, poll for graph event
+            event = claim_next_graph_event(db, worker_id=worker_id)
+            if event:
+                logger.info(
+                    "claimed_graph_event",
+                    extra={
+                        "event_id": str(event.id),
+                        "paper_id": str(event.paper_id),
+                        "action": event.action,
+                    },
+                )
+                processing_task = asyncio.create_task(
+                    processor.process_graph_event(db, event_id=event.id, worker_id=worker_id)
+                )
+                active_processing_task = processing_task
+                heartbeat_task = asyncio.create_task(
+                    _graph_heartbeat(
+                        event.id,
+                        worker_id=worker_id,
+                        processing_task=processing_task,
+                        interval=heartbeat_interval,
+                    )
+                )
+
+                try:
+                    await processing_task
+                except asyncio.CancelledError:
+                    db.rollback()
+                    current_task = asyncio.current_task()
+                    is_stopping = (not running) or (
+                        current_task is not None
+                        and getattr(current_task, "cancelling", lambda: 0)() > 0
+                    )
+                    if is_stopping:
+                        running = False
+                        with SessionLocal() as r_db:
+                            release_graph_event(r_db, event.id, worker_id=worker_id)
+                        logger.info(
+                            "released_graph_event_on_shutdown",
+                            extra={"event_id": str(event.id)},
+                        )
+                        raise
+                finally:
+                    if not processing_task.done():
+                        processing_task.cancel()
+                        try:
+                            await processing_task
+                        except asyncio.CancelledError:
+                            pass
+                    heartbeat_task.cancel()
+                    active_processing_task = None
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                logger.info("finished_graph_event", extra={"event_id": str(event.id)})
+
+                if once:
+                    break
+                continue
+
         except Exception as err:
             logger.error("worker_loop_error", exc_info=err)
         finally:

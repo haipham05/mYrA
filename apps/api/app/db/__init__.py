@@ -2,6 +2,8 @@ from app.db.base import Base
 from app.db.models import (
     ChunkElement,
     Conversation,
+    GraphEvent,
+    GraphFactSnapshot,
     Job,
     Message,
     Paper,
@@ -16,6 +18,8 @@ __all__ = [
     "Base",
     "ChunkElement",
     "Conversation",
+    "GraphEvent",
+    "GraphFactSnapshot",
     "Job",
     "Message",
     "Paper",
