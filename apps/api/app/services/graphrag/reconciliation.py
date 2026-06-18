@@ -45,7 +45,7 @@ def validate_snapshot_provenance(
         return False
     if not snapshot.document_sha256 or not snapshot.document_sha256.strip():
         return False
-    if paper_sha256 and snapshot.document_sha256 != paper_sha256:
+    if paper_sha256 and snapshot.document_sha256.strip().lower() != paper_sha256.strip().lower():
         return False
     if not snapshot.subject_key or not snapshot.object_key or not snapshot.predicate:
         return False
@@ -286,4 +286,121 @@ def rebuild_paper_graph_from_snapshots(
         "scanned_snapshots": len(snapshots),
         "rejected_snapshots": rejected_count,
         "status": "SUCCESS",
+    }
+
+
+def scoped_rebuild_project_graph(
+    db: Session,
+    repo: Neo4jRepository,
+    project_id: UUID | str,
+    paper_id: UUID | str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Rebuild a project's knowledge graph deterministically from stored PostgreSQL snapshots.
+
+    Guarantees:
+    - Queries papers in project_id (filtered by paper_id if specified).
+    - Checks graph_fact_snapshots in PostgreSQL for each paper.
+    - If NO snapshots exist: records paper in missing_snapshots_papers with notice:
+      "No snapshots retained; requires approved re-extraction".
+    - If snapshots exist:
+      - Rechecks snapshot validity against PostgreSQL paper row (document_sha256).
+        If paper SHA-256 changed or is stale, records stale count and skips stale snapshots.
+      - If not dry_run:
+        Calls rebuild_paper_graph_from_snapshots(
+            db, repo, project_id, paper.id
+        ) with valid snapshots.
+    - Returns:
+      {"project_id": str(project_id), "dry_run": dry_run, "papers_rebuilt": int,
+       "facts_published": int, "missing_snapshots_papers": list[str],
+       "stale_snapshots_count": int}
+    - Invariants:
+      - Recovery is deterministic strictly from PostgreSQL snapshots.
+      - NEVER reads Neo4j as authority.
+      - NEVER mutates PDF storage or paper records in PostgreSQL.
+    """
+    if isinstance(project_id, str):
+        project_id = UUID(project_id)
+    if isinstance(paper_id, str):
+        paper_id = UUID(paper_id)
+
+    if paper_id is not None:
+        paper = db.query(Paper).filter(Paper.id == paper_id, Paper.project_id == project_id).first()
+        if not paper:
+            raise ValueError(f"Paper {paper_id} not found in project {project_id}")
+        papers = [paper]
+    else:
+        papers = (
+            db.query(Paper)
+            .filter(Paper.project_id == project_id)
+            .order_by(Paper.created_at.asc())
+            .all()
+        )
+
+    papers_rebuilt = 0
+    facts_published = 0
+    missing_snapshots_papers: list[str] = []
+    stale_snapshots_count = 0
+
+    for p in papers:
+        snapshots = (
+            db.query(GraphFactSnapshot)
+            .filter(
+                GraphFactSnapshot.project_id == project_id,
+                GraphFactSnapshot.paper_id == p.id,
+            )
+            .all()
+        )
+
+        if not snapshots:
+            missing_snapshots_papers.append(str(p.id))
+            logger.warning(
+                "Paper %s: No snapshots retained; requires approved re-extraction",
+                p.id,
+            )
+            continue
+
+        latest_event = get_latest_completed_graph_event(db, p.id)
+        if latest_event and latest_event.generation_id:
+            target_generation_id = latest_event.generation_id
+        else:
+            latest_snapshot = max(snapshots, key=lambda s: s.created_at)
+            target_generation_id = latest_snapshot.generation_id
+
+        target_snapshots = [s for s in snapshots if s.generation_id == target_generation_id]
+        if not target_snapshots:
+            missing_snapshots_papers.append(str(p.id))
+            logger.warning(
+                "Paper %s: No snapshots retained; requires approved re-extraction",
+                p.id,
+            )
+            continue
+
+        paper_stale_count = 0
+        for s in target_snapshots:
+            if not validate_snapshot_provenance(s, paper_sha256=p.document_sha256):
+                paper_stale_count += 1
+
+        stale_snapshots_count += paper_stale_count
+
+        if not dry_run:
+            rebuild_res = rebuild_paper_graph_from_snapshots(
+                db=db,
+                repo=repo,
+                project_id=project_id,
+                paper_id=p.id,
+                generation_id=target_generation_id,
+            )
+            pub_count = rebuild_res.get("rebuilt_facts_count", 0)
+            facts_published += pub_count
+            if pub_count > 0:
+                papers_rebuilt += 1
+
+    return {
+        "project_id": str(project_id),
+        "dry_run": dry_run,
+        "papers_rebuilt": papers_rebuilt,
+        "facts_published": facts_published,
+        "missing_snapshots_papers": missing_snapshots_papers,
+        "stale_snapshots_count": stale_snapshots_count,
     }

@@ -864,3 +864,66 @@ class Neo4jRepository:
 
         with self._get_session() as session:
             return session.execute_read(_tx_work)
+
+    def get_project_facts(
+        self,
+        project_id: UUID,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        skip: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Retrieve facts within a project with linked subject and object node info.
+
+        Caps pagination at MAX_PAGE_LIMIT and strictly isolates by project_id.
+        """
+        safe_limit = max(1, min(limit, MAX_PAGE_LIMIT))
+        safe_skip = max(0, skip)
+        pid_str = str(project_id)
+
+        cypher = """
+        MATCH (s:Node {project_id: $project_id})<-[:SUBJECT]-
+              (f:Fact {project_id: $project_id})-[:OBJECT]->
+              (o:Node {project_id: $project_id})
+        RETURN f.id AS fact_id,
+               f.project_id AS project_id,
+               f.paper_id AS paper_id,
+               f.generation_id AS generation_id,
+               f.predicate AS predicate,
+               f.qualifiers_json AS qualifiers_json,
+               f.char_start AS char_start,
+               f.char_end AS char_end,
+               f.page_number AS page_number,
+               f.exact_quote AS exact_quote,
+               f.updated_at AS updated_at,
+               s.key AS subject_key,
+               s.name AS subject_name,
+               s.type AS subject_type,
+               o.key AS object_key,
+               o.name AS object_name,
+               o.type AS object_type
+        ORDER BY f.id ASC
+        SKIP $skip
+        LIMIT $limit
+        """
+        params = {
+            "project_id": pid_str,
+            "skip": safe_skip,
+            "limit": safe_limit,
+        }
+
+        def _tx_work(tx) -> list[dict[str, Any]]:
+            result = tx.run(cypher, params)
+            records: list[dict[str, Any]] = []
+            for row in result:
+                data = dict(row)
+                qualifiers = None
+                if data.get("qualifiers_json"):
+                    try:
+                        qualifiers = json.loads(data["qualifiers_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        qualifiers = None
+                data["qualifiers"] = qualifiers
+                records.append(data)
+            return records
+
+        with self._get_session() as session:
+            return session.execute_read(_tx_work)

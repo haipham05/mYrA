@@ -14,6 +14,7 @@ from app.services.graphrag.identity import (
     generate_entity_key,
     generate_fact_id,
 )
+from app.services.graphrag.indexing import enqueue_existing_papers_for_graph
 from app.services.graphrag.input_selector import (
     ExtractionEvidenceItem,
     select_extraction_inputs,
@@ -21,9 +22,15 @@ from app.services.graphrag.input_selector import (
 from app.services.graphrag.neo4j_repository import Neo4jRepository
 from app.services.graphrag.processor import GraphEventProcessor
 from app.services.graphrag.provenance import resolve_graph_source_anchor
+from app.services.graphrag.query_engine import (
+    build_contradiction_candidates,
+    build_corpus_themes,
+    build_relationship_candidates,
+)
 from app.services.graphrag.reconciliation import (
     rebuild_paper_graph_from_snapshots,
     reconcile_graph_drift,
+    scoped_rebuild_project_graph,
 )
 from app.services.graphrag.snapshots import (
     get_verified_fact_snapshots,
@@ -39,7 +46,11 @@ __all__ = [
     "GraphExtractionError",
     "GraphExtractionTimeoutError",
     "Neo4jRepository",
+    "build_contradiction_candidates",
+    "build_corpus_themes",
+    "build_relationship_candidates",
     "canonicalize_name",
+    "enqueue_existing_papers_for_graph",
     "generate_entity_key",
     "generate_fact_id",
     "get_verified_fact_snapshots",
@@ -48,6 +59,7 @@ __all__ = [
     "rebuild_paper_graph_from_snapshots",
     "reconcile_graph_drift",
     "resolve_graph_source_anchor",
+    "scoped_rebuild_project_graph",
     "select_extraction_inputs",
     "verify_candidate_fact",
 ]

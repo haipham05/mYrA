@@ -4,8 +4,7 @@ Decoupled from paper ingestion; maintains strict failure isolation where
 graph failures NEVER modify or fail the authoritative Paper record.
 """
 
-from __future__ import annotations
-
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -20,8 +19,19 @@ from app.crud.graph import (
     fail_graph_event,
     get_graph_event,
 )
-from app.db.models import GraphFactSnapshot, Paper
+from app.db.models import GraphEvent, Paper
+from app.services.graphrag.extractor import (
+    ExtractionResult,
+    GraphExtractionAdapter,
+    parse_and_validate_extraction,
+)
+from app.services.graphrag.input_selector import select_extraction_inputs
 from app.services.graphrag.neo4j_repository import Neo4jRepository
+from app.services.graphrag.snapshots import (
+    get_verified_fact_snapshots,
+    persist_verified_fact_snapshots,
+)
+from app.services.graphrag.verifier import verify_candidate_fact
 
 logger = logging.getLogger("myra.graphrag.processor")
 
@@ -33,6 +43,7 @@ class GraphEventProcessor:
         self,
         settings: Settings | None = None,
         repo: Neo4jRepository | None = None,
+        extractor: Any | None = None,
     ) -> None:
         self.settings = settings or Settings.from_environment()
         self.repo = repo
@@ -42,6 +53,17 @@ class GraphEventProcessor:
             except Exception as exc:
                 logger.warning("Could not initialize Neo4jRepository: %s", exc)
                 self.repo = None
+
+        self.extractor = extractor
+        if self.extractor is None:
+            try:
+                from app.services.llm import get_llm_provider
+
+                llm = get_llm_provider(self.settings)
+                self.extractor = GraphExtractionAdapter(llm_provider=llm)
+            except Exception as exc:
+                logger.warning("Could not initialize GraphExtractionAdapter: %s", exc)
+                self.extractor = None
 
     async def process_graph_event(
         self,
@@ -133,51 +155,162 @@ class GraphEventProcessor:
                     )
                     return
 
-                # If snapshots exist, publish them to Neo4j
-                snapshots = list(event.snapshots) if event.snapshots else []
+                project_id = UUID(str(event.project_id))
+                paper_id = UUID(str(event.paper_id))
+
+                # Retrieve existing snapshots
+                snapshots = get_verified_fact_snapshots(
+                    db=db,
+                    paper_id=paper_id,
+                    generation_id=event.generation_id,
+                )
+
                 if not snapshots:
-                    snapshots = (
-                        db.query(GraphFactSnapshot)
-                        .filter(
-                            GraphFactSnapshot.project_id == event.project_id,
-                            GraphFactSnapshot.paper_id == event.paper_id,
-                            GraphFactSnapshot.generation_id == event.generation_id,
+                    evidence_items = select_extraction_inputs(
+                        db=db,
+                        project_id=project_id,
+                        paper_id=paper_id,
+                    )
+                    if not evidence_items:
+                        complete_graph_event(db, event.id, worker_id=worker_id)
+                        logger.info(
+                            "Completed UPSERT graph event %s (no evidence items to extract)",
+                            event.id,
                         )
-                        .all()
-                    )
+                        return
 
-                if snapshots and self.repo is not None:
-                    fact_payloads: list[dict[str, Any]] = [
-                        {
-                            "fact_id": s.fact_id,
-                            "subject_key": s.subject_key,
-                            "subject_name": s.subject_name,
-                            "subject_type": s.subject_type,
-                            "predicate": s.predicate,
-                            "object_key": s.object_key,
-                            "object_name": s.object_name,
-                            "object_type": s.object_type,
-                            "qualifiers": s.qualifiers,
-                            "char_start": s.char_start,
-                            "char_end": s.char_end,
-                            "page_number": s.page_number,
-                            "exact_quote": s.exact_quote,
-                        }
-                        for s in snapshots
-                    ]
-                    self.repo.upsert_facts(
-                        project_id=event.project_id,
-                        paper_id=event.paper_id,
+                    if self.extractor is None:
+                        raise RuntimeError("Graph extractor is not configured")
+
+                    raw_result = await self.extractor.extract(
+                        project_id,
+                        paper_id,
+                        evidence_items,
+                    )
+                    if isinstance(raw_result, ExtractionResult):
+                        extraction_result = raw_result
+                    elif isinstance(raw_result, str):
+                        extraction_result = parse_and_validate_extraction(
+                            raw_result,
+                            project_id,
+                            paper_id,
+                            evidence_items,
+                        )
+                    elif isinstance(raw_result, (dict, list)):
+                        extraction_result = parse_and_validate_extraction(
+                            json.dumps(raw_result),
+                            project_id,
+                            paper_id,
+                            evidence_items,
+                        )
+                    else:
+                        extraction_result = parse_and_validate_extraction(
+                            str(raw_result),
+                            project_id,
+                            paper_id,
+                            evidence_items,
+                        )
+
+                    valid_candidates = []
+                    for candidate in extraction_result.accepted_facts:
+                        is_valid, _ = verify_candidate_fact(db, project_id, candidate)
+                        if is_valid:
+                            valid_candidates.append(candidate)
+
+                    snapshots = persist_verified_fact_snapshots(
+                        db=db,
+                        project_id=project_id,
+                        paper_id=paper_id,
                         generation_id=event.generation_id,
-                        facts=fact_payloads,
+                        event_id=event.id,
+                        verified_candidates=valid_candidates,
+                        ontology_version=event.ontology_version or "1.0.0",
                     )
-                    self.repo.retire_older_generations(
-                        project_id=event.project_id,
-                        paper_id=event.paper_id,
-                        active_generation_id=event.generation_id,
-                    )
+                    # Commit db transaction so snapshots are durably stored in PostgreSQL
+                    # BEFORE touching Neo4j!
+                    db.commit()
 
-                # Complete event
+                # Current Generation Check:
+                # Query graph_events for any newer completed event for this paper.
+                # If a newer generation was already completed, do NOT retire the newer graph!
+                # Complete the event without retiring the newer generation.
+                newer_completed_event = None
+                if event.created_at is not None:
+                    newer_completed_event = (
+                        db.query(GraphEvent)
+                        .filter(
+                            GraphEvent.paper_id == paper_id,
+                            GraphEvent.status == "COMPLETED",
+                            GraphEvent.id != event.id,
+                            GraphEvent.created_at > event.created_at,
+                        )
+                        .first()
+                    )
+                is_latest_generation = newer_completed_event is None
+
+                # Publish to Neo4j (if self.repo is configured/present)
+                if self.repo is not None:
+                    if snapshots:
+                        nodes_by_key: dict[str, dict[str, Any]] = {}
+                        for s in snapshots:
+                            s_name = s.subject_name or s.subject_key
+                            s_type = s.subject_type or "Concept"
+                            if s.subject_key not in nodes_by_key:
+                                nodes_by_key[s.subject_key] = {
+                                    "key": s.subject_key,
+                                    "name": s_name,
+                                    "type": s_type,
+                                }
+                            o_name = s.object_name or s.object_key
+                            o_type = s.object_type or "Concept"
+                            if s.object_key not in nodes_by_key:
+                                nodes_by_key[s.object_key] = {
+                                    "key": s.object_key,
+                                    "name": o_name,
+                                    "type": o_type,
+                                }
+                        nodes = list(nodes_by_key.values())
+
+                        facts = [
+                            {
+                                "id": s.fact_id,
+                                "fact_id": s.fact_id,
+                                "subject_key": s.subject_key,
+                                "subject_name": s.subject_name or s.subject_key,
+                                "subject_type": s.subject_type or "Concept",
+                                "object_key": s.object_key,
+                                "object_name": s.object_name or s.object_key,
+                                "object_type": s.object_type or "Concept",
+                                "predicate": s.predicate,
+                                "qualifiers_json": (
+                                    json.dumps(s.qualifiers)
+                                    if s.qualifiers and not isinstance(s.qualifiers, str)
+                                    else (s.qualifiers if isinstance(s.qualifiers, str) else None)
+                                ),
+                                "char_start": s.char_start,
+                                "char_end": s.char_end,
+                                "page_number": s.page_number,
+                                "exact_quote": s.exact_quote,
+                            }
+                            for s in snapshots
+                        ]
+
+                        self.repo.upsert_nodes(project_id, nodes)
+                        self.repo.upsert_facts(
+                            project_id,
+                            paper_id,
+                            event.generation_id,
+                            facts,
+                        )
+
+                    if is_latest_generation:
+                        self.repo.retire_older_generations(
+                            project_id,
+                            paper_id,
+                            event.generation_id,
+                        )
+
+                # Checkpoint in PostgreSQL
                 complete_graph_event(db, event.id, worker_id=worker_id)
                 logger.info("Completed UPSERT graph event %s", event.id)
                 return
@@ -197,6 +330,7 @@ class GraphEventProcessor:
             logger.warning("Worker %s lost lease for graph event %s", worker_id, event_id)
             return
         except Exception as exc:
+            db.rollback()
             logger.error("Error processing graph event %s", event_id, exc_info=exc)
             exc_str = str(exc).lower()
             is_transient = True
@@ -216,7 +350,7 @@ class GraphEventProcessor:
 
             fail_graph_event(
                 db=db,
-                event_id=event.id,
+                event_id=event.id if "event" in locals() and event else event_id,
                 worker_id=worker_id,
                 error_code=error_code,
                 error_message=str(exc),
