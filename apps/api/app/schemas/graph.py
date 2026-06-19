@@ -17,6 +17,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.schemas.evidence import AnchorStatus, Citation
+
 
 class EntityType(StrEnum):
     """Allowlisted entity types in the core GraphRAG ontology."""
@@ -477,3 +479,90 @@ class GraphExtractionBatch(BaseModel):
         max_length=100,
         description="Extracted fact candidates (max 100).",
     )
+
+
+class GraphStatusResponse(BaseModel):
+    project_id: UUID
+    graphrag_enabled: bool
+    neo4j_available: bool
+    node_count: int = 0
+    fact_count: int = 0
+    pending_events_count: int = 0
+    completed_events_count: int = 0
+    failed_events_count: int = 0
+
+
+class GraphNodeResponse(BaseModel):
+    key: str
+    project_id: UUID
+    name: str
+    type: str
+    description: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
+
+
+class GraphNodeListResponse(BaseModel):
+    items: list[GraphNodeResponse]
+    total: int
+    limit: int
+    skip: int
+
+
+class GraphNeighborResponse(BaseModel):
+    neighbor_key: str
+    neighbor_name: str
+    neighbor_type: str
+    direction: str
+    predicate: str
+    fact_id: str
+    qualifiers: dict[str, Any] | None = None
+
+
+class GraphNeighborListResponse(BaseModel):
+    node_key: str
+    neighbors: list[GraphNeighborResponse]
+    total: int
+
+
+class GraphFactDetailResponse(BaseModel):
+    id: str
+    project_id: UUID
+    paper_id: UUID
+    paper_title: str | None = None
+    generation_id: str
+    predicate: str
+    subject_key: str
+    subject_name: str
+    subject_type: str
+    object_key: str
+    object_name: str
+    object_type: str
+    qualifiers: dict[str, Any] | None = None
+    exact_quote: str
+    page_number: int
+    char_start: int
+    char_end: int
+    document_sha256: str
+    updated_at: str | None = None
+    citation: Citation | None = None
+    anchor_status: AnchorStatus = AnchorStatus.UNRESOLVED
+
+
+class GraphRelationshipResponse(BaseModel):
+    items: list[GraphFactDetailResponse]
+    total: int
+
+
+class GraphIndexRequest(BaseModel):
+    paper_ids: list[UUID] | None = None
+    limit: int = 10
+    dry_run: bool = True
+
+
+class GraphIndexResponse(BaseModel):
+    dry_run: bool
+    eligible_paper_ids: list[UUID]
+    enqueued_count: int
+    skipped_count: int
+    target_project_id: UUID

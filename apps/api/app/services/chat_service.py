@@ -5,11 +5,18 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.config import Settings
 from app.crud.chat import add_message, get_conversation
 from app.db.models import Memory, Message
 from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import AnchorStatus, Citation, CitationAnchor, EvidenceItem
 from app.schemas.memory import MemoryStatus, MemoryType
+from app.services.graphrag.neo4j_repository import Neo4jRepository
+from app.services.graphrag.router import (
+    GraphIntent,
+    retrieve_graph_evidence,
+    route_query_intent,
+)
 from app.services.llm import get_llm_provider
 from app.services.memory_service import (
     capture_conversation_memories,
@@ -438,8 +445,21 @@ class ChatService:
     def __init__(
         self,
         retriever: HybridRetriever | None = None,
+        graph_repo: Neo4jRepository | None = None,
     ) -> None:
         self.retriever = retriever or HybridRetriever()
+        if graph_repo is not None:
+            self.graph_repo = graph_repo
+        else:
+            settings = Settings.from_environment()
+            if settings.graphrag_enabled:
+                try:
+                    self.graph_repo = Neo4jRepository.from_settings(settings)
+                except Exception as exc:
+                    logger.warning("Failed to initialize Neo4jRepository: %s", exc)
+                    self.graph_repo = None
+            else:
+                self.graph_repo = None
 
     async def answer_question(
         self,
@@ -453,6 +473,7 @@ class ChatService:
             raise ValueError(f"Conversation {conversation_id} not found")
 
         project_id = conv.project_id
+        intent = route_query_intent(question)
 
         # 1. Save user message if not an immediate duplicate of prior unanswered message
         last_msg = (
@@ -536,6 +557,23 @@ class ChatService:
                     )
                     evidence_items.append(resolved_evidence)
 
+        # 2c. Retrieve graph evidence
+        graph_evidence_items, graph_notice = retrieve_graph_evidence(
+            db=db,
+            repo=self.graph_repo,
+            project_id=project_id,
+            query=question,
+            intent=intent,
+        )
+        for g_item in graph_evidence_items:
+            norm_q = g_item.quote.strip().lower()
+            if norm_q in existing_evidence_quotes:
+                continue
+            existing_evidence_quotes.add(norm_q)
+            new_id = f"E{len(evidence_items) + 1}"
+            g_item.id = new_id
+            evidence_items.append(g_item)
+
         evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
         memory_block = format_memories_for_prompt(
             decision_preference_memories, db=db, include_paper_facts=False
@@ -573,6 +611,22 @@ class ChatService:
             "to answer, state that evidence is insufficient."
         )
 
+        if intent == GraphIntent.CONTRADICTION:
+            system_prompt += (
+                "\n\nCONTRADICTION ANALYSIS:\n"
+                "- When differing results or conflicting claims are present in the evidence, "
+                "present each side as its own source-supported statement with its own citation "
+                "(e.g. 'Paper A reports ... [E1], whereas Paper B observes ... [E2]').\n"
+                "- Do not merge conflicting claims into a single synthetic sentence without "
+                "individual citations.\n"
+                "- If the evidence does not contain conflicting or opposing claims on the "
+                "specified topic, clearly state that no direct contradictions were found in "
+                "the current evidence."
+            )
+
+        if graph_notice and intent != GraphIntent.FACTUAL:
+            system_prompt += f"\n\n[NOTE: {graph_notice}]"
+
         evidence_text_parts = []
         for e in evidence_items:
             title = e.paper_title or "Paper"
@@ -589,6 +643,8 @@ class ChatService:
             if evidence_text_parts
             else "No relevant evidence found."
         )
+        if graph_notice and intent != GraphIntent.FACTUAL:
+            evidence_block = f"[NOTE: {graph_notice}]\n\n{evidence_block}"
 
         prompt_parts = []
         if memory_block:
@@ -751,3 +807,5 @@ class ChatService:
             token_count=assistant_msg.token_count,
             created_at=assistant_msg.created_at,
         )
+
+    answer = answer_question
