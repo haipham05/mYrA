@@ -162,3 +162,90 @@ export interface Memory {
   sources: MemorySource[];
   history: MemoryAudit[];
 }
+
+export type EntityType =
+  | "Paper"
+  | "Author"
+  | "Institution"
+  | "Task"
+  | "Method"
+  | "Model"
+  | "Dataset"
+  | "Metric"
+  | "Result"
+  | "Claim"
+  | "Limitation"
+  | "Concept";
+
+export type RelationshipPredicate =
+  | "EVALUATED_ON"
+  | "ACHIEVES_RESULT"
+  | "PROPOSES_METHOD"
+  | "USES_MODEL"
+  | "CONTRADICTS"
+  | "EXTENDS"
+  | "AUTHORED_BY"
+  | "AFFILIATED_WITH";
+
+export interface GraphNode {
+  key: string;
+  project_id: string;
+  name: string;
+  type: string;
+  description?: string | null;
+  aliases: string[];
+  updated_at?: string | null;
+}
+
+export interface GraphNeighbor {
+  neighbor_key: string;
+  neighbor_name: string;
+  neighbor_type: string;
+  direction: "OUTGOING" | "INCOMING" | "BOTH";
+  predicate: string;
+  fact_id: string;
+  qualifiers?: Record<string, unknown> | null;
+}
+
+export interface GraphFactDetail {
+  id: string;
+  project_id: string;
+  paper_id: string;
+  paper_title?: string | null;
+  generation_id: string;
+  predicate: string;
+  subject_key: string;
+  subject_name: string;
+  subject_type: string;
+  object_key: string;
+  object_name: string;
+  object_type: string;
+  qualifiers?: Record<string, unknown> | null;
+  exact_quote: string;
+  page_number: number;
+  char_start: number;
+  char_end: number;
+  document_sha256: string;
+  updated_at?: string | null;
+  citation?: Citation | null;
+  anchor_status: AnchorStatus;
+}
+
+export interface GraphStatus {
+  project_id: string;
+  graphrag_enabled: boolean;
+  neo4j_available: boolean;
+  node_count: number;
+  fact_count: number;
+  pending_events_count: number;
+  completed_events_count: number;
+  failed_events_count: number;
+}
+
+export interface GraphIndexResponse {
+  dry_run: boolean;
+  eligible_paper_ids: string[];
+  enqueued_count: number;
+  skipped_count: number;
+  target_project_id: string;
+}

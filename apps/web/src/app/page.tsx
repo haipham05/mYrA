@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import ChatPanel from "@/components/ChatPanel";
 import MemoryInspector from "@/components/MemoryInspector";
 import PaperUploader from "@/components/PaperUploader";
@@ -65,7 +66,15 @@ export default function Home() {
           const items: Project[] = data.items || [];
           setProjects(items);
           if (items.length > 0) {
-            setSelectedProject((current) => current || items[0]);
+            let matchedProj: Project | undefined;
+            if (typeof window !== "undefined") {
+              const params = new URLSearchParams(window.location.search);
+              const targetProjId = params.get("project");
+              if (targetProjId) {
+                matchedProj = items.find((p) => p.id === targetProjId);
+              }
+            }
+            setSelectedProject((current) => current || matchedProj || items[0]);
           }
         }
       } catch {
@@ -99,13 +108,55 @@ export default function Home() {
           const items: Paper[] = pData.items || [];
           setPapers(items);
           if (items.length > 0) {
-            setSelectedPaper(items[0]);
+            let matchedPaper: Paper | undefined;
+            if (typeof window !== "undefined") {
+              const params = new URLSearchParams(window.location.search);
+              const targetPaperId = params.get("paper");
+              if (targetPaperId) {
+                matchedPaper = items.find((p) => p.id === targetPaperId);
+              }
+            }
+            setSelectedPaper(matchedPaper || items[0]);
           } else {
             setSelectedPaper(null);
           }
         } else if (!ignore) {
           setPapers([]);
           setSelectedPaper(null);
+        }
+
+        // Check for fact deep link
+        if (typeof window !== "undefined" && selectedProject?.id) {
+          const params = new URLSearchParams(window.location.search);
+          const targetFactId = params.get("fact");
+          const targetPageNum = params.get("page");
+          if (targetFactId) {
+            fetch(
+              `${apiUrl}/api/v1/projects/${selectedProject.id}/graph/facts/${targetFactId}`,
+            )
+              .then((res) => (res.ok ? res.json() : null))
+              .then((fact) => {
+                if (!ignore && fact) {
+                  if (fact.citation) {
+                    setActiveCitation(fact.citation);
+                  } else if (fact.exact_quote) {
+                    setActiveCitation({
+                      citation_index: 1,
+                      evidence_id: `graph-fact-${fact.id}`,
+                      paper_id: fact.paper_id,
+                      page_number:
+                        fact.page_number ||
+                        (targetPageNum ? parseInt(targetPageNum, 10) : 1),
+                      bounding_boxes: [],
+                      quote: fact.exact_quote,
+                      document_sha256: fact.document_sha256,
+                      anchor_status: fact.anchor_status || "unresolved",
+                    });
+                  }
+                }
+              })
+              .catch(() => {});
+          }
         }
 
         // Restore conversations for project
@@ -469,6 +520,15 @@ export default function Home() {
                 Project Memory
               </button>
             </div>
+
+            {selectedProject && (
+              <Link
+                href={`/projects/${selectedProject.id}/graph`}
+                className="px-3 py-1.5 text-xs font-medium rounded-md transition text-zinc-600 hover:text-zinc-900 border border-zinc-200 bg-white hover:bg-zinc-50 shadow-2xs"
+              >
+                Graph Explorer
+              </Link>
+            )}
 
             <ProjectSelector
               projects={projects}
