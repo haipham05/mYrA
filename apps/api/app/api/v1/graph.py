@@ -289,9 +289,17 @@ def search_graph_nodes(
         for n in nodes
     ]
 
+    total = len(items)
+    if not query and not entity_type:
+        try:
+            counts = repo.count_project_elements(project_id)
+            total = counts.get("node_count", len(items))
+        except Exception:
+            total = len(items)
+
     return GraphNodeListResponse(
         items=items,
-        total=len(items),
+        total=total,
         limit=limit,
         skip=skip,
     )

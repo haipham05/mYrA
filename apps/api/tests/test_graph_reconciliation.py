@@ -4,7 +4,6 @@ multi-paper isolation, and snapshot rebuilds (Task 5.13).
 
 from __future__ import annotations
 
-import socket
 from collections.abc import Generator
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
@@ -12,7 +11,6 @@ from uuid import UUID, uuid4
 
 import pytest
 from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable
 
 from app.crud.graph import (
     claim_next_graph_event,
@@ -33,32 +31,6 @@ from app.services.graphrag.reconciliation import (
 )
 
 
-def is_neo4j_available() -> bool:
-    """Check if Neo4j is listening on localhost:7687 and can be reached."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
-    try:
-        sock.connect(("127.0.0.1", 7687))
-        sock.close()
-    except OSError:
-        return False
-
-    try:
-        d = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=None)
-        d.verify_connectivity()
-        d.close()
-        return True
-    except (ServiceUnavailable, Exception):
-        return False
-
-
-NEO4J_AVAILABLE = is_neo4j_available()
-skip_if_no_neo4j = pytest.mark.skipif(
-    not NEO4J_AVAILABLE,
-    reason="Local Neo4j service not available on bolt://127.0.0.1:7687",
-)
-
-
 @pytest.fixture(autouse=True)
 def clean_database():
     """Ensure clean PostgreSQL tables before each test."""
@@ -73,12 +45,10 @@ def clean_database():
 
 
 @pytest.fixture
-def real_repo() -> Generator[Neo4jRepository, None, None]:
-    """Provide a real Neo4jRepository connected to local Neo4j."""
-    if not NEO4J_AVAILABLE:
-        pytest.skip("Local Neo4j service not available")
-
-    driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=None)
+def real_repo(disposable_neo4j_uri: str) -> Generator[Neo4jRepository, None, None]:
+    """Connect only to the explicitly acknowledged disposable test target."""
+    driver = GraphDatabase.driver(disposable_neo4j_uri, auth=None)
+    driver.verify_connectivity()
     repo = Neo4jRepository(driver=driver, database="neo4j")
     repo.ensure_schema()
     yield repo
@@ -130,7 +100,6 @@ def _create_snapshot(
 # =============================================================================
 
 
-@skip_if_no_neo4j
 @pytest.mark.anyio
 async def test_active_generation_retirement(real_repo: Neo4jRepository) -> None:
     """Test 1: Active generation retirement: Upsert gen 1 facts, then upsert gen 2 facts.
@@ -237,7 +206,6 @@ async def test_active_generation_retirement(real_repo: Neo4jRepository) -> None:
 # =============================================================================
 
 
-@skip_if_no_neo4j
 @pytest.mark.anyio
 async def test_multi_paper_isolation(real_repo: Neo4jRepository) -> None:
     """Test 2: Multi-paper isolation: Two papers in the same project have facts in Neo4j.
@@ -345,7 +313,6 @@ async def test_multi_paper_isolation(real_repo: Neo4jRepository) -> None:
 # =============================================================================
 
 
-@skip_if_no_neo4j
 def test_reconciliation_sweep_detects_absent_papers(real_repo: Neo4jRepository) -> None:
     """Test 3: Reconciliation sweep detects absent papers: Paper facts exist in Neo4j for a paper
     deleted from PostgreSQL. `reconcile_graph_drift` cleans up the orphaned paper facts from Neo4j.
@@ -457,7 +424,6 @@ def test_reconciliation_sweep_detects_absent_papers(real_repo: Neo4jRepository) 
 # =============================================================================
 
 
-@skip_if_no_neo4j
 def test_rebuild_from_snapshots(real_repo: Neo4jRepository) -> None:
     """Test 4: Rebuild from snapshots: Drops paper facts in Neo4j, replays PostgreSQL snapshots,
     and confirms exact facts and nodes are restored.

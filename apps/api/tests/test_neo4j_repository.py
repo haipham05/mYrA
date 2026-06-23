@@ -9,7 +9,7 @@ Covers:
    - Direction validation
    - Rollback on exception in managed transaction
 
-2. Integration Tests (Local Neo4j at bolt://127.0.0.1:7687):
+2. Integration Tests (explicit disposable test Neo4j target only):
    - ensure_schema constraint and index idempotency
    - Duplicate MERGE idempotency (nodes and facts)
    - Cross-project isolation (same name in Project A vs B creates distinct nodes)
@@ -22,7 +22,6 @@ Covers:
 
 from __future__ import annotations
 
-import socket
 from collections.abc import Generator
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -270,46 +269,17 @@ def test_empty_inputs_short_circuit() -> None:
 # =============================================================================
 
 
-def is_neo4j_available() -> bool:
-    """Check if Neo4j is listening on localhost:7687 and can be reached."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
-    try:
-        sock.connect(("127.0.0.1", 7687))
-        sock.close()
-    except OSError:
-        return False
-
-    try:
-        d = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=None)
-        d.verify_connectivity()
-        d.close()
-        return True
-    except (ServiceUnavailable, Exception):
-        return False
-
-
-NEO4J_AVAILABLE = is_neo4j_available()
-skip_if_no_neo4j = pytest.mark.skipif(
-    not NEO4J_AVAILABLE,
-    reason="Local Neo4j service not available on bolt://127.0.0.1:7687",
-)
-
-
 @pytest.fixture
-def real_repo() -> Generator[Neo4jRepository, None, None]:
-    """Provide a real Neo4jRepository connected to local Neo4j."""
-    if not NEO4J_AVAILABLE:
-        pytest.skip("Local Neo4j service not available")
-
-    driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=None)
+def real_repo(disposable_neo4j_uri: str) -> Generator[Neo4jRepository, None, None]:
+    """Connect only to the explicitly acknowledged disposable test target."""
+    driver = GraphDatabase.driver(disposable_neo4j_uri, auth=None)
+    driver.verify_connectivity()
     repo = Neo4jRepository(driver=driver, database="neo4j")
     repo.ensure_schema()
     yield repo
     driver.close()
 
 
-@skip_if_no_neo4j
 def test_ensure_schema_idempotency(real_repo: Neo4jRepository) -> None:
     """ensure_schema creates constraints and indexes and is safely repeatable."""
     real_repo.ensure_schema()
@@ -329,7 +299,6 @@ def test_ensure_schema_idempotency(real_repo: Neo4jRepository) -> None:
         assert "fact_project_id" in index_names
 
 
-@skip_if_no_neo4j
 def test_duplicate_merge_idempotency(real_repo: Neo4jRepository) -> None:
     """Repeatedly upserting identical nodes and facts yields the exact same counts."""
     project_id = uuid4()
@@ -394,7 +363,6 @@ def test_duplicate_merge_idempotency(real_repo: Neo4jRepository) -> None:
         real_repo.delete_project_graph(project_id)
 
 
-@skip_if_no_neo4j
 def test_cross_project_isolation(real_repo: Neo4jRepository) -> None:
     """Two projects with identical entity name produce separate nodes;
 
@@ -435,7 +403,6 @@ def test_cross_project_isolation(real_repo: Neo4jRepository) -> None:
         real_repo.delete_project_graph(proj_b)
 
 
-@skip_if_no_neo4j
 def test_neighbor_traversal_and_filtering(real_repo: Neo4jRepository) -> None:
     """Verify one-hop neighbor traversal with OUTGOING, INCOMING, BOTH and predicate filter."""
     project_id = uuid4()
@@ -535,7 +502,6 @@ def test_neighbor_traversal_and_filtering(real_repo: Neo4jRepository) -> None:
         real_repo.delete_project_graph(project_id)
 
 
-@skip_if_no_neo4j
 def test_generation_retirement_and_paper_deletion(real_repo: Neo4jRepository) -> None:
     """Verify retiring older generations detaches old facts while keeping active ones."""
     project_id = uuid4()
@@ -604,7 +570,6 @@ def test_generation_retirement_and_paper_deletion(real_repo: Neo4jRepository) ->
         real_repo.delete_project_graph(project_id)
 
 
-@skip_if_no_neo4j
 def test_delete_project_graph_cleanup(real_repo: Neo4jRepository) -> None:
     """delete_project_graph removes all facts and nodes belonging to that project."""
     project_id = uuid4()
@@ -626,7 +591,6 @@ def test_delete_project_graph_cleanup(real_repo: Neo4jRepository) -> None:
     assert counts_after["facts"] == 0
 
 
-@skip_if_no_neo4j
 def test_upsert_from_dict_and_qualifiers_parsing(real_repo: Neo4jRepository) -> None:
     """Verify upserting nodes and facts using dict representations with nested and flat forms."""
     project_id = uuid4()

@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState, useCallback, useTransition } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import PdfViewer from "@/components/PdfViewer";
 import {
   fetchFactDetail,
   fetchGraphStatus,
+  fetchNodeDetail,
   fetchNodeNeighbors,
   searchGraphNodes,
   triggerGraphIndex,
@@ -58,7 +59,6 @@ export default function GraphExplorer({
   const [viewMode, setViewMode] = useState<"visual" | "list">("visual");
   const [searchQuery, setSearchQuery] = useState("");
   const [entityTypeFilter, setEntityTypeFilter] = useState<string>("");
-  const [, startTransition] = useTransition();
 
   // Nodes & pagination
   const [nodes, setNodes] = useState<GraphNode[]>([]);
@@ -238,7 +238,15 @@ export default function GraphExplorer({
         const res = await fetchNodeNeighbors(apiUrl, projectId, nodeKey);
         if (!ignore) {
           const match = nodes.find((n) => n.key === nodeKey);
-          if (match) setSelectedNode(match);
+          if (match) {
+            setSelectedNode(match);
+          } else {
+            fetchNodeDetail(apiUrl, projectId, nodeKey)
+              .then((node) => {
+                if (!ignore) setSelectedNode(node);
+              })
+              .catch(() => {});
+          }
           setSelectedNodeKey(nodeKey);
           setNeighbors(res.neighbors || []);
         }
@@ -490,9 +498,6 @@ export default function GraphExplorer({
                 const val = e.target.value;
                 setSearchQuery(val);
                 setSkip(0);
-                startTransition(() => {
-                  loadNodes(val, entityTypeFilter, 0);
-                });
               }}
               placeholder="Search entities by name..."
               aria-label="Search entities"
@@ -515,7 +520,6 @@ export default function GraphExplorer({
                 const val = e.target.value;
                 setEntityTypeFilter(val);
                 setSkip(0);
-                loadNodes(searchQuery, val, 0);
               }}
               aria-label="Filter by entity type"
               className="rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-xs text-zinc-900 focus:border-zinc-900 focus:outline-hidden"
@@ -658,7 +662,10 @@ export default function GraphExplorer({
                   <button
                     type="button"
                     onClick={() => setSkip((s) => s + limit)}
-                    disabled={skip + limit >= totalNodes}
+                    disabled={
+                      nodes.length < limit ||
+                      (totalNodes > 0 && skip + limit >= totalNodes)
+                    }
                     className="rounded border border-zinc-300 bg-white px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 transition"
                   >
                     Next
