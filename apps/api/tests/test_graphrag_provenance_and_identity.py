@@ -32,7 +32,7 @@ from tests.fixtures.graphrag.corpus_fixtures import (
 )
 
 from app.db.base import Base
-from app.db.models import Paper, PaperChunk, PaperElement, PaperPage
+from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
 from app.schemas.evidence import AnchorStatus, CitationAnchor
 from app.schemas.graph import (
     EntityType,
@@ -317,6 +317,60 @@ def test_quote_outside_page_text_returns_unresolved(db_session: Session):
     assert anchor is None
 
 
+def test_chunk_link_does_not_verify_quote_absent_from_linked_element(db_session: Session):
+    paper = db_session.query(Paper).filter(Paper.id == PAPER_A1_ID).one()
+    quote = "Supported by page text and chunk only."
+    page = PaperPage(
+        id=uuid4(),
+        paper_id=paper.id,
+        page_number=98,
+        width=612,
+        height=792,
+        raw_text=quote,
+    )
+    element = PaperElement(
+        id=uuid4(),
+        paper_id=paper.id,
+        page_number=98,
+        element_index=998,
+        element_type="paragraph",
+        text="Different text in linked element",
+    )
+    chunk = PaperChunk(
+        id=uuid4(),
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=887,
+        text=quote,
+    )
+    link = ChunkElement(
+        id=uuid4(),
+        chunk_id=chunk.id,
+        element_id=element.id,
+        order_index=0,
+    )
+    db_session.add_all([page, element, chunk, link])
+    db_session.commit()
+
+    anchor, status = resolve_graph_source_anchor(
+        db=db_session,
+        project_id=PROJECT_A_ID,
+        provenance={
+            "paper_id": paper.id,
+            "chunk_id": chunk.id,
+            "page_number": page.page_number,
+            "element_id": element.id,
+            "exact_quote": quote,
+            "char_start": 0,
+            "char_end": len(quote),
+            "document_sha256": paper.document_sha256,
+        },
+    )
+
+    assert status == AnchorStatus.UNRESOLVED
+    assert anchor is None
+
+
 def test_wrong_project_id_returns_unresolved(db_session: Session):
     """Verify that resolving provenance under a different project ID returns UNRESOLVED."""
     manifest = validate_manifest(load_manifest())
@@ -387,7 +441,13 @@ def test_repeated_ambiguous_quote_without_offsets_returns_unresolved(db_session:
         chunk_index=888,
         text=page_text,
     )
-    db_session.add_all([test_page, test_elem, test_chunk])
+    chunk_element = ChunkElement(
+        id=uuid4(),
+        chunk_id=test_chunk.id,
+        element_id=test_elem.id,
+        order_index=0,
+    )
+    db_session.add_all([test_page, test_elem, test_chunk, chunk_element])
     db_session.commit()
 
     # Provenance without offsets

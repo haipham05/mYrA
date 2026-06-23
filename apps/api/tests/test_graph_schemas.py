@@ -336,6 +336,16 @@ def test_qualifier_normalization_decimal_spaces_consistency():
     assert q_alias.numeric_value == 41.0
 
 
+def test_qualifier_schema_rejects_conflicting_numeric_representations():
+    with pytest.raises(ValidationError, match="Conflicting numeric qualifier representations"):
+        GraphQualifierSchema(result_value=999, numeric_value=999, raw_value="2.1")
+
+    compatible_precision = GraphQualifierSchema(result_value=2.10, raw_value="2 . 1 %")
+    assert compatible_precision.result_value == 2.1
+    assert compatible_precision.numeric_value == 2.1
+    assert compatible_precision.raw_value == "2.1 %"
+
+
 def test_qualifier_unit_comparisons_and_missing_units():
     """Verify that different units or missing units do not silently become equivalent."""
     q_bleu = GraphQualifierSchema(result_value=41.0, unit="BLEU", dataset="WMT14")

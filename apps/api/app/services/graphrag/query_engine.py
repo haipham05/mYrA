@@ -73,7 +73,7 @@ def _format_fact(fact: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_comparable_context(fact: dict[str, Any]) -> dict[str, Any]:
-    """Extract comparable dimensions (dataset, metric, value, polarity) from fact details."""
+    """Extract only explicitly supported comparison dimensions from a fact."""
     qualifiers = _parse_qualifiers(fact.get("qualifiers"))
     exact_quote = fact.get("exact_quote") or ""
 
@@ -95,7 +95,17 @@ def _extract_comparable_context(fact: dict[str, Any]) -> dict[str, Any]:
     elif str(fact.get("subject_type", "")).lower() == "metric":
         metric = str(fact.get("subject_name", "")).strip()
 
-    # 3. Numeric value
+    # 3. Method and task
+    method = str(qualifiers.get("method") or "").strip() or None
+    if method is None and str(fact.get("subject_type", "")).lower() in {"method", "model"}:
+        method = str(fact.get("subject_name") or "").strip() or None
+    task = str(qualifiers.get("task") or "").strip() or None
+    if task is None and str(fact.get("object_type", "")).lower() == "task":
+        task = str(fact.get("object_name") or "").strip() or None
+    if task is None and str(fact.get("subject_type", "")).lower() == "task":
+        task = str(fact.get("subject_name") or "").strip() or None
+
+    # 4. Numeric value. Missing metadata remains unknown; do not infer it from a quote.
     val: float | None = None
     for field in ("result_value", "numeric_value", "raw_value"):
         if field in qualifiers and qualifiers[field] is not None:
@@ -104,13 +114,7 @@ def _extract_comparable_context(fact: dict[str, Any]) -> dict[str, Any]:
                 val = parsed
                 break
 
-    if val is None and exact_quote:
-        # Check if exact_quote has numeric value
-        parsed, _ = parse_numeric_value(exact_quote)
-        if parsed is not None:
-            val = parsed
-
-    # 4. Polarity identification
+    # 5. Polarity identification. Unknown polarity is not made positive by default.
     polarity: str | None = None
     if qualifiers.get("polarity"):
         p_str = str(qualifiers["polarity"]).strip().upper()
@@ -128,20 +132,52 @@ def _extract_comparable_context(fact: dict[str, Any]) -> dict[str, Any]:
             for neg in ("fails to converge", "fail", "failed", "cannot", "unable", "not achieve")
         ):
             polarity = ClaimPolarity.NEGATIVE.value
-        elif val is not None or any(
+        elif any(
             pos in quote_lower
             for pos in ("achieve", "improves", "outperforms", "yields", "attains")
         ):
             polarity = ClaimPolarity.POSITIVE.value
-        else:
-            polarity = ClaimPolarity.POSITIVE.value
 
     return {
+        "method": method,
         "dataset": dataset if dataset else None,
         "metric": metric if metric else None,
+        "task": task,
+        "split": str(qualifiers["split"]).strip() if qualifiers.get("split") else None,
+        "unit": str(qualifiers["unit"]).strip() if qualifiers.get("unit") else None,
+        "comparison_condition": (
+            str(qualifiers["comparison_condition"]).strip()
+            if qualifiers.get("comparison_condition")
+            else None
+        ),
         "value": val,
         "polarity": polarity,
     }
+
+
+def _normalize_condition(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).casefold().split())
+    return normalized or None
+
+
+def _comparable_contexts(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Require explicit, matching conditions before comparing two claims."""
+    required_dimensions = (
+        "method",
+        "dataset",
+        "metric",
+        "task",
+        "split",
+        "unit",
+        "comparison_condition",
+    )
+    return all(
+        _normalize_condition(a.get(dimension)) is not None
+        and _normalize_condition(a.get(dimension)) == _normalize_condition(b.get(dimension))
+        for dimension in required_dimensions
+    )
 
 
 def build_relationship_candidates(
@@ -230,12 +266,11 @@ def build_contradiction_candidates(
     - Pairs of facts asserting relations on the same subject and object (or method and dataset)
       from different papers.
     - Comparability rule:
-      Both facts MUST share comparable conditions:
-      - Same metric (e.g. ECE, BLEU, WER)
-      - Same dataset (e.g. ImageNet, LibriSpeech)
+      Both facts MUST explicitly agree on method, dataset, metric, task, split, unit,
+      and comparison condition.
       - Polarity conflict: one POSITIVE and one NEGATIVE (e.g. fails vs achieves)
-        OR Numeric conflict: same metric/dataset with differing values (e.g. 2.1% vs 8.5%)
-      - If dataset or metric differ (e.g. ImageNet vs CIFAR-100), it is NOT a contradiction.
+        OR Numeric conflict: under matching conditions, the supported values differ.
+      - Missing or different comparison conditions abstain; no defaults are invented.
     - Caps results at min(limit, 50).
     - Returns both supported source facts so absence is never treated as disagreement.
     """
@@ -270,8 +305,19 @@ def build_contradiction_candidates(
         ctx_a = contexts[i]
         paper_a = str(fact_a.get("paper_id")) if fact_a.get("paper_id") is not None else None
 
-        # Must have both dataset and metric
-        if not ctx_a["dataset"] or not ctx_a["metric"]:
+        # Every relevant comparison condition must be explicitly supported.
+        if any(
+            ctx_a.get(dimension) is None
+            for dimension in (
+                "method",
+                "dataset",
+                "metric",
+                "task",
+                "split",
+                "unit",
+                "comparison_condition",
+            )
+        ):
             continue
 
         s_key_a = fact_a.get("subject_key")
@@ -287,14 +333,7 @@ def build_contradiction_candidates(
 
             ctx_b = contexts[j]
 
-            # Must have both dataset and metric
-            if not ctx_b["dataset"] or not ctx_b["metric"]:
-                continue
-
-            # Comparability rule: same dataset and same metric
-            if ctx_a["dataset"].strip().lower() != ctx_b["dataset"].strip().lower():
-                continue
-            if ctx_a["metric"].strip().lower() != ctx_b["metric"].strip().lower():
+            if not _comparable_contexts(ctx_a, ctx_b):
                 continue
 
             # Must assert relations on the same subject/method or method-dataset
@@ -335,8 +374,13 @@ def build_contradiction_candidates(
                         "fact_b": _format_fact(fact_b),
                         "conflict_type": conflict_type,
                         "comparison_basis": {
+                            "method": ctx_a["method"],
                             "dataset": ctx_a["dataset"],
                             "metric": ctx_a["metric"],
+                            "task": ctx_a["task"],
+                            "split": ctx_a["split"],
+                            "unit": ctx_a["unit"],
+                            "comparison_condition": ctx_a["comparison_condition"],
                         },
                     }
                 )

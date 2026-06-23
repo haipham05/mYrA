@@ -839,6 +839,32 @@ def test_verifier_raw_value_and_integer_numeric_support(db_session: Session):
     assert _check_numeric_support(q3, [], "achieves an ECE of 2.1% on ImageNet") is False
 
 
+def test_numeric_support_reconciles_every_value_with_boundaries():
+    from app.services.graphrag.verifier import _check_numeric_support
+
+    supported_spaced_decimal = GraphQualifierSchema(result_value=2.1, raw_value="2 . 1")
+    assert _check_numeric_support(supported_spaced_decimal, [], "result was 2 . 1") is True
+
+    inconsistent = GraphQualifierSchema.model_construct(
+        result_value=999.0, numeric_value=999.0, raw_value="2.1"
+    )
+    assert _check_numeric_support(inconsistent, [], "result was 2.1") is False
+
+    assert _check_numeric_support(GraphQualifierSchema(result_value=2), [], "value 12") is False
+    assert _check_numeric_support(GraphQualifierSchema(), [], "no numeric claim") is True
+
+    numeric_entity = GraphEntitySchema(id="e", name="999 BLEU", type=EntityType.RESULT)
+    correct_raw_value = GraphQualifierSchema(raw_value="2.1 BLEU")
+    assert (
+        _check_numeric_support(
+            correct_raw_value,
+            [numeric_entity],
+            "Method X achieves 2.1 BLEU on Dataset Y.",
+        )
+        is False
+    )
+
+
 def test_snapshots_extract_external_id_coverage():
     """Verify external ID extraction edge cases."""
     from app.services.graphrag.snapshots import _extract_external_id

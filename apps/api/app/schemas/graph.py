@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from math import isclose
 from typing import Any
 from uuid import UUID
 
@@ -291,6 +292,23 @@ class GraphQualifierSchema(BaseModel):
     @classmethod
     def normalize_qualifier_inputs(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            provided_numbers: list[tuple[str, float]] = []
+            for field_name in ("result_value", "numeric_value", "raw_value"):
+                raw_value = data.get(field_name)
+                if raw_value is None:
+                    continue
+                parsed_value, _ = parse_numeric_value(raw_value)
+                if parsed_value is not None:
+                    provided_numbers.append((field_name, parsed_value))
+            if provided_numbers:
+                reference_name, reference_value = provided_numbers[0]
+                for field_name, value in provided_numbers[1:]:
+                    if not isclose(reference_value, value, rel_tol=1e-9, abs_tol=1e-9):
+                        raise ValueError(
+                            f"Conflicting numeric qualifier representations: "
+                            f"{reference_name} and {field_name} disagree"
+                        )
+
             # Sync numeric_value and result_value
             if "numeric_value" in data and "result_value" not in data:
                 data["result_value"] = data["numeric_value"]

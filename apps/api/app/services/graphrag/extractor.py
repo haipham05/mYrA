@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError
 
+from app.ingestion.parser import find_verbatim_span, normalize_text
 from app.schemas.graph import (
     VALID_ENDPOINT_CONSTRAINTS,
     EntityType,
@@ -26,7 +27,11 @@ from app.schemas.graph import (
     RelationshipPredicate,
 )
 from app.services.graphrag.identity import generate_entity_key
-from app.services.graphrag.input_selector import ExtractionEvidenceItem
+from app.services.graphrag.input_selector import (
+    ExtractionEvidenceItem,
+    ExtractionSourceElement,
+    ExtractionSourcePage,
+)
 from app.services.llm import LLMProvider
 
 logger = logging.getLogger("myra.graphrag.extractor")
@@ -222,6 +227,36 @@ def _extract_endpoint(
     return name, ent_type, ent_id
 
 
+def _resolve_quote_source(
+    quote: str,
+    pages: list[ExtractionSourcePage],
+    elements: list[ExtractionSourceElement],
+) -> tuple[int, UUID, int, int, str, str] | None:
+    """Resolve a quote uniquely to authoritative page text and a linked element."""
+    page_by_number = {page.page_number: page for page in pages}
+    matches: list[tuple[int, UUID, int, int, str, str]] = []
+    for element in elements:
+        page = page_by_number.get(element.page_number)
+        if page is None or not page.raw_text:
+            continue
+        page_span = find_verbatim_span(page.raw_text, quote)
+        element_supports_quote = normalize_text(quote) in normalize_text(element.text)
+        if page_span is not None and element_supports_quote:
+            matches.append(
+                (
+                    element.page_number,
+                    element.element_id,
+                    page_span[0],
+                    page_span[1],
+                    element.parser_version,
+                    page.raw_text[page_span[0] : page_span[1]],
+                )
+            )
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def parse_and_validate_extraction(
     raw_response: str,
     project_id: UUID | str,
@@ -395,11 +430,24 @@ def parse_and_validate_extraction(
             _record_rejection("QUOTE_NOT_IN_EVIDENCE")
             continue
 
-        char_start = evidence.text.find(exact_quote)
-        if char_start == -1:
+        chunk_start = evidence.text.find(exact_quote)
+        if chunk_start == -1:
             _record_rejection("QUOTE_NOT_IN_EVIDENCE")
             continue
-        char_end = char_start + len(exact_quote)
+        resolved_source = _resolve_quote_source(
+            exact_quote, evidence.source_pages, evidence.source_elements
+        )
+        if resolved_source is None:
+            _record_rejection("UNRESOLVED_SOURCE_QUOTE")
+            continue
+        (
+            source_page_number,
+            source_element_id,
+            char_start,
+            char_end,
+            source_parser_version,
+            source_quote,
+        ) = resolved_source
 
         # 3. Predicate check
         pred_raw = raw_fact.get("predicate")
@@ -471,13 +519,13 @@ def parse_and_validate_extraction(
             provenance = GraphProvenanceSchema(
                 paper_id=paper_id,
                 chunk_id=evidence.chunk_id,
-                page_number=evidence.page_number,
-                element_id=evidence.element_id,
-                exact_quote=exact_quote,
+                page_number=source_page_number,
+                element_id=source_element_id,
+                exact_quote=source_quote,
                 char_start=char_start,
                 char_end=char_end,
                 document_sha256=evidence.document_sha256,
-                parser_version=evidence.parser_version,
+                parser_version=source_parser_version or evidence.parser_version,
             )
         except ValidationError:
             _record_rejection("QUOTE_NOT_IN_EVIDENCE")

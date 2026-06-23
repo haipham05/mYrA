@@ -33,7 +33,7 @@ from tests.fixtures.graphrag.corpus_fixtures import (
 )
 
 from app.db.base import Base
-from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, Project
+from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage, Project
 from app.services.graphrag import ExtractionEvidenceItem, select_extraction_inputs
 
 
@@ -383,6 +383,54 @@ def test_evidence_items_opaque_ids_and_correct_metadata(db_session: Session):
     assert item2.parser_version == "v2.1"
     assert item2.document_sha256 == doc_sha
     assert item2.chunk_index == 1
+
+
+def test_evidence_item_carries_all_linked_page_and_element_sources(db_session: Session):
+    project = create_test_project(db_session)
+    paper = create_test_paper(db_session, project.id)
+    first = create_test_element(
+        db_session, paper.id, page_number=1, element_index=0, text="First page element"
+    )
+    second = create_test_element(
+        db_session, paper.id, page_number=2, element_index=1, text="Second page element"
+    )
+    db_session.add_all(
+        [
+            PaperPage(
+                id=uuid4(),
+                paper_id=paper.id,
+                page_number=1,
+                width=612,
+                height=792,
+                raw_text="First page text",
+            ),
+            PaperPage(
+                id=uuid4(),
+                paper_id=paper.id,
+                page_number=2,
+                width=612,
+                height=792,
+                raw_text="Second page text",
+            ),
+        ]
+    )
+    db_session.commit()
+    create_test_chunk(
+        db_session,
+        paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="A chunk spanning two pages",
+        elements=[first, second],
+    )
+
+    [item] = select_extraction_inputs(db_session, project.id, paper.id)
+
+    assert [(page.page_number, page.raw_text) for page in item.source_pages] == [
+        (1, "First page text"),
+        (2, "Second page text"),
+    ]
+    assert [element.element_id for element in item.source_elements] == [first.id, second.id]
 
 
 def test_primary_element_ordered_selection_and_default_parser_version(db_session: Session):

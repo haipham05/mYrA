@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
-from app.ingestion.parser import find_verbatim_span
+from app.ingestion.parser import find_verbatim_span, normalize_text
 from app.schemas.evidence import AnchorStatus, BoundingBox, CitationAnchor, CoordinateOrigin
 from app.schemas.graph import GraphProvenanceSchema
 
@@ -35,8 +35,8 @@ def resolve_graph_source_anchor(
       page.raw_text[char_start:char_end] == exact_quote.
     - Linked child chunk: PaperChunk must exist, have chunk_type == 'child', belong to
       paper_id, and exact_quote.lower() must be contained within chunk.text.lower().
-    - Linked element: PaperElement must exist on that page, belong to paper, and contain
-      the quote or overlap with the chunk via ChunkElement.
+    - Linked element: PaperElement must exist on that page, belong to paper, be linked
+      to the chunk, and independently contain the exact quote.
 
     Returns:
     - (CitationAnchor(...), AnchorStatus.VERIFIED) if all checks pass.
@@ -140,8 +140,11 @@ def resolve_graph_source_anchor(
     if not chunk or chunk.chunk_type != "child":
         return (None, AnchorStatus.UNRESOLVED)
 
-    if not chunk.text or exact_quote.lower() not in chunk.text.lower():
+    if not chunk.text or normalize_text(exact_quote) not in normalize_text(chunk.text):
         return (None, AnchorStatus.UNRESOLVED)
+
+    def element_supports_quote(text: str | None) -> bool:
+        return bool(text and normalize_text(exact_quote) in normalize_text(text))
 
     # 5. Locate and verify linked element
     element: PaperElement | None = None
@@ -158,8 +161,8 @@ def resolve_graph_source_anchor(
         if not element:
             return (None, AnchorStatus.UNRESOLVED)
 
-        contains_quote = bool(element.text and exact_quote.lower() in element.text.lower())
-        has_chunk_overlap = (
+        contains_quote = element_supports_quote(element.text)
+        is_linked = (
             db.query(ChunkElement)
             .filter(
                 ChunkElement.chunk_id == chunk.id,
@@ -168,7 +171,7 @@ def resolve_graph_source_anchor(
             .first()
             is not None
         )
-        if not (contains_quote or has_chunk_overlap):
+        if not (contains_quote and is_linked):
             return (None, AnchorStatus.UNRESOLVED)
     else:
         candidate_elements = (
@@ -190,28 +193,14 @@ def resolve_graph_source_anchor(
             .all()
         }
 
-        # 1. Overlapping with chunk AND containing quote
-        for elem in candidate_elements:
-            if elem.id in chunk_elem_ids and elem.text and exact_quote.lower() in elem.text.lower():
-                element = elem
-                break
-
-        # 2. Overlapping with chunk via ChunkElement
-        if element is None:
-            for elem in candidate_elements:
-                if elem.id in chunk_elem_ids:
-                    element = elem
-                    break
-
-        # 3. Containing quote on this page
-        if element is None:
-            for elem in candidate_elements:
-                if elem.text and exact_quote.lower() in elem.text.lower():
-                    element = elem
-                    break
-
-        if element is None:
+        matching_elements = [
+            elem
+            for elem in candidate_elements
+            if elem.id in chunk_elem_ids and element_supports_quote(elem.text)
+        ]
+        if len(matching_elements) != 1:
             return (None, AnchorStatus.UNRESOLVED)
+        element = matching_elements[0]
 
     # 6. Extract bounding box from element
     bboxes: list[BoundingBox] = []

@@ -30,7 +30,11 @@ from app.services.graphrag.extractor import (
     parse_and_validate_extraction,
     strip_markdown_fences,
 )
-from app.services.graphrag.input_selector import ExtractionEvidenceItem
+from app.services.graphrag.input_selector import (
+    ExtractionEvidenceItem,
+    ExtractionSourceElement,
+    ExtractionSourcePage,
+)
 from app.services.llm import FakeLLMProvider, LLMProvider
 
 SAMPLE_PROJECT_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -45,16 +49,149 @@ def make_evidence_item(
     chunk_id: UUID | None = None,
     element_id: UUID | None = None,
 ) -> ExtractionEvidenceItem:
+    selected_element_id = element_id or uuid4()
     return ExtractionEvidenceItem(
         evidence_id=evidence_id,
         chunk_id=chunk_id or uuid4(),
         text=text,
         page_number=page_number,
-        element_id=element_id or uuid4(),
+        element_id=selected_element_id,
         parser_version="v1",
         document_sha256=SAMPLE_SHA256,
         chunk_index=0,
+        source_pages=[ExtractionSourcePage(page_number=page_number, raw_text=text)],
+        source_elements=[
+            ExtractionSourceElement(
+                element_id=selected_element_id,
+                page_number=page_number,
+                text=text,
+                parser_version="v1",
+            )
+        ],
     )
+
+
+def parse_source_fact(evidence: ExtractionEvidenceItem, quote: str):
+    response = json.dumps(
+        {
+            "entities": [],
+            "facts": [
+                {
+                    "subject": {"name": "Model A", "type": "Model"},
+                    "predicate": "EXTENDS",
+                    "object": {"name": "Model B", "type": "Model"},
+                    "evidence_id": evidence.evidence_id,
+                    "exact_quote": quote,
+                }
+            ],
+        }
+    )
+    return parse_and_validate_extraction(
+        raw_response=response,
+        project_id=SAMPLE_PROJECT_ID,
+        paper_id=SAMPLE_PAPER_ID,
+        evidence_items=[evidence],
+    )
+
+
+def test_quote_provenance_uses_page_offsets_after_page_prefix():
+    quote = "Method X was evaluated on Dataset Y."
+    evidence = make_evidence_item(
+        text=quote,
+        page_number=1,
+    )
+    evidence = evidence.model_copy(
+        update={"source_pages": [ExtractionSourcePage(page_number=1, raw_text=f"Intro. {quote}")]}
+    )
+
+    result = parse_source_fact(evidence, quote)
+
+    assert len(result.accepted_facts) == 1
+    provenance = result.accepted_facts[0].provenance
+    assert provenance.char_start == 7
+    assert provenance.char_end == 7 + len(quote)
+    assert f"Intro. {quote}"[provenance.char_start : provenance.char_end] == provenance.exact_quote
+
+
+def test_quote_resolves_to_second_linked_element():
+    quote = "Only this source element supports the quote."
+    first_id, second_id = uuid4(), uuid4()
+    evidence = make_evidence_item(text=quote, page_number=1, element_id=first_id)
+    evidence = evidence.model_copy(
+        update={
+            "source_elements": [
+                ExtractionSourceElement(
+                    element_id=first_id,
+                    page_number=1,
+                    text="Unrelated text in the first element.",
+                    parser_version="v1",
+                ),
+                ExtractionSourceElement(
+                    element_id=second_id,
+                    page_number=1,
+                    text=quote,
+                    parser_version="v2",
+                ),
+            ]
+        }
+    )
+
+    result = parse_source_fact(evidence, quote)
+
+    assert len(result.accepted_facts) == 1
+    provenance = result.accepted_facts[0].provenance
+    assert provenance.element_id == second_id
+    assert provenance.parser_version == "v2"
+
+
+def test_quote_resolves_to_later_linked_page():
+    quote = "Later page contains the supported statement."
+    evidence = make_evidence_item(text=quote, page_number=1)
+    later_element_id = uuid4()
+    evidence = evidence.model_copy(
+        update={
+            "source_pages": [
+                ExtractionSourcePage(page_number=1, raw_text="First page."),
+                ExtractionSourcePage(page_number=2, raw_text=f"Header. {quote}"),
+            ],
+            "source_elements": [
+                ExtractionSourceElement(
+                    element_id=later_element_id,
+                    page_number=2,
+                    text=quote,
+                    parser_version="v3",
+                )
+            ],
+        }
+    )
+
+    result = parse_source_fact(evidence, quote)
+
+    assert len(result.accepted_facts) == 1
+    provenance = result.accepted_facts[0].provenance
+    assert provenance.page_number == 2
+    assert provenance.element_id == later_element_id
+    assert provenance.char_start == len("Header. ")
+
+
+def test_repeated_page_quote_is_rejected_as_ambiguous():
+    quote = "Repeated source statement."
+    evidence = make_evidence_item(text=quote, page_number=1)
+    evidence = evidence.model_copy(
+        update={
+            "source_pages": [
+                ExtractionSourcePage(
+                    page_number=1,
+                    raw_text=f"{quote} More text. {quote}",
+                )
+            ]
+        }
+    )
+
+    result = parse_source_fact(evidence, quote)
+
+    assert result.accepted_facts == []
+    assert result.rejection_reasons.get("UNRESOLVED_SOURCE_QUOTE") == 1
 
 
 # ==============================================================================

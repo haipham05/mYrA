@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import socket
 from collections.abc import Generator
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable
 
 from app.db.models import GraphFactSnapshot, Job, Paper, Project
 from app.db.session import SessionLocal, create_tables
@@ -23,31 +22,14 @@ from app.services.graphrag.query_engine import (
     build_corpus_themes,
     build_relationship_candidates,
 )
+from conftest import disposable_neo4j_test_uri
 
-
-def is_neo4j_available() -> bool:
-    """Check if Neo4j is listening on localhost:7687 and can be reached."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
-    try:
-        sock.connect(("127.0.0.1", 7687))
-        sock.close()
-    except OSError:
-        return False
-
-    try:
-        d = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=None)
-        d.verify_connectivity()
-        d.close()
-        return True
-    except (ServiceUnavailable, Exception):
-        return False
-
-
-NEO4J_AVAILABLE = is_neo4j_available()
 skip_if_no_neo4j = pytest.mark.skipif(
-    not NEO4J_AVAILABLE,
-    reason="Local Neo4j service not available on bolt://127.0.0.1:7687",
+    disposable_neo4j_test_uri() is None,
+    reason=(
+        "Neo4j integration checks require MYRA_TEST_NEO4J_URI and "
+        "MYRA_ALLOW_DISPOSABLE_NEO4J_TESTS=1"
+    ),
 )
 
 
@@ -64,12 +46,10 @@ def clean_database():
 
 
 @pytest.fixture
-def real_repo() -> Generator[Neo4jRepository, None, None]:
-    """Provide a real Neo4jRepository connected to local Neo4j."""
-    if not NEO4J_AVAILABLE:
-        pytest.skip("Local Neo4j service not available")
-
-    driver = GraphDatabase.driver("bolt://127.0.0.1:7687", auth=None)
+def real_repo(disposable_neo4j_uri: str) -> Generator[Neo4jRepository, None, None]:
+    """Connect only to the explicitly acknowledged disposable test target."""
+    driver = GraphDatabase.driver(disposable_neo4j_uri, auth=None)
+    driver.verify_connectivity()
     repo = Neo4jRepository(driver=driver, database="neo4j")
     repo.ensure_schema()
     yield repo
@@ -351,8 +331,15 @@ def test_contradiction_candidate_numeric_value_conflict(
                         "dataset": "ImageNet",
                         "result_value": 2.1,
                         "polarity": "POSITIVE",
+                        "task": "classification",
+                        "split": "test",
+                        "unit": "%",
+                        "comparison_condition": "standard evaluation",
                     },
-                    "exact_quote": "Method X achieves 2.1% ECE on ImageNet.",
+                    "exact_quote": (
+                        "Method X achieves 2.1% ECE on ImageNet for classification test "
+                        "split under standard evaluation."
+                    ),
                     "page_number": 2,
                 }
             ],
@@ -378,8 +365,15 @@ def test_contradiction_candidate_numeric_value_conflict(
                         "dataset": "ImageNet",
                         "result_value": 8.5,
                         "polarity": "POSITIVE",
+                        "task": "classification",
+                        "split": "test",
+                        "unit": "%",
+                        "comparison_condition": "standard evaluation",
                     },
-                    "exact_quote": "Method X reports 8.5% ECE on ImageNet.",
+                    "exact_quote": (
+                        "Method X reports 8.5% ECE on ImageNet for classification test "
+                        "split under standard evaluation."
+                    ),
                     "page_number": 5,
                 }
             ],
@@ -451,8 +445,15 @@ def test_contradiction_candidate_polarity_conflict(real_repo: Neo4jRepository, d
                         "dataset": "ImageNet",
                         "result_value": 2.1,
                         "polarity": "POSITIVE",
+                        "task": "classification",
+                        "split": "test",
+                        "unit": "%",
+                        "comparison_condition": "standard evaluation",
                     },
-                    "exact_quote": "Method X achieves 2.1% ECE on ImageNet.",
+                    "exact_quote": (
+                        "Method X achieves 2.1% ECE on ImageNet for classification test "
+                        "split under standard evaluation."
+                    ),
                     "page_number": 2,
                 }
             ],
@@ -477,8 +478,15 @@ def test_contradiction_candidate_polarity_conflict(real_repo: Neo4jRepository, d
                         "metric": "ECE",
                         "dataset": "ImageNet",
                         "polarity": "NEGATIVE",
+                        "task": "classification",
+                        "split": "test",
+                        "unit": "%",
+                        "comparison_condition": "standard evaluation",
                     },
-                    "exact_quote": "Method X fails to converge on ImageNet calibration.",
+                    "exact_quote": (
+                        "Method X fails to converge when reporting ECE percentages on ImageNet "
+                        "for classification test split under standard evaluation."
+                    ),
                     "page_number": 6,
                 }
             ],
@@ -996,9 +1004,6 @@ def test_bidirectional_relationship_candidate_retrieval(
     real_repo: Neo4jRepository, db_session
 ) -> None:
     """Tests that querying (Dataset Y, Method X) resolves Method X -> Dataset Y."""
-    if not NEO4J_AVAILABLE:
-        pytest.skip("Local Neo4j service not available")
-
     project_id = uuid4()
     paper_id = uuid4()
     try:
@@ -1081,8 +1086,19 @@ def test_contradiction_qualifier_method_and_quote_fallbacks() -> None:
             "object_name": "ImageNet",
             "object_type": "Dataset",
             "predicate": "ACHIEVES_RESULT",
-            "qualifiers": {"method": "Transformer", "metric": "ECE", "result_value": 2.1},
-            "exact_quote": "Transformer attains 2.1 ECE on ImageNet.",
+            "qualifiers": {
+                "method": "Transformer",
+                "metric": "ECE",
+                "result_value": 2.1,
+                "task": "calibration",
+                "split": "test",
+                "unit": "%",
+                "comparison_condition": "standard evaluation",
+            },
+            "exact_quote": (
+                "Transformer attains 2.1 ECE percent on ImageNet for calibration test split "
+                "under standard evaluation."
+            ),
         },
         {
             "fact_id": "f2",
@@ -1093,15 +1109,145 @@ def test_contradiction_qualifier_method_and_quote_fallbacks() -> None:
             "object_name": "ImageNet",
             "object_type": "Dataset",
             "predicate": "ACHIEVES_RESULT",
-            "qualifiers": {"method": "Transformer", "metric": "ECE"},
-            "exact_quote": "Transformer fails to converge on ImageNet calibration.",
+            "qualifiers": {
+                "method": "Transformer",
+                "metric": "ECE",
+                "task": "calibration",
+                "split": "test",
+                "unit": "%",
+                "comparison_condition": "standard evaluation",
+            },
+            "exact_quote": (
+                "Transformer fails to converge for ECE percent on ImageNet during calibration "
+                "test split under standard evaluation."
+            ),
         },
     ]
 
     contras = build_contradiction_candidates(db=None, repo=mock_repo, project_id=p_id)
     assert len(contras) == 1
     assert contras[0]["conflict_type"] == "POLARITY"
-    assert contras[0]["comparison_basis"] == {"dataset": "ImageNet", "metric": "ECE"}
+    assert contras[0]["comparison_basis"] == {
+        "method": "Transformer",
+        "dataset": "ImageNet",
+        "metric": "ECE",
+        "task": "calibration",
+        "split": "test",
+        "unit": "%",
+        "comparison_condition": "standard evaluation",
+    }
+
+
+def _make_comparison_fact(
+    fact_id: str,
+    paper_id: str,
+    value: float,
+    *,
+    split: str | None = "test",
+    unit: str | None = "%",
+    task: str | None = "classification",
+    comparison_condition: str | None = "standard setup",
+    metric: str = "ECE",
+    polarity: str = "POSITIVE",
+) -> dict[str, Any]:
+    quote = (
+        f"Method X reports {value}{unit or ''} {metric} on ImageNet for {task or 'unknown task'} "
+        f"{split or 'unknown split'} split under {comparison_condition or 'unknown conditions'}."
+    )
+    return {
+        "fact_id": fact_id,
+        "paper_id": paper_id,
+        "subject_key": "method-x",
+        "subject_name": "Method X",
+        "subject_type": "Method",
+        "object_key": "imagenet",
+        "object_name": "ImageNet",
+        "object_type": "Dataset",
+        "predicate": "EVALUATED_ON",
+        "qualifiers": {
+            "metric": metric,
+            "dataset": "ImageNet",
+            "result_value": value,
+            "polarity": polarity,
+            **({"task": task} if task else {}),
+            **({"split": split} if split else {}),
+            **({"unit": unit} if unit else {}),
+            **({"comparison_condition": comparison_condition} if comparison_condition else {}),
+        },
+        "exact_quote": quote,
+        "page_number": 3,
+    }
+
+
+def test_comparisons_abstain_for_different_or_unknown_conditions() -> None:
+    from unittest.mock import MagicMock
+
+    from app.services.graphrag.query_engine import build_contradiction_candidates
+
+    project_id = uuid4()
+    base = _make_comparison_fact("a", str(uuid4()), 90)
+    train_test = _make_comparison_fact("a", str(uuid4()), 90, metric="accuracy")
+    cases = [
+        (
+            train_test,
+            _make_comparison_fact("b", str(uuid4()), 80, split="train", metric="accuracy"),
+        ),
+        (base, _make_comparison_fact("b", str(uuid4()), 80, unit="count")),
+        (
+            base,
+            _make_comparison_fact("b", str(uuid4()), 80, comparison_condition="augmented setup"),
+        ),
+        (base, _make_comparison_fact("b", str(uuid4()), 80, split=None)),
+        (base, _make_comparison_fact("b", str(uuid4()), 80, unit=None)),
+        (base, _make_comparison_fact("b", str(uuid4()), 80, task=None)),
+        (base, _make_comparison_fact("b", str(uuid4()), 80, comparison_condition=None)),
+    ]
+
+    for first, other in cases:
+        mock_repo = MagicMock(spec=Neo4jRepository)
+        mock_repo.get_project_facts.return_value = [first, other]
+        assert build_contradiction_candidates(None, mock_repo, project_id) == []
+
+
+def test_matching_supported_comparison_preserves_both_sources_and_basis() -> None:
+    from unittest.mock import MagicMock
+
+    from app.services.graphrag.query_engine import build_contradiction_candidates
+
+    paper_a, paper_b = str(uuid4()), str(uuid4())
+    fact_a = _make_comparison_fact("fact-a", paper_a, 90)
+    fact_b = _make_comparison_fact("fact-b", paper_b, 80)
+    mock_repo = MagicMock(spec=Neo4jRepository)
+    mock_repo.get_project_facts.return_value = [fact_a, fact_b]
+
+    [candidate] = build_contradiction_candidates(None, mock_repo, uuid4())
+
+    assert candidate["conflict_type"] == "NUMERIC_VALUE"
+    assert candidate["fact_a"]["paper_id"] != candidate["fact_b"]["paper_id"]
+    assert candidate["fact_a"]["exact_quote"] == fact_a["exact_quote"]
+    assert candidate["fact_b"]["exact_quote"] == fact_b["exact_quote"]
+    assert candidate["fact_a"]["page_number"] == candidate["fact_b"]["page_number"] == 3
+    assert candidate["comparison_basis"] == {
+        "method": "Method X",
+        "dataset": "ImageNet",
+        "metric": "ECE",
+        "task": "classification",
+        "split": "test",
+        "unit": "%",
+        "comparison_condition": "standard setup",
+    }
+
+    positive = _make_comparison_fact("polarity-a", paper_a, 90, polarity="POSITIVE")
+    negative = _make_comparison_fact("polarity-b", paper_b, 90, polarity="NEGATIVE")
+    negative["exact_quote"] = (
+        "Method X fails to achieve 90% ECE on ImageNet for classification test split "
+        "under standard setup."
+    )
+    mock_repo.get_project_facts.return_value = [positive, negative]
+    [polarity_candidate] = build_contradiction_candidates(None, mock_repo, uuid4())
+    assert polarity_candidate["conflict_type"] == "POLARITY"
+    assert polarity_candidate["fact_a"]["fact_id"] == "polarity-a"
+    assert polarity_candidate["fact_b"]["fact_id"] == "polarity-b"
 
 
 def test_empty_facts_scenarios() -> None:

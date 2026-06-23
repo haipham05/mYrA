@@ -142,50 +142,40 @@ def _check_numeric_support(
     """Verify that numeric claims in qualifiers or entity names are supported by the quote text."""
     quote_norm_decimals = normalize_decimal_spaces(quote_norm)
 
-    # Extract all floats from the quote text
-    found_floats: list[float] = []
-    for m in re.finditer(r"[+-]?\d+(?:\.\d+)?", quote_norm_decimals):
-        try:
-            found_floats.append(float(m.group(0)))
-        except ValueError:
-            pass
+    def numeric_tokens(text: str) -> list[float]:
+        values: list[float] = []
+        pattern = r"(?<![\w.])[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w.])"
+        for match in re.finditer(pattern, normalize_decimal_spaces(text)):
+            try:
+                values.append(float(match.group(0).replace(",", "")))
+            except ValueError:
+                continue
+        return values
+
+    found_floats = numeric_tokens(quote_norm_decimals)
+
+    def is_supported(value: float) -> bool:
+        return any(abs(found - value) < tolerance for found in found_floats)
 
     # 1. Check qualifiers numeric values
     if qualifiers is not None:
-        target_val = qualifiers.result_value
-        if target_val is None:
-            target_val = qualifiers.numeric_value
-
-        # Match raw_value directly if present
+        declared_values = [
+            value
+            for value in (qualifiers.result_value, qualifiers.numeric_value)
+            if value is not None
+        ]
         if qualifiers.raw_value:
-            raw_clean = normalize_decimal_spaces(qualifiers.raw_value.strip().lower())
-            if raw_clean in quote_norm or raw_clean in quote_norm_decimals:
-                return True
-
-        if target_val is not None:
-            # Check numeric match within floating-point tolerance
-            if any(abs(f - target_val) < tolerance for f in found_floats):
-                return True
-
-            # Check string representations (e.g. "8.5" or "8" if integer)
-            target_str = f"{target_val:.6g}".lower()
-            if target_str in quote_norm_decimals:
-                return True
-            if target_val.is_integer() and str(int(target_val)) in quote_norm_decimals:
-                return True
-
+            declared_values.extend(numeric_tokens(qualifiers.raw_value))
+        if any(not is_supported(value) for value in declared_values):
             return False
 
     # 2. Check numbers in entity names (e.g. Result named "8.5% ECE")
     for ent in candidate_entities:
-        ent_numbers = re.findall(r"[+-]?\d+(?:\.\d+)?", ent.name)
-        for num_str in ent_numbers:
-            try:
-                num_val = float(num_str)
-                if not any(abs(f - num_val) < tolerance for f in found_floats):
+        entity_names = [ent.name, *(ent.aliases or [])]
+        for name in entity_names:
+            for num_val in numeric_tokens(name):
+                if not is_supported(num_val):
                     return False
-            except ValueError:
-                pass
 
     return True
 
