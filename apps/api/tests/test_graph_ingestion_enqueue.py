@@ -428,6 +428,8 @@ def test_crud_graph_event_operations(env):
     )
     event_newer.status = "COMPLETED"
     event_newer.completed_at = now
+    # Completion/retry time must not make the older source event current again.
+    event.completed_at = now + timedelta(hours=1)
     db.commit()
 
     latest2 = get_latest_completed_graph_event(db, paper.id)

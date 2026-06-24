@@ -35,7 +35,7 @@ from tests.fixtures.graphrag.corpus_fixtures import (
 )
 
 from app.db.base import Base
-from app.db.models import ChunkElement, GraphFactSnapshot, Paper, PaperChunk
+from app.db.models import ChunkElement, GraphFactSnapshot, Paper, PaperChunk, PaperElement
 from app.schemas.evidence import AnchorStatus, CitationAnchor, EvidenceItem
 from app.services.graphrag.evidence import (
     extract_fact_ids_from_candidates,
@@ -120,6 +120,11 @@ def test_verified_exact_quote(db_session: Session):
     manifest = validate_manifest(load_manifest())
     rel = manifest.projects["project_a"].papers[0].relationships[0]
     paper = db_session.query(Paper).filter(Paper.id == PAPER_A1_ID).one()
+    source_element = (
+        db_session.query(PaperElement).filter(PaperElement.id == rel.provenance.element_id).one()
+    )
+    source_element.parser_version = "docling-v3"
+    db_session.commit()
 
     snapshot = _create_snapshot(db_session, PROJECT_A_ID, rel, paper.document_sha256)
 
@@ -157,6 +162,7 @@ def test_verified_exact_quote(db_session: Session):
     assert anchor.source_char_end == rel.provenance.char_end
     assert anchor.document_sha256 == paper.document_sha256
     assert anchor.anchor_status == AnchorStatus.VERIFIED
+    assert anchor.parser_version == "docling-v3"
     assert len(anchor.bounding_boxes) > 0
 
     # Resolution via GraphFactSnapshot object directly
@@ -168,6 +174,7 @@ def test_verified_exact_quote(db_session: Session):
     assert (
         anchor_from_snap is not None and anchor_from_snap.exact_quote == rel.provenance.exact_quote
     )
+    assert anchor_from_snap is not None and anchor_from_snap.parser_version == "docling-v3"
 
     # Resolution via dict candidate with fact_id
     item_from_dict, _, status_from_dict = resolve_graph_fact_to_evidence(

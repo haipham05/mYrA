@@ -853,6 +853,73 @@ def test_numeric_support_reconciles_every_value_with_boundaries():
     assert _check_numeric_support(GraphQualifierSchema(result_value=2), [], "value 12") is False
     assert _check_numeric_support(GraphQualifierSchema(), [], "no numeric claim") is True
 
+    # The claimed result 2% accuracy must not be borrowed from the unrelated
+    # "2 GPUs" count elsewhere in the quote.
+    unrelated_measure = GraphQualifierSchema(
+        result_value=2, unit="%", metric="accuracy", dataset="ImageNet"
+    )
+    assert (
+        _check_numeric_support(
+            unrelated_measure,
+            [],
+            "Method X achieves 90% accuracy on ImageNet with 2 GPUs.",
+        )
+        is False
+    )
+
+    from app.services.graphrag.verifier import _check_qualifier_text_support
+
+    unsupported_conditions = GraphQualifierSchema(
+        result_value=2.1,
+        unit="count",
+        metric="ECE",
+        dataset="ImageNet",
+        split="train",
+        comparison_condition="augmented setup",
+    )
+    assert not _check_qualifier_text_support(
+        unsupported_conditions,
+        "Method X achieves 2.1% ECE on ImageNet test split under standard setup.",
+    )
+
+    from app.services.graphrag.verifier import _check_numeric_support
+
+    multi_metric_quote = (
+        "BERT reports GLUE 80.5% and MultiNLI 86.7% on test split for classification "
+        "under standard setup."
+    )
+    assert (
+        _check_numeric_support(
+            GraphQualifierSchema(result_value=86.7, raw_value="86.7%", unit="%", metric="GLUE"),
+            [],
+            multi_metric_quote,
+        )
+        is False
+    )
+    assert (
+        _check_numeric_support(
+            GraphQualifierSchema(result_value=80.5, raw_value="80.5%", unit="%", metric="GLUE"),
+            [],
+            multi_metric_quote,
+        )
+        is True
+    )
+
+    multi_dataset_quote = (
+        "Method X reports ImageNet accuracy 90% and CIFAR accuracy 80% on test split "
+        "for classification under standard setup."
+    )
+    assert (
+        _check_numeric_support(
+            GraphQualifierSchema(
+                result_value=80, raw_value="80%", unit="%", metric="accuracy", dataset="ImageNet"
+            ),
+            [],
+            multi_dataset_quote,
+        )
+        is False
+    )
+
     numeric_entity = GraphEntitySchema(id="e", name="999 BLEU", type=EntityType.RESULT)
     correct_raw_value = GraphQualifierSchema(raw_value="2.1 BLEU")
     assert (

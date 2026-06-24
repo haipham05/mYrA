@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import PdfViewer from "@/components/PdfViewer";
 import {
@@ -87,6 +87,7 @@ export default function GraphExplorer({
   const [isLoadingFact, setIsLoadingFact] = useState(false);
   const [factError, setFactError] = useState<string | null>(null);
   const [loadedPaper, setLoadedPaper] = useState<Paper | null>(null);
+  const factRequestId = useRef(0);
 
   // Visual graph pan & zoom state
   const [zoom, setZoom] = useState(1);
@@ -263,25 +264,23 @@ export default function GraphExplorer({
   // 4. Load Fact Detail when a fact is selected
   const loadFact = useCallback(
     async (factId: string) => {
+      const requestId = ++factRequestId.current;
       setIsLoadingFact(true);
       setFactError(null);
       setSelectedFact(null);
       setLoadedPaper(null);
       try {
         const fact = await fetchFactDetail(apiUrl, projectId, factId);
-        setSelectedFact(fact);
-
-        // Fetch paper for PDF viewer if verified
+        let paper: Paper | null = null;
         if (fact.anchor_status === "verified" && fact.citation) {
           try {
             const paperRes = await fetch(
               `${apiUrl}/api/v1/papers/${fact.paper_id}`,
             );
             if (paperRes.ok) {
-              const paperData = (await paperRes.json()) as Paper;
-              setLoadedPaper(paperData);
+              paper = (await paperRes.json()) as Paper;
             } else {
-              setLoadedPaper({
+              paper = {
                 id: fact.paper_id,
                 project_id: projectId,
                 filename: fact.paper_title || "Paper",
@@ -289,10 +288,10 @@ export default function GraphExplorer({
                 document_sha256: fact.document_sha256,
                 created_at: new Date().toISOString(),
                 updated_at: new Date().toISOString(),
-              });
+              };
             }
           } catch {
-            setLoadedPaper({
+            paper = {
               id: fact.paper_id,
               project_id: projectId,
               filename: fact.paper_title || "Paper",
@@ -300,18 +299,25 @@ export default function GraphExplorer({
               document_sha256: fact.document_sha256,
               created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
-            });
+            };
           }
         }
-      } catch (err) {
-        if (err instanceof GraphUnavailableError) {
-          setIsOffline(true);
+        if (factRequestId.current === requestId) {
+          setSelectedFactId(factId);
+          setSelectedFact(fact);
+          setLoadedPaper(paper);
         }
-        setFactError(
-          err instanceof Error ? err.message : "Failed to load fact details.",
-        );
+      } catch (err) {
+        if (factRequestId.current === requestId) {
+          if (err instanceof GraphUnavailableError) {
+            setIsOffline(true);
+          }
+          setFactError(
+            err instanceof Error ? err.message : "Failed to load fact details.",
+          );
+        }
       } finally {
-        setIsLoadingFact(false);
+        if (factRequestId.current === requestId) setIsLoadingFact(false);
       }
     },
     [apiUrl, projectId],
@@ -324,24 +330,12 @@ export default function GraphExplorer({
 
   useEffect(() => {
     if (!initialFactId) return;
-    const factId = initialFactId;
-    let ignore = false;
-    async function initFact() {
-      try {
-        const fact = await fetchFactDetail(apiUrl, projectId, factId);
-        if (!ignore) {
-          setSelectedFactId(factId);
-          setSelectedFact(fact);
-        }
-      } catch {
-        // ignore
-      }
-    }
-    initFact();
+    const timer = window.setTimeout(() => void loadFact(initialFactId), 0);
     return () => {
-      ignore = true;
+      window.clearTimeout(timer);
+      factRequestId.current += 1;
     };
-  }, [initialFactId, apiUrl, projectId]);
+  }, [initialFactId, loadFact]);
 
   // 5. Index Papers Action
   const handleIndexPapers = async () => {
@@ -1081,7 +1075,7 @@ export default function GraphExplorer({
         )}
 
         {/* Right Column: Fact Detail & Source Jump (Task 5.32) */}
-        {selectedFact && (
+        {(selectedFact || isLoadingFact || factError) && (
           <div className="flex flex-col gap-4 rounded-xl border border-zinc-200 bg-white p-5 shadow-2xs lg:col-span-5">
             <div className="flex items-center justify-between border-b border-zinc-200 pb-3">
               <h3 className="font-bold text-sm text-zinc-950">Fact Detail</h3>
@@ -1107,7 +1101,7 @@ export default function GraphExplorer({
               <div className="p-4 text-xs text-red-600 bg-red-50 rounded-lg">
                 {factError}
               </div>
-            ) : (
+            ) : selectedFact ? (
               <div className="flex flex-col gap-4">
                 {/* Subject - Predicate - Object */}
                 <div className="rounded-lg bg-zinc-50 p-3 text-xs flex flex-col gap-1.5 border border-zinc-200">
@@ -1239,7 +1233,7 @@ export default function GraphExplorer({
                   </Link>
                 </div>
               </div>
-            )}
+            ) : null}
           </div>
         )}
       </div>

@@ -375,6 +375,61 @@ describe("GraphExplorer Component", () => {
     });
   });
 
+  it("loads the source paper and viewer for an initial fact deep link", async () => {
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        id: "paper-123",
+        project_id: mockProjectId,
+        filename: "Attention Is All You Need.pdf",
+        status: "READY",
+        document_sha256: "aabbcc112233".padEnd(64, "0"),
+      }),
+    } as Response);
+
+    render(
+      <GraphExplorer
+        projectId={mockProjectId}
+        apiUrl={mockApiUrl}
+        initialFactId="fact-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(fetchFactDetail).toHaveBeenCalledWith(
+        mockApiUrl,
+        mockProjectId,
+        "fact-1",
+      );
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `${mockApiUrl}/api/v1/papers/paper-123`,
+      );
+      expect(screen.getByTestId("mock-pdf-filename")).toHaveTextContent(
+        "Attention Is All You Need.pdf",
+      );
+      expect(screen.getByTestId("mock-pdf-citation")).toHaveTextContent(
+        mockVerifiedFact.exact_quote,
+      );
+    });
+  });
+
+  it("shows an error when an initial fact deep link is unavailable", async () => {
+    vi.mocked(fetchFactDetail).mockRejectedValueOnce(
+      new Error("Graph fact not found"),
+    );
+
+    render(
+      <GraphExplorer
+        projectId={mockProjectId}
+        apiUrl={mockApiUrl}
+        initialFactId="retired-fact"
+      />,
+    );
+
+    expect(await screen.findByText("Graph fact not found")).toBeInTheDocument();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
   // Test 6: Selecting an unverified fact shows "Exact highlight unavailable" notice with zero guessed rectangle.
   it("selecting an unverified fact shows 'Exact highlight unavailable' notice with zero guessed rectangle", async () => {
     vi.mocked(fetchFactDetail).mockResolvedValueOnce(mockUnverifiedFact);

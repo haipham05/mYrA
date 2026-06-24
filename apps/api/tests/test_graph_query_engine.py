@@ -1208,6 +1208,24 @@ def test_comparisons_abstain_for_different_or_unknown_conditions() -> None:
         mock_repo.get_project_facts.return_value = [first, other]
         assert build_contradiction_candidates(None, mock_repo, project_id) == []
 
+    # Identical invented qualifiers cannot make unlike source splits comparable.
+    train_quote = _make_comparison_fact("train", str(uuid4()), 90)
+    test_quote = _make_comparison_fact("test", str(uuid4()), 80)
+    for fact, split in ((train_quote, "train"), (test_quote, "test")):
+        fact["exact_quote"] = fact["exact_quote"].replace("test split", f"{split} split")
+        fact["qualifiers"]["split"] = "test"
+    mock_repo = MagicMock(spec=Neo4jRepository)
+    mock_repo.get_project_facts.return_value = [train_quote, test_quote]
+    assert build_contradiction_candidates(None, mock_repo, project_id) == []
+
+    # A fabricated unit/condition is not comparison evidence even if both records agree.
+    unsupported_a = _make_comparison_fact("a", str(uuid4()), 90, split="test", unit="count")
+    unsupported_b = _make_comparison_fact("b", str(uuid4()), 80, split="test", unit="count")
+    unsupported_a["exact_quote"] = unsupported_a["exact_quote"].replace("90count", "90%")
+    unsupported_b["exact_quote"] = unsupported_b["exact_quote"].replace("80count", "80%")
+    mock_repo.get_project_facts.return_value = [unsupported_a, unsupported_b]
+    assert build_contradiction_candidates(None, mock_repo, project_id) == []
+
 
 def test_matching_supported_comparison_preserves_both_sources_and_basis() -> None:
     from unittest.mock import MagicMock

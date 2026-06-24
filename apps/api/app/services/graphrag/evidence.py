@@ -70,9 +70,7 @@ def resolve_graph_fact_to_evidence(
             "char_start": snapshot.char_start,
             "char_end": snapshot.char_end,
             "document_sha256": snapshot.document_sha256,
-            "parser_version": getattr(snapshot, "parser_version", None)
-            or getattr(snapshot, "validation_version", None)
-            or "v1",
+            "parser_version": getattr(snapshot, "parser_version", None),
         }
     elif isinstance(fact, str):
         fact_id = fact.strip()
@@ -98,9 +96,7 @@ def resolve_graph_fact_to_evidence(
             "char_start": snapshot.char_start,
             "char_end": snapshot.char_end,
             "document_sha256": snapshot.document_sha256,
-            "parser_version": getattr(snapshot, "parser_version", None)
-            or getattr(snapshot, "validation_version", None)
-            or "v1",
+            "parser_version": getattr(snapshot, "parser_version", None),
         }
     elif isinstance(fact, dict):
         cand_proj = fact.get("project_id")
@@ -134,9 +130,7 @@ def resolve_graph_fact_to_evidence(
                 "char_start": snapshot.char_start,
                 "char_end": snapshot.char_end,
                 "document_sha256": snapshot.document_sha256,
-                "parser_version": getattr(snapshot, "parser_version", None)
-                or getattr(snapshot, "validation_version", None)
-                or "v1",
+                "parser_version": getattr(snapshot, "parser_version", None),
             }
         else:
             raw_prov = fact.get("provenance") if isinstance(fact.get("provenance"), dict) else fact

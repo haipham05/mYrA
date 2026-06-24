@@ -419,12 +419,40 @@ async def test_stale_generation_does_not_retire_newer_graph():
         assert claimed.id == ev1_id
         await processor.process_graph_event(db, ev1_id, worker_id="worker-stale")
 
-    # Older event completes, but retire_older_generations was NEVER called!
+    # The stale generation is rejected before any graph writes or retirement.
+    mock_repo.upsert_nodes.assert_not_called()
+    mock_repo.upsert_facts.assert_not_called()
     mock_repo.retire_older_generations.assert_not_called()
 
     with SessionLocal() as db:
         ev1_refreshed = get_graph_event(db, ev1_id)
-        assert ev1_refreshed.status == "COMPLETED"
+        assert ev1_refreshed.status == "FAILED"
+        assert ev1_refreshed.error_code == "SUPERSEDED"
+
+
+@pytest.mark.anyio
+async def test_expired_graph_lease_cannot_publish():
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Expired Lease Proj"))
+        paper = _setup_ready_paper(db, project.id)
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+
+    with SessionLocal() as db:
+        claimed = claim_next_graph_event(db, worker_id="expired-worker")
+        assert claimed is not None and claimed.id == event_id
+        claimed.lease_expires_at = datetime.now(tz=UTC) - timedelta(seconds=1)
+        db.commit()
+
+    mock_repo = MagicMock(spec=Neo4jRepository)
+    processor = GraphEventProcessor(repo=mock_repo)
+    with SessionLocal() as db:
+        await processor.process_graph_event(db, event_id, worker_id="expired-worker")
+
+    mock_repo.upsert_nodes.assert_not_called()
+    mock_repo.upsert_facts.assert_not_called()
+    mock_repo.retire_older_generations.assert_not_called()
 
 
 @pytest.mark.anyio

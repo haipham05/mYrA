@@ -162,6 +162,43 @@ def _normalize_condition(value: Any) -> str | None:
     return normalized or None
 
 
+def _quote_supports(value: Any, quote: str) -> bool:
+    """Return whether a declared comparison dimension is stated in its source quote."""
+    normalized = _normalize_condition(value)
+    if normalized is None:
+        return False
+    quote_normalized = _normalize_condition(quote)
+    if quote_normalized is None:
+        return False
+    aliases = {"%": {"%", "percent", "percentage"}, "percent": {"%", "percent", "percentage"}}
+    candidates = aliases.get(normalized, {normalized})
+    for candidate in candidates:
+        if candidate == "%":
+            if "%" in quote:
+                return True
+            continue
+        if candidate in quote_normalized:
+            return True
+    return False
+
+
+def _context_is_quote_supported(fact: dict[str, Any], context: dict[str, Any]) -> bool:
+    """Do not compare facts whose declared conditions are not grounded in their quotes."""
+    quote = str(fact.get("exact_quote") or "")
+    return all(
+        _quote_supports(context.get(dimension), quote)
+        for dimension in (
+            "method",
+            "dataset",
+            "metric",
+            "task",
+            "split",
+            "unit",
+            "comparison_condition",
+        )
+    )
+
+
 def _comparable_contexts(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Require explicit, matching conditions before comparing two claims."""
     required_dimensions = (
@@ -319,6 +356,8 @@ def build_contradiction_candidates(
             )
         ):
             continue
+        if not _context_is_quote_supported(fact_a, ctx_a):
+            continue
 
         s_key_a = fact_a.get("subject_key")
         s_name_a = (fact_a.get("subject_name") or "").strip().lower()
@@ -334,6 +373,8 @@ def build_contradiction_candidates(
             ctx_b = contexts[j]
 
             if not _comparable_contexts(ctx_a, ctx_b):
+                continue
+            if not _context_is_quote_supported(fact_b, ctx_b):
                 continue
 
             # Must assert relations on the same subject/method or method-dataset

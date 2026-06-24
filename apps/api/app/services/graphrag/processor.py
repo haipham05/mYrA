@@ -18,8 +18,9 @@ from app.crud.graph import (
     complete_graph_event,
     fail_graph_event,
     get_graph_event,
+    lock_graph_publication,
 )
-from app.db.models import GraphEvent, Paper
+from app.db.models import Paper
 from app.services.graphrag.extractor import (
     ExtractionResult,
     GraphExtractionAdapter,
@@ -103,6 +104,8 @@ class GraphEventProcessor:
 
         try:
             if event.action == "DELETE":
+                if not lock_graph_publication(db, event.id, worker_id):
+                    return
                 if self.repo is not None:
                     try:
                         self.repo.delete_paper_facts(
@@ -230,23 +233,10 @@ class GraphEventProcessor:
                     # BEFORE touching Neo4j!
                     db.commit()
 
-                # Current Generation Check:
-                # Query graph_events for any newer completed event for this paper.
-                # If a newer generation was already completed, do NOT retire the newer graph!
-                # Complete the event without retiring the newer generation.
-                newer_completed_event = None
-                if event.created_at is not None:
-                    newer_completed_event = (
-                        db.query(GraphEvent)
-                        .filter(
-                            GraphEvent.paper_id == paper_id,
-                            GraphEvent.status == "COMPLETED",
-                            GraphEvent.id != event.id,
-                            GraphEvent.created_at > event.created_at,
-                        )
-                        .first()
-                    )
-                is_latest_generation = newer_completed_event is None
+                # Lock/recheck after extraction and durable snapshot commit, as close
+                # as possible to publication; newer enqueues serialize on Paper.
+                if not lock_graph_publication(db, event.id, worker_id):
+                    return
 
                 # Publish to Neo4j (if self.repo is configured/present)
                 if self.repo is not None:
@@ -303,12 +293,11 @@ class GraphEventProcessor:
                             facts,
                         )
 
-                    if is_latest_generation:
-                        self.repo.retire_older_generations(
-                            project_id,
-                            paper_id,
-                            event.generation_id,
-                        )
+                    self.repo.retire_older_generations(
+                        project_id,
+                        paper_id,
+                        event.generation_id,
+                    )
 
                 # Checkpoint in PostgreSQL
                 complete_graph_event(db, event.id, worker_id=worker_id)

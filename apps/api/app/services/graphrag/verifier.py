@@ -166,8 +166,57 @@ def _check_numeric_support(
         ]
         if qualifiers.raw_value:
             declared_values.extend(numeric_tokens(qualifiers.raw_value))
-        if any(not is_supported(value) for value in declared_values):
+        # Metric, dataset and unit describe one measurement, so bind them and its
+        # value within one short source clause. This prevents borrowing a number
+        # from a neighboring metric/dataset in a multi-result sentence.
+        measurement_fields = (qualifiers.metric, qualifiers.dataset, qualifiers.unit)
+        clauses = [
+            clause.strip().casefold()
+            for clause in re.split(
+                r"[;,!?]|\.(?=\s|$)|\b(?:and|but|while|whereas)\b",
+                quote_norm_decimals,
+                flags=re.IGNORECASE,
+            )
+            if clause.strip()
+        ]
+        scoped_clauses = [
+            clause
+            for clause in clauses
+            if all(
+                not field or " ".join(str(field).casefold().split()) in clause
+                for field in measurement_fields
+            )
+        ]
+        if any(measurement_fields) and not scoped_clauses:
             return False
+        numeric_evidence = (
+            " ".join(scoped_clauses) if any(measurement_fields) else quote_norm_decimals
+        )
+        scoped_values = numeric_tokens(numeric_evidence)
+        if any(
+            not any(abs(found - value) < tolerance for found in scoped_values)
+            for value in declared_values
+        ):
+            return False
+        # When a unit is claimed, the value must occur with that unit, not merely
+        # somewhere else in a quote that contains an unrelated measurement.
+        if qualifiers.unit and declared_values:
+            unit = qualifiers.unit.strip()
+            unit_pattern = r"%" if unit in {"%", "percent", "percentage"} else re.escape(unit)
+            paired = re.compile(
+                rf"(?<![\w.])([+-]?(?:\d{{1,3}}(?:,\d{{3}})+|\d+)(?:\.\d+)?)"
+                rf"\s*{unit_pattern}(?!\w)",
+                re.IGNORECASE,
+            )
+            paired_values = {
+                float(match.group(1).replace(",", ""))
+                for match in paired.finditer(numeric_evidence)
+            }
+            if any(
+                not any(abs(value - paired_value) < tolerance for paired_value in paired_values)
+                for value in declared_values
+            ):
+                return False
 
     # 2. Check numbers in entity names (e.g. Result named "8.5% ECE")
     for ent in candidate_entities:
@@ -177,6 +226,24 @@ def _check_numeric_support(
                 if not is_supported(num_val):
                     return False
 
+    return True
+
+
+def _check_qualifier_text_support(qualifiers: GraphQualifierSchema | None, quote: str) -> bool:
+    """Ensure declared comparison conditions are present in the authoritative quote."""
+    if qualifiers is None:
+        return True
+    quote_normalized = " ".join(quote.casefold().split())
+    for field in ("unit", "metric", "dataset", "split", "task", "comparison_condition"):
+        value = getattr(qualifiers, field, None)
+        if not value:
+            continue
+        normalized = " ".join(str(value).casefold().split())
+        if field == "unit" and normalized in {"%", "percent", "percentage"}:
+            if "%" not in quote and "percent" not in quote_normalized:
+                return False
+        elif normalized not in quote_normalized:
+            return False
     return True
 
 
@@ -231,6 +298,8 @@ def verify_candidate_fact(
         return (False, "REVERSED_ACTOR")
 
     # 5. Qualifier / Numeric check
+    if not _check_qualifier_text_support(candidate.qualifiers, quote_norm):
+        return (False, "UNSUPPORTED_QUALIFIER")
     if not _check_numeric_support(
         candidate.qualifiers,
         [candidate.subject, candidate.object],

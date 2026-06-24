@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import GraphEvent
+from app.db.models import GraphEvent, Paper
 
 
 class LostGraphLeaseError(RuntimeError):
@@ -32,6 +32,10 @@ def create_or_enqueue_graph_event(
 
     if generation_id is None:
         generation_id = f"gen_{paper_id.hex[:8]}_{uuid4().hex[:12]}"
+
+    # Serialize event creation with the publication boundary. A publisher holds
+    # this same row lock while checking for newer events and writing its projection.
+    db.query(Paper).filter(Paper.id == paper_id).with_for_update().first()
 
     event = GraphEvent(
         project_id=project_id,
@@ -73,7 +77,7 @@ def get_active_graph_events_for_paper(db: Session, paper_id: UUID | str) -> list
 
 
 def get_latest_completed_graph_event(db: Session, paper_id: UUID | str) -> GraphEvent | None:
-    """Retrieve the most recently completed GraphEvent for a paper."""
+    """Retrieve the completed event with the newest source/event order."""
     if isinstance(paper_id, str):
         paper_id = UUID(paper_id)
     stmt = (
@@ -82,10 +86,57 @@ def get_latest_completed_graph_event(db: Session, paper_id: UUID | str) -> Graph
             GraphEvent.paper_id == paper_id,
             GraphEvent.status == "COMPLETED",
         )
-        .order_by(GraphEvent.completed_at.desc().nullslast(), GraphEvent.created_at.desc())
+        .order_by(GraphEvent.created_at.desc(), GraphEvent.id.desc())
         .limit(1)
     )
     return db.scalars(stmt).first()
+
+
+def lock_graph_publication(db: Session, event_id: UUID | str, worker_id: str) -> bool:
+    """Hold a per-paper publication lock and fence expired, lost, or superseded work.
+
+    The Paper row lock is shared with create_or_enqueue_graph_event and is retained
+    until the caller's event completion/failure commits. PostgreSQL therefore
+    linearizes event creation against the final generation check and graph write;
+    the SQL/Neo4j operations are still not one distributed transaction.
+    """
+    event_id = UUID(event_id) if isinstance(event_id, str) else event_id
+    event = db.query(GraphEvent).filter(GraphEvent.id == event_id).with_for_update().first()
+    if not event or event.status != "PROCESSING" or event.lease_owner != worker_id:
+        db.rollback()
+        return False
+
+    db.query(Paper).filter(Paper.id == event.paper_id).with_for_update().first()
+    now = datetime.now(tz=UTC)
+    expiry = event.lease_expires_at
+    if expiry is not None:
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if expiry < now:
+            db.rollback()
+            return False
+
+    newer_event = (
+        db.query(GraphEvent.id)
+        .filter(
+            GraphEvent.paper_id == event.paper_id,
+            GraphEvent.id != event.id,
+            (GraphEvent.created_at > event.created_at)
+            | ((GraphEvent.created_at == event.created_at) & (GraphEvent.id > event.id)),
+        )
+        .first()
+    )
+    if newer_event:
+        fail_graph_event(
+            db,
+            event.id,
+            worker_id,
+            error_code="SUPERSEDED",
+            error_message="A newer graph event superseded this generation before publication.",
+            is_transient=False,
+        )
+        return False
+    return True
 
 
 def claim_next_graph_event(

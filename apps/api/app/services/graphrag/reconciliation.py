@@ -206,7 +206,11 @@ def rebuild_paper_graph_from_snapshots(
                     GraphFactSnapshot.project_id == project_id,
                     GraphFactSnapshot.paper_id == paper_id,
                 )
-                .order_by(GraphFactSnapshot.created_at.desc())
+                .order_by(
+                    GraphFactSnapshot.created_at.desc(),
+                    GraphFactSnapshot.generation_id.desc(),
+                    GraphFactSnapshot.fact_id.desc(),
+                )
                 .first()
             )
             if latest_snapshot:
