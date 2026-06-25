@@ -6,6 +6,8 @@ graph failures NEVER modify or fail the authoritative Paper record.
 
 import json
 import logging
+import re
+from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -252,10 +254,64 @@ class GraphEventProcessor:
                         )
 
                     valid_candidates = []
+                    verification_rejections: Counter[str] = Counter()
                     for candidate in extraction_result.accepted_facts:
-                        is_valid, _ = verify_candidate_fact(db, project_id, candidate)
+                        is_valid, rejection_reason = verify_candidate_fact(
+                            db, project_id, candidate
+                        )
                         if is_valid:
                             valid_candidates.append(candidate)
+                        else:
+                            verification_rejections[rejection_reason or "UNKNOWN"] += 1
+
+                    if verification_rejections:
+                        logger.info(
+                            "Graph candidate verification for paper %s: extracted=%d, "
+                            "verified=%d, rejected=%d, reasons=%s",
+                            paper_id,
+                            len(extraction_result.accepted_facts),
+                            len(valid_candidates),
+                            sum(verification_rejections.values()),
+                            dict(sorted(verification_rejections.items())),
+                        )
+
+                    if extraction_result.rejected_count:
+                        safe_extraction_rejections = {
+                            reason: count
+                            for reason, count in extraction_result.rejection_reasons.items()
+                            if re.fullmatch(r"[A-Z0-9_]{1,64}", reason)
+                            and isinstance(count, int)
+                            and count > 0
+                        }
+                        logger.info(
+                            "Graph extraction validation for paper %s: rejected=%d, reasons=%s",
+                            paper_id,
+                            extraction_result.rejected_count,
+                            dict(sorted(safe_extraction_rejections.items())),
+                        )
+
+                    if not valid_candidates and (
+                        extraction_result.accepted_facts or extraction_result.rejected_count
+                    ):
+                        # Do not turn failed source/claim verification into a
+                        # successful empty generation. Preserve the currently
+                        # published generation for inspection/retry after a fix.
+                        fail_graph_event(
+                            db=db,
+                            event_id=event.id,
+                            worker_id=worker_id,
+                            error_code="NO_VERIFIED_FACTS",
+                            error_message=(
+                                f"{len(extraction_result.accepted_facts)} extracted facts "
+                                "failed source or claim verification."
+                            ),
+                            is_transient=False,
+                        )
+                        logger.warning(
+                            "Graph event %s failed: no extracted facts passed verification",
+                            event.id,
+                        )
+                        return
 
                     snapshots = persist_verified_fact_snapshots(
                         db=db,

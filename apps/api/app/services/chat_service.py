@@ -408,10 +408,12 @@ def check_claim_support(claim_text: str, evidence_quote: str) -> bool:
 
 
 def extract_verbatim_quoted_phrase(claim_text: str, evidence_quote: str) -> str | None:
-    """Keep a model-quoted source phrase, never its unsupported surrounding prose."""
+    """Keep a model-quoted or bolded source phrase, never its unsupported surrounding prose."""
     norm_evidence = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", evidence_quote)
-    for match in re.finditer(r'["“]([^"”]+)["”]', claim_text):
-        candidate = match.group(1).strip()
+    for match in re.finditer(r'(?:["“]([^"”]+)["”]|(?:\*\*|__)([^*_]+)(?:\*\*|__))', claim_text):
+        candidate = (match.group(1) or match.group(2) or "").strip()
+        if not candidate:
+            continue
         norm_candidate = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", candidate)
         if len(re.findall(r"\b\w+\b", norm_candidate)) < 3:
             continue
@@ -425,6 +427,29 @@ def extract_verbatim_quoted_phrase(claim_text: str, evidence_quote: str) -> str 
         source_phrase = source_match.group(0)
         if check_claim_support(source_phrase, evidence_quote):
             return source_phrase
+    return None
+
+
+def find_substantive_span(claim_text: str, evidence_quote: str, min_words: int = 4) -> str | None:
+    norm_evidence = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", evidence_quote)
+    norm_claim = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", claim_text)
+    claim_numbers = re.findall(r"\b\d+(?:\.\d+)?%?\b", norm_claim)
+    quote_numbers = set(re.findall(r"\b\d+(?:\.\d+)?%?\b", norm_evidence))
+    for num in claim_numbers:
+        if num not in quote_numbers:
+            return None
+
+    words = re.findall(r"\b\w+\b", norm_claim)
+    max_search_len = min(len(words), 30)
+    for length in range(max_search_len, min_words - 1, -1):
+        for start in range(len(words) - length + 1):
+            sub_words = words[start : start + length]
+            pattern = r"\s*".join(re.escape(w) for w in sub_words)
+            m = re.search(pattern, norm_evidence, flags=re.IGNORECASE)
+            if m:
+                matched_span = m.group(0)
+                if check_claim_support(matched_span, evidence_quote):
+                    return matched_span
     return None
 
 
@@ -491,8 +516,12 @@ def resolve_claim_anchor(
 
         # Check if candidate quotes match across parent_context / canonical page text
         # (Quotes that span across multiple elements or lines in the PDF)
-        for match in re.finditer(r'["“]([^"”]+)["”]', clean_claim):
-            candidate_raw = match.group(1).strip()
+        for match in re.finditer(
+            r'(?:["“]([^"”]+)["”]|(?:\*\*|__)([^*_]+)(?:\*\*|__))', clean_claim
+        ):
+            candidate_raw = (match.group(1) or match.group(2) or "").strip()
+            if not candidate_raw:
+                continue
             candidate_variants = [candidate_raw]
             stripped = candidate_raw.rstrip(".,;:!? ")
             if stripped != candidate_raw and len(stripped) > 0:
@@ -575,6 +604,13 @@ def resolve_claim_anchor(
             combined = f"{a1.exact_quote} {a2.exact_quote}"
             if check_claim_support(clean_claim, combined):
                 return a1, None
+
+    # 4. Check substantive contiguous span for unquoted natural sentences
+    if cite_count == 1:
+        for cand in verified_anchors:
+            span = find_substantive_span(clean_claim, cand.exact_quote)
+            if span is not None:
+                return cand, span
 
     return None, None
 
@@ -737,10 +773,10 @@ class ChatService:
             "Answer the QUESTION using the provided EVIDENCE quotes and PROJECT MEMORY, "
             "maintaining continuity with CONVERSATION HISTORY when relevant.\n\n"
             "CITATION & PROVENANCE RULES:\n"
-            "- For any factual claim from papers, copy a short relevant sentence or phrase "
-            "verbatim from ONE Evidence quote, preserving its words, numbers, and order, "
-            "then append that quote's citation ID such as [E1]. "
-            "Wrap verbatim quotes in quotation marks.\n"
+            "- For any factual claim from papers, support it with a citation ID such as [E1]. "
+            "You may quote key phrases in quotation marks or integrate facts naturally into "
+            "clear, complete sentences.\n"
+            "- Preserve exact technical terms, numbers, and definitions from the cited evidence.\n"
             "- Never invent a citation ID. Never use [E...] brackets for project decisions "
             "or user preferences.\n"
             "- For questions regarding project decisions, user preferences, terminology, or "
@@ -799,107 +835,149 @@ class ChatService:
         raw_answer = await llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
 
         # 5. Sentence-level citation validation and claim support checking
-        raw_sentences = [
-            s.strip() for s in re.split(r"(?<=[.!?])\s+(?!\[E\d+\])", raw_answer) if s.strip()
-        ]
-
+        protected_answer = re.sub(
+            r"\b(et\s+al|vs|e\.g|i\.e|fig|tab|no|vol|sec)\.",
+            r"\1<DOT>",
+            raw_answer,
+            flags=re.IGNORECASE,
+        )
         validated_citations: list[Citation] = []
         citation_to_display_index: dict[str, int] = {}
         display_idx = 1
-        retained_sentences: list[str] = []
+        retained_paragraphs: list[str] = []
 
-        for sentence in raw_sentences:
-            cite_matches = list(re.finditer(r"\[E(\d+)\]", sentence))
-            if not cite_matches:
-                if is_attributed_to_memories(
-                    sentence,
-                    memories=decision_preference_memories,
-                ):
-                    retained_sentences.append(sentence)
-                continue
+        paragraphs = [p for p in protected_answer.split("\n\n") if p.strip()]
+        for para in paragraphs:
+            para_lines = [line for line in para.split("\n") if line.strip()]
+            retained_lines: list[str] = []
+            for line in para_lines:
+                clean_line = line.strip()
+                cite_matches_in_line = list(re.finditer(r"\[E(\d+)\]", clean_line))
 
-            # Verify all citation IDs exist in evidence
-            all_valid_ids = True
-            for m in cite_matches:
-                e_id = f"E{m.group(1)}"
-                if e_id not in evidence_map:
-                    all_valid_ids = False
-                    break
-
-            if not all_valid_ids:
-                # Hallucinated unknown citation: discard entire sentence
-                continue
-
-            # Verify claim support against cited evidence
-            sentence_supported = True
-            resolved_anchors_for_sentence: dict[str, tuple[CitationAnchor, str | None]] = {}
-            clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
-
-            for m in cite_matches:
-                e_id = f"E{m.group(1)}"
-                evidence = evidence_map[e_id]
-                anchor, source_phrase = resolve_claim_anchor(
-                    db=db,
-                    evidence=evidence,
-                    clean_claim=clean_claim,
-                    cite_count=len(cite_matches),
-                )
-                if anchor is None:
-                    sentence_supported = False
-                    break
-                resolved_anchors_for_sentence[e_id] = (anchor, source_phrase)
-
-            if not sentence_supported:
-                # Unsupported claim: discard entire sentence
-                continue
-
-            if len(cite_matches) == 1:
-                e_id = f"E{cite_matches[0].group(1)}"
-                _, source_phrase = resolved_anchors_for_sentence[e_id]
-                if source_phrase is not None:
-                    sentence = f'"{source_phrase}" {cite_matches[0].group()}.'
-
-            # Register verified citations for supported sentence
-            for m in cite_matches:
-                e_id = f"E{m.group(1)}"
-                if e_id not in citation_to_display_index:
-                    evidence = evidence_map[e_id]
-                    citation_to_display_index[e_id] = display_idx
-                    matched_anchor, _ = resolved_anchors_for_sentence[e_id]
-
-                    anchors_list = list(evidence.anchors)
-                    if not any(
-                        a.page_number == matched_anchor.page_number
-                        and a.exact_quote == matched_anchor.exact_quote
-                        and a.source_char_start == matched_anchor.source_char_start
-                        for a in anchors_list
-                    ):
-                        anchors_list.append(matched_anchor)
-
-                    validated_citations.append(
-                        Citation(
-                            citation_index=display_idx,
-                            evidence_id=e_id,
-                            paper_id=evidence.paper_id,
-                            page_number=matched_anchor.page_number,
-                            bounding_boxes=matched_anchor.bounding_boxes or evidence.bounding_boxes,
-                            quote=matched_anchor.exact_quote,
-                            document_sha256=evidence.document_sha256,
-                            parser_version=evidence.parser_version,
-                            anchor_status=AnchorStatus.VERIFIED,
-                            anchors=anchors_list,
-                        )
+                # Retain section headers and transition/introductory lines
+                is_structure = (
+                    clean_line.endswith(":")
+                    or (
+                        clean_line.startswith(("#", "**"))
+                        and not clean_line.endswith((".", "!", "?"))
                     )
-                    display_idx += 1
+                ) and len(clean_line) < 100
 
-            def replace_cite(m: re.Match) -> str:
-                eid = f"E{m.group(1)}"
-                return f"[{citation_to_display_index[eid]}]"
+                if is_structure and not cite_matches_in_line:
+                    retained_lines.append(line)
+                    continue
 
-            retained_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
+                line_sentences = [
+                    s.replace("<DOT>", ".").strip()
+                    for s in re.split(r"(?<=[.!?])\s+(?!\[E\d+\])", clean_line)
+                    if s.strip()
+                ]
 
-        if retained_sentences and (validated_citations or decision_preference_memories):
-            formatted_answer = " ".join(retained_sentences)
+                retained_line_sentences: list[str] = []
+                for sentence in line_sentences:
+                    cite_matches = list(re.finditer(r"\[E(\d+)\]", sentence))
+                    if not cite_matches:
+                        if is_attributed_to_memories(
+                            sentence,
+                            memories=decision_preference_memories,
+                        ):
+                            retained_line_sentences.append(sentence)
+                        continue
+
+                    # Verify all citation IDs exist in evidence
+                    all_valid_ids = True
+                    for m in cite_matches:
+                        e_id = f"E{m.group(1)}"
+                        if e_id not in evidence_map:
+                            all_valid_ids = False
+                            break
+
+                    if not all_valid_ids:
+                        # Hallucinated unknown citation: discard entire sentence
+                        continue
+
+                    # Verify claim support against cited evidence
+                    sentence_supported = True
+                    resolved_anchors_for_sentence: dict[str, tuple[CitationAnchor, str | None]] = {}
+                    clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
+
+                    for m in cite_matches:
+                        e_id = f"E{m.group(1)}"
+                        evidence = evidence_map[e_id]
+                        anchor, source_phrase = resolve_claim_anchor(
+                            db=db,
+                            evidence=evidence,
+                            clean_claim=clean_claim,
+                            cite_count=len(cite_matches),
+                        )
+                        if anchor is None:
+                            sentence_supported = False
+                            break
+                        resolved_anchors_for_sentence[e_id] = (anchor, source_phrase)
+
+                    if not sentence_supported:
+                        # Unsupported claim: discard entire sentence
+                        continue
+
+                    # Register verified citations for supported sentence
+                    for m in cite_matches:
+                        e_id = f"E{m.group(1)}"
+                        if e_id not in citation_to_display_index:
+                            evidence = evidence_map[e_id]
+                            citation_to_display_index[e_id] = display_idx
+                            matched_anchor, _ = resolved_anchors_for_sentence[e_id]
+
+                            anchors_list = list(evidence.anchors)
+                            if not any(
+                                a.page_number == matched_anchor.page_number
+                                and a.exact_quote == matched_anchor.exact_quote
+                                and a.source_char_start == matched_anchor.source_char_start
+                                for a in anchors_list
+                            ):
+                                anchors_list.append(matched_anchor)
+
+                            validated_citations.append(
+                                Citation(
+                                    citation_index=display_idx,
+                                    evidence_id=e_id,
+                                    paper_id=evidence.paper_id,
+                                    page_number=matched_anchor.page_number,
+                                    bounding_boxes=(
+                                        matched_anchor.bounding_boxes or evidence.bounding_boxes
+                                    ),
+                                    quote=matched_anchor.exact_quote,
+                                    document_sha256=evidence.document_sha256,
+                                    parser_version=evidence.parser_version,
+                                    anchor_status=AnchorStatus.VERIFIED,
+                                    anchors=anchors_list,
+                                )
+                            )
+                            display_idx += 1
+
+                    def replace_cite(m: re.Match) -> str:
+                        eid = f"E{m.group(1)}"
+                        return f"[{citation_to_display_index[eid]}]"
+
+                    retained_line_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
+
+                if retained_line_sentences:
+                    bullet_prefix = ""
+                    stripped_l = line.lstrip()
+                    for prefix in ("- ", "* ", "+ ", "• "):
+                        if stripped_l.startswith(prefix):
+                            bullet_prefix = line[: len(line) - len(stripped_l)] + prefix
+                            break
+                    joined_sent = " ".join(retained_line_sentences)
+                    if bullet_prefix and not joined_sent.startswith(bullet_prefix):
+                        if not any(joined_sent.startswith(p) for p in ("- ", "* ", "+ ", "• ")):
+                            joined_sent = f"{bullet_prefix}{joined_sent}"
+                    retained_lines.append(joined_sent)
+
+            if retained_lines:
+                retained_paragraphs.append("\n".join(retained_lines))
+
+        if retained_paragraphs and (validated_citations or decision_preference_memories):
+            formatted_answer = "\n\n".join(retained_paragraphs)
         else:
             formatted_answer = (
                 "Insufficient evidence available in the uploaded papers to answer this question."

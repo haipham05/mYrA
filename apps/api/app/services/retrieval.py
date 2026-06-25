@@ -48,27 +48,41 @@ class SimpleLexicalReranker(RerankerProvider):
     _stop_words = frozenset(
         {
             "a",
+            "about",
             "an",
             "and",
             "are",
             "as",
             "by",
+            "can",
+            "could",
+            "describe",
             "do",
             "does",
+            "explain",
             "for",
             "from",
+            "give",
             "how",
+            "i",
             "in",
             "is",
+            "me",
+            "my",
             "of",
             "on",
+            "please",
+            "tell",
             "the",
             "to",
             "was",
+            "we",
             "what",
             "why",
             "with",
             "would",
+            "you",
+            "your",
         }
     )
 
@@ -220,6 +234,8 @@ class HybridRetriever:
         dense_cids = [row[0] for row in dense_rows]
 
         # 2. PostgreSQL Full-Text Search with plainto_tsquery and ts_rank
+        fts_tokens = SimpleLexicalReranker._tokens(query)
+        fts_query = " ".join(fts_tokens) if fts_tokens else query
         fts_sql = text("""
             SELECT pc.id
             FROM paper_chunks pc
@@ -235,7 +251,7 @@ class HybridRetriever:
             fts_sql,
             {
                 "project_id": project_id,
-                "query": query,
+                "query": fts_query,
                 "limit": self.top_candidates,
             },
         ).fetchall()

@@ -655,3 +655,78 @@ async def test_empty_reindex_retires_old_generation_before_completion():
     with SessionLocal() as db:
         persisted = get_graph_event(db, event_id)
         assert persisted.status == "COMPLETED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("rejected_at", ["verification", "extraction"])
+async def test_rejected_extracted_facts_fail_without_publishing_empty_generation(rejected_at):
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Rejected Facts Proj"))
+        paper = _setup_ready_paper(db, project.id)
+        chunk_id = db.query(PaperChunk.id).filter(PaperChunk.paper_id == paper.id).scalar()
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+        paper_id = paper.id
+
+    candidate = GraphFactCandidate(
+        subject=GraphEntitySchema(id="e1", name="Transformer", type=EntityType.METHOD),
+        predicate=RelationshipPredicate.EVALUATED_ON,
+        object=GraphEntitySchema(id="e2", name="WMT 2014", type=EntityType.DATASET),
+        qualifiers=GraphQualifierSchema(metric="BLEU", result_value=28.4),
+        provenance=GraphProvenanceSchema(
+            paper_id=paper_id,
+            chunk_id=chunk_id,
+            page_number=1,
+            exact_quote=QUOTE_77,
+            char_start=0,
+            char_end=len(QUOTE_77),
+            document_sha256="d0c0" * 16,
+        ),
+    )
+    extractor = AsyncMock()
+    if rejected_at == "verification":
+        extractor.extract.return_value = ExtractionResult(
+            accepted_entities=[candidate.subject, candidate.object],
+            accepted_facts=[candidate],
+            rejected_count=0,
+            rejection_reasons={},
+        )
+    else:
+        extractor.extract.return_value = ExtractionResult(
+            accepted_entities=[],
+            accepted_facts=[],
+            rejected_count=1,
+            rejection_reasons={"INVALID_ENDPOINT_TYPES": 1},
+        )
+    repo = MagicMock(spec=Neo4jRepository)
+    processor = GraphEventProcessor(repo=repo, extractor=extractor)
+
+    with (
+        patch(
+            "app.services.graphrag.processor.verify_candidate_fact",
+            return_value=(False, "UNRESOLVED_ANCHOR"),
+        ),
+        patch("app.services.graphrag.processor.logger.info") as log_info,
+    ):
+        with SessionLocal() as db:
+            claimed = claim_next_graph_event(db, worker_id="rejected-facts")
+            assert claimed is not None
+            await processor.process_graph_event(db, event_id, worker_id="rejected-facts")
+
+    with SessionLocal() as db:
+        persisted = get_graph_event(db, event_id)
+        assert persisted.status == "FAILED"
+        assert persisted.error_code == "NO_VERIFIED_FACTS"
+        assert persisted.completed_at is None
+        assert db.query(GraphFactSnapshot).filter_by(paper_id=paper_id).count() == 0
+        assert db.get(Paper, paper_id).status == "READY"
+
+    repo.upsert_facts.assert_not_called()
+    repo.retire_older_generations.assert_not_called()
+    reason_logs = repr(log_info.call_args_list)
+    expected_reason = (
+        "UNRESOLVED_ANCHOR" if rejected_at == "verification" else "INVALID_ENDPOINT_TYPES"
+    )
+    assert expected_reason in reason_logs
+    assert QUOTE_77 not in reason_logs
