@@ -236,8 +236,14 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
 
     conv = create_conversation(db, project_id=project.id, title="Contradiction Query")
 
-    quote_a = "Temperature scaling achieves 2.1% ECE on ImageNet."
-    quote_b = "Temperature scaling fails to converge, yielding an ECE of 8.5% on ImageNet."
+    quote_a = (
+        "Temperature scaling achieves 2.1% ECE on ImageNet for classification on the test split "
+        "under standard evaluation."
+    )
+    quote_b = (
+        "Temperature scaling fails to converge, yielding an ECE of 8.5% on ImageNet for "
+        "classification on the test split under standard evaluation."
+    )
     hash_a = "a" * 64
     hash_b = "b" * 64
 
@@ -261,6 +267,10 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
             "dataset": "ImageNet",
             "metric": "ECE",
             "result_value": 2.1,
+            "unit": "%",
+            "task": "classification",
+            "split": "test",
+            "comparison_condition": "standard evaluation",
             "polarity": "POSITIVE",
         },
         chunk_id=chunk_a.id,
@@ -288,6 +298,10 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
             "dataset": "ImageNet",
             "metric": "ECE",
             "result_value": 8.5,
+            "unit": "%",
+            "task": "classification",
+            "split": "test",
+            "comparison_condition": "standard evaluation",
             "polarity": "NEGATIVE",
         },
         chunk_id=chunk_b.id,
@@ -338,10 +352,7 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
 
     mock_llm = AsyncMock()
     # LLM produces two-sided answer citing E1 and E2 individually
-    mock_llm.generate.return_value = (
-        "Temperature scaling achieves 2.1% ECE on ImageNet [E1]. "
-        "Temperature scaling fails to converge, yielding an ECE of 8.5% on ImageNet [E2]."
-    )
+    mock_llm.generate.return_value = f"{quote_a} [E1]. {quote_b} [E2]."
     mock_llm.model_name = "test-deepseek"
 
     mock_retriever = MagicMock()

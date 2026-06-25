@@ -137,6 +137,27 @@ def test_parameterization_queries_are_static() -> None:
     assert params["query"] == "transformer"
     assert params["entity_type"] == "Model"
 
+    # The pagination total uses the exact same project/query/type predicates.
+    mock_res.single.return_value = {"total": 11}
+    assert (
+        repo.count_matching_nodes(
+            project_id=project_id,
+            query="transformer",
+            entity_type="Model",
+        )
+        == 11
+    )
+    count_call = mock_tx.run.call_args
+    count_query, count_params = count_call[0][0], count_call[0][1]
+    assert "$project_id" in count_query
+    assert "$query" in count_query
+    assert "$entity_type" in count_query
+    assert count_params == {
+        "project_id": params["project_id"],
+        "query": params["query"],
+        "entity_type": params["entity_type"],
+    }
+
     # 2. get_node_by_key
     mock_res.single.return_value = None
     repo.get_node_by_key(project_id=project_id, key="model_bert")

@@ -289,13 +289,18 @@ def search_graph_nodes(
         for n in nodes
     ]
 
-    total = len(items)
-    if not query and not entity_type:
-        try:
-            counts = repo.count_project_elements(project_id)
-            total = counts.get("node_count", len(items))
-        except Exception:
-            total = len(items)
+    try:
+        total = repo.count_matching_nodes(
+            project_id=project_id,
+            query=query,
+            entity_type=entity_type,
+        )
+    except Exception as exc:
+        logger.warning("count_matching_nodes error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Graph service unavailable",
+        ) from exc
 
     return GraphNodeListResponse(
         items=items,
@@ -498,9 +503,23 @@ def trigger_graph_index(
     project_id: UUID,
     req: GraphIndexRequest,
     db: Session = Depends(get_db),
+    repo: Neo4jRepository | None = Depends(get_graph_repo),
 ) -> GraphIndexResponse:
     """Enqueue existing READY papers for GraphRAG extraction."""
     _get_project_or_404(db, project_id)
+
+    settings = Settings.from_environment()
+    if not req.dry_run:
+        if not settings.graphrag_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Graph indexing is disabled by configuration.",
+            )
+        if repo is None or not _check_repo_available(repo):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Graph indexing is unavailable because Neo4j is not connected.",
+            )
 
     result = enqueue_existing_papers_for_graph(
         db=db,

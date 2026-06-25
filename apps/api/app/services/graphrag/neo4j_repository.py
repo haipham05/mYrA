@@ -555,6 +555,37 @@ class Neo4jRepository:
         with self._get_session() as session:
             return session.execute_read(_tx_work)
 
+    def count_matching_nodes(
+        self,
+        project_id: UUID,
+        query: str | None = None,
+        entity_type: str | EntityType | None = None,
+    ) -> int:
+        """Count project nodes using the same normalized filters as search_nodes."""
+        pid_str = str(project_id)
+        clean_query = query.strip() if query and query.strip() else None
+        clean_type = (
+            (entity_type.value if hasattr(entity_type, "value") else str(entity_type).strip())
+            if entity_type
+            else None
+        )
+        cypher = """
+        MATCH (n:Node {project_id: $project_id})
+        WHERE ($entity_type IS NULL OR toLower(n.type) = toLower($entity_type))
+          AND ($query IS NULL
+               OR toLower(n.name) CONTAINS toLower($query)
+               OR any(a IN n.aliases WHERE toLower(a) CONTAINS toLower($query)))
+        RETURN count(n) AS total
+        """
+        params = {"project_id": pid_str, "entity_type": clean_type, "query": clean_query}
+
+        def _tx_work(tx) -> int:
+            record = tx.run(cypher, params).single()
+            return int(record["total"]) if record else 0
+
+        with self._get_session() as session:
+            return session.execute_read(_tx_work)
+
     def get_node_by_key(self, project_id: UUID, key: str) -> dict[str, Any] | None:
         """Retrieve a single node by key within a project."""
         clean_key = key.strip()

@@ -329,6 +329,22 @@ export default function GraphExplorer({
   };
 
   useEffect(() => {
+    const contextRequestId = ++factRequestId.current;
+    const timer = window.setTimeout(() => {
+      if (factRequestId.current !== contextRequestId) return;
+      setSelectedFact(null);
+      setLoadedPaper(null);
+      setSelectedFactId(initialFactId);
+      setFactError(null);
+      setIsLoadingFact(false);
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      factRequestId.current += 1;
+    };
+  }, [apiUrl, projectId, initialFactId]);
+
+  useEffect(() => {
     if (!initialFactId) return;
     const timer = window.setTimeout(() => void loadFact(initialFactId), 0);
     return () => {

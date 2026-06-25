@@ -173,7 +173,7 @@ def _check_numeric_support(
         clauses = [
             clause.strip().casefold()
             for clause in re.split(
-                r"[;,!?]|\.(?=\s|$)|\b(?:and|but|while|whereas)\b",
+                r"[;,!?()]|\.(?=\s|$)|\b(?:and|but|while|whereas)\b",
                 quote_norm_decimals,
                 flags=re.IGNORECASE,
             )

@@ -101,7 +101,13 @@ def lock_graph_publication(db: Session, event_id: UUID | str, worker_id: str) ->
     the SQL/Neo4j operations are still not one distributed transaction.
     """
     event_id = UUID(event_id) if isinstance(event_id, str) else event_id
-    event = db.query(GraphEvent).filter(GraphEvent.id == event_id).with_for_update().first()
+    event = (
+        db.query(GraphEvent)
+        .populate_existing()
+        .filter(GraphEvent.id == event_id)
+        .with_for_update()
+        .first()
+    )
     if not event or event.status != "PROCESSING" or event.lease_owner != worker_id:
         db.rollback()
         return False

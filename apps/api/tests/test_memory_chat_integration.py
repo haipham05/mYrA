@@ -467,7 +467,9 @@ async def test_archived_stale_or_foreign_project_memories_cannot_supply_evidence
     mock_llm.model_name = "test-deepseek"
 
     with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
-        chat_service = ChatService()
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = []
+        chat_service = ChatService(retriever=mock_retriever)
         resp = await chat_service.answer_question(
             db=db,
             conversation_id=conv.id,

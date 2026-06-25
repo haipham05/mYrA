@@ -30,7 +30,7 @@ class Settings(BaseModel):
     neo4j_password: str | None = None
     neo4j_database: str = "neo4j"
     neo4j_timeout_seconds: float = 10.0
-    graph_batch_limit: int = 50
+    graph_batch_limit: int = Field(default=50, ge=1, le=100)
 
     @classmethod
     def from_environment(cls) -> "Settings":

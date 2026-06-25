@@ -15,6 +15,7 @@ from app.crud.graph import (
     get_active_graph_events_for_paper,
     get_graph_event,
     get_latest_completed_graph_event,
+    lock_graph_publication,
 )
 from app.crud.job import create_job
 from app.crud.paper import create_paper
@@ -461,3 +462,27 @@ def test_crud_graph_event_operations(env):
     assert custom_event.generation_id == "custom-generation-42"
     assert custom_event.ontology_version == "2.0.0"
     assert custom_event.extractor_version == "3.0.0"
+
+
+def test_publication_lock_refreshes_lease_after_separate_session_takeover(env):
+    db, _, _ = env
+    project = create_project(db, ProjectCreate(name="Lease Refresh Proj"))
+    paper = create_paper(db, project.id, "lease.pdf", "lease.pdf")
+    event = create_or_enqueue_graph_event(db, project.id, paper.id)
+    event.status = "PROCESSING"
+    event.lease_owner = "old-worker"
+    event.lease_expires_at = datetime.now(tz=UTC) + timedelta(minutes=5)
+    db.commit()
+    event_id = event.id
+    assert get_graph_event(db, event_id).lease_owner == "old-worker"
+
+    takeover_session = sessionmaker(bind=db.get_bind(), expire_on_commit=False)()
+    try:
+        takeover = takeover_session.get(GraphEvent, event_id)
+        takeover.lease_owner = "replacement-worker"
+        takeover.lease_expires_at = datetime.now(tz=UTC) + timedelta(minutes=5)
+        takeover_session.commit()
+    finally:
+        takeover_session.close()
+
+    assert lock_graph_publication(db, event_id, "old-worker") is False

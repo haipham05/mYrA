@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.config import Settings
 from app.crud.graph import (
     claim_next_graph_event,
     create_or_enqueue_graph_event,
@@ -120,7 +121,7 @@ def test_expired_lease_recovery():
 
 
 @pytest.mark.anyio
-async def test_shutdown_release():
+async def test_shutdown_release(monkeypatch):
     """Test 3: Shutdown release: When worker is cancelled/shut down, the claimed event
     is released back to PENDING.
     """
@@ -148,12 +149,22 @@ async def test_shutdown_release():
 
     # Part B: Worker loop task cancellation during active processing
     started_event = asyncio.Event()
+    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
+    monkeypatch.setenv("NEO4J_URI", "bolt://127.0.0.1:17687")
 
     async def blocking_process(*args, **kwargs):
         started_event.set()
         await asyncio.sleep(10.0)
 
-    with patch.object(GraphEventProcessor, "process_graph_event", side_effect=blocking_process):
+    ready_repo = MagicMock()
+    ready_repo.verify_connectivity.return_value = True
+    with (
+        patch.object(GraphEventProcessor, "process_graph_event", side_effect=blocking_process),
+        patch(
+            "app.services.graphrag.neo4j_repository.Neo4jRepository.from_settings",
+            return_value=ready_repo,
+        ),
+    ):
         worker_task = asyncio.create_task(
             run_worker(poll_interval=0.01, once=False, heartbeat_interval=0.1)
         )
@@ -298,12 +309,9 @@ async def test_event_completion_and_delete_action():
         paper = create_paper(db, project.id, "complete.pdf", "complete.pdf")
         paper.status = "READY"
         upsert_event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
-        delete_event = create_or_enqueue_graph_event(db, project.id, paper.id, action="DELETE")
         db.commit()
         db.refresh(upsert_event)
-        db.refresh(delete_event)
         upsert_id = upsert_event.id
-        delete_id = delete_event.id
         paper_id = paper.id
         project_id = project.id
 
@@ -327,6 +335,9 @@ async def test_event_completion_and_delete_action():
 
     # 5b: Process DELETE event
     with SessionLocal() as db:
+        delete_event = create_or_enqueue_graph_event(db, project_id, paper_id, action="DELETE")
+        db.commit()
+        delete_id = delete_event.id
         claimed_delete = claim_next_graph_event(db, worker_id="worker-delete")
         assert claimed_delete is not None
         assert claimed_delete.id == delete_id
@@ -406,7 +417,7 @@ def test_exponential_backoff_for_retried_event():
 
 
 @pytest.mark.anyio
-async def test_worker_run_once_processes_graph_event():
+async def test_worker_run_once_processes_graph_event(monkeypatch):
     """Verify worker processes a pending graph event when run with once=True."""
     with SessionLocal() as db:
         project = create_project(db, ProjectCreate(name="Worker Graph Run Once"))
@@ -416,9 +427,33 @@ async def test_worker_run_once_processes_graph_event():
         db.commit()
         event_id = event.id
 
-    await run_worker(poll_interval=0.01, once=True)
+    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
+    monkeypatch.setenv("NEO4J_URI", "bolt://127.0.0.1:17687")
+    ready_repo = MagicMock()
+    ready_repo.verify_connectivity.return_value = True
+    with patch(
+        "app.services.graphrag.neo4j_repository.Neo4jRepository.from_settings",
+        return_value=ready_repo,
+    ):
+        await run_worker(poll_interval=0.01, once=True)
 
     with SessionLocal() as db:
         persisted = get_graph_event(db, event_id)
         assert persisted.status == "COMPLETED"
         assert persisted.completed_at is not None
+
+
+@pytest.mark.anyio
+async def test_disabled_worker_never_claims_graph_events():
+    create_tables()
+    with patch(
+        "app.worker.Settings.from_environment",
+        return_value=Settings(check_migration_compatibility=False),
+    ):
+        with (
+            patch("app.worker.claim_next_job", return_value=None),
+            patch("app.worker.claim_next_graph_event") as graph_claim,
+            patch("app.worker.IngestionPipeline"),
+        ):
+            await run_worker(poll_interval=0.01, once=True)
+    graph_claim.assert_not_called()

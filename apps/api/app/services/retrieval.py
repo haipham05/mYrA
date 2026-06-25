@@ -409,23 +409,11 @@ class HybridRetriever:
             parser_ver = None
 
             if source_elements:
-                # Find best matching source element for the query
-                best_elem = source_elements[0]
-                best_score = -1.0
-                query_words = set(query.lower().split())
-
-                for elem in source_elements:
-                    elem_words = set(elem.text.lower().split())
-                    score = len(query_words.intersection(elem_words))
-                    if score > best_score:
-                        best_score = score
-                        best_elem = elem
-
-                page_number = best_elem.page_number
-                exact_quote = best_elem.text
-                parser_ver = best_elem.parser_version
-
                 page_text_cache: dict[int, str | None] = {}
+                evaluated_elements: list[
+                    tuple[PaperElement, CitationAnchor, list[BoundingBox]]
+                ] = []
+
                 for elem in source_elements:
                     elem_boxes: list[BoundingBox] = []
                     if elem.bbox_x_min is not None and elem.page_width and elem.page_height:
@@ -493,22 +481,54 @@ class HybridRetriever:
                         anchor_status = AnchorStatus.UNRESOLVED
                         verified_boxes = []
 
-                    if anchor_status == AnchorStatus.VERIFIED and elem.page_number == page_number:
-                        bboxes.extend(verified_boxes)
-
-                    anchors.append(
-                        CitationAnchor(
-                            page_number=elem.page_number,
-                            source_element_id=elem.id,
-                            exact_quote=elem.text,
-                            source_char_start=start_char,
-                            source_char_end=end_char,
-                            document_sha256=paper.document_sha256 if paper else None,
-                            parser_version=elem.parser_version,
-                            anchor_status=anchor_status,
-                            bounding_boxes=verified_boxes,
-                        )
+                    cand_anchor = CitationAnchor(
+                        page_number=elem.page_number,
+                        source_element_id=elem.id,
+                        exact_quote=elem.text,
+                        source_char_start=start_char,
+                        source_char_end=end_char,
+                        document_sha256=paper.document_sha256 if paper else None,
+                        parser_version=elem.parser_version,
+                        anchor_status=anchor_status,
+                        bounding_boxes=verified_boxes,
                     )
+                    anchors.append(cand_anchor)
+                    evaluated_elements.append((elem, cand_anchor, verified_boxes))
+
+                # Select best element: prioritize verified anchors, lexical match
+                # without stopwords, then substantive length
+                query_tokens = SimpleLexicalReranker._tokens(query)
+                if not query_tokens:
+                    query_tokens = {
+                        w for w in re.findall(r"[a-z0-9]+", query.casefold()) if len(w) > 2
+                    }
+
+                best_elem, best_anchor, _ = max(
+                    evaluated_elements,
+                    key=lambda item: (
+                        (1000.0 if item[1].anchor_status == AnchorStatus.VERIFIED else 0.0)
+                        + (
+                            len(
+                                query_tokens.intersection(
+                                    SimpleLexicalReranker._tokens(item[0].text)
+                                )
+                            )
+                            * 50.0
+                        )
+                        + (min(len(item[0].text.strip()), 300) / 300.0)
+                    ),
+                )
+
+                page_number = best_elem.page_number
+                exact_quote = best_elem.text
+                parser_ver = best_elem.parser_version
+
+                for elem, cand_anchor, v_boxes in evaluated_elements:
+                    if (
+                        cand_anchor.anchor_status == AnchorStatus.VERIFIED
+                        and elem.page_number == page_number
+                    ):
+                        bboxes.extend(v_boxes)
 
             evidence_items.append(
                 EvidenceItem(

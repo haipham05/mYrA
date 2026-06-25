@@ -11,7 +11,7 @@ from app.schemas.evidence import (
     CoordinateOrigin,
     EvidenceItem,
 )
-from app.services.chat_service import matching_verified_anchor
+from app.services.chat_service import matching_verified_anchor, resolve_claim_anchor
 
 
 def test_valid_citation_anchor():
@@ -154,3 +154,192 @@ def test_only_matching_verified_span_can_support_citation(change, value):
     assert matching_verified_anchor(evidence) == anchor
     bad_anchor = anchor.model_copy(update={change: value})
     assert matching_verified_anchor(evidence.model_copy(update={"anchors": [bad_anchor]})) is None
+
+
+def test_resolve_claim_anchor_direct_monotonic():
+    from unittest.mock import MagicMock
+
+    mock_db = MagicMock()
+    paper_id = uuid4()
+    anchor = CitationAnchor(
+        page_number=2,
+        source_element_id=uuid4(),
+        exact_quote="The Transformer model relies entirely on self-attention.",
+        source_char_start=100,
+        source_char_end=156,
+        document_sha256="test-sha",
+        parser_version="docling-2",
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        quote="Different primary quote",
+        page_number=2,
+        document_sha256="test-sha",
+        parser_version="docling-2",
+        anchors=[anchor],
+    )
+
+    # Monotonic claim supported by anchor in anchors list even if not matching primary quote
+    matched, phrase = resolve_claim_anchor(
+        mock_db,
+        evidence,
+        "The Transformer model relies entirely on self-attention.",
+        cite_count=1,
+    )
+    assert matched == anchor
+    assert phrase is None
+
+
+def test_resolve_claim_anchor_multi_element_verbatim_quote():
+    from unittest.mock import MagicMock
+
+    from app.db.models import PaperElement, PaperPage
+
+    mock_db = MagicMock()
+    paper_id = uuid4()
+    raw_page_text = (
+        "We propose a new simple network architecture, the Transformer, "
+        "based solely on attention mechanisms, dispensing with recurrence "
+        "and convolutions entirely."
+    )
+
+    page_rec = PaperPage(
+        paper_id=paper_id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text=raw_page_text,
+    )
+
+    elem1 = PaperElement(
+        id=uuid4(),
+        paper_id=paper_id,
+        page_number=1,
+        element_index=0,
+        element_type="paragraph",
+        text="We propose a new simple network architecture, the Transformer,",
+        bbox_x_min=10.0,
+        bbox_y_min=10.0,
+        bbox_x_max=100.0,
+        bbox_y_max=20.0,
+        page_width=612.0,
+        page_height=792.0,
+        coordinate_origin="TOP_LEFT",
+        rotation=0,
+        parser_version="docling-2",
+    )
+    elem2 = PaperElement(
+        id=uuid4(),
+        paper_id=paper_id,
+        page_number=1,
+        element_index=1,
+        element_type="paragraph",
+        text=(
+            "based solely on attention mechanisms, "
+            "dispensing with recurrence and convolutions entirely."
+        ),
+        bbox_x_min=10.0,
+        bbox_y_min=25.0,
+        bbox_x_max=100.0,
+        bbox_y_max=35.0,
+        page_width=612.0,
+        page_height=792.0,
+        coordinate_origin="TOP_LEFT",
+        rotation=0,
+        parser_version="docling-2",
+    )
+
+    # Set up mock_db queries
+    def query_mock(model):
+        q = MagicMock()
+        if model == PaperPage:
+            q.filter.return_value.first.return_value = page_rec
+        elif model == PaperElement:
+            q.filter.return_value.order_by.return_value.all.return_value = [elem1, elem2]
+        return q
+
+    mock_db.query.side_effect = query_mock
+
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        quote=elem1.text,
+        page_number=1,
+        document_sha256="doc-hash-123",
+        parser_version="docling-2",
+        anchors=[
+            CitationAnchor(
+                page_number=1,
+                source_element_id=elem1.id,
+                exact_quote=elem1.text,
+                source_char_start=0,
+                source_char_end=len(elem1.text),
+                document_sha256="doc-hash-123",
+                parser_version="docling-2",
+                anchor_status=AnchorStatus.VERIFIED,
+            )
+        ],
+    )
+
+    # Claim quoting a multi-element sentence
+    claim = (
+        'The authors "propose a new simple network architecture, the Transformer, '
+        "based solely on attention mechanisms, dispensing with recurrence "
+        'and convolutions entirely."'
+    )
+    matched, phrase = resolve_claim_anchor(mock_db, evidence, claim, cite_count=1)
+
+    assert matched is not None
+    assert matched.anchor_status == AnchorStatus.VERIFIED
+    assert matched.page_number == 1
+    assert "propose a new simple network architecture" in matched.exact_quote
+    assert matched.source_char_start is not None
+    assert matched.source_char_end is not None
+    assert len(matched.bounding_boxes) == 2  # Overlaps both elem1 and elem2
+    assert phrase is not None
+
+
+def test_resolve_claim_anchor_rejects_hallucination():
+    from unittest.mock import MagicMock
+
+    from app.db.models import PaperElement, PaperPage
+
+    mock_db = MagicMock()
+    paper_id = uuid4()
+    page_rec = PaperPage(
+        paper_id=paper_id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text="Real facts only.",
+    )
+
+    def query_mock(model):
+        q = MagicMock()
+        if model == PaperPage:
+            q.filter.return_value.first.return_value = page_rec
+        elif model == PaperElement:
+            q.filter.return_value.order_by.return_value.all.return_value = []
+        return q
+
+    mock_db.query.side_effect = query_mock
+
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        quote="Real facts only.",
+        page_number=1,
+        document_sha256="doc-hash-123",
+        parser_version="docling-2",
+        anchors=[],
+    )
+
+    claim = 'The authors "invented time travel and infinite energy".'
+    matched, phrase = resolve_claim_anchor(mock_db, evidence, claim, cite_count=1)
+    assert matched is None
+    assert phrase is None

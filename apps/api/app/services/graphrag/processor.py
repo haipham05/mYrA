@@ -56,7 +56,7 @@ class GraphEventProcessor:
                 self.repo = None
 
         self.extractor = extractor
-        if self.extractor is None:
+        if self.extractor is None and self.settings.graphrag_enabled and self.repo is not None:
             try:
                 from app.services.llm import get_llm_provider
 
@@ -101,6 +101,31 @@ class GraphEventProcessor:
                     now,
                 )
                 return
+
+        if self.repo is None:
+            fail_graph_event(
+                db,
+                event.id,
+                worker_id,
+                error_code="NEO4J_UNAVAILABLE",
+                error_message="Graph repository is not configured.",
+                is_transient=True,
+            )
+            return
+        try:
+            repository_ready = bool(self.repo.verify_connectivity())
+        except Exception:
+            repository_ready = False
+        if not repository_ready:
+            fail_graph_event(
+                db,
+                event.id,
+                worker_id,
+                error_code="NEO4J_UNAVAILABLE",
+                error_message="Graph repository connectivity check failed.",
+                is_transient=True,
+            )
+            return
 
         try:
             if event.action == "DELETE":
@@ -173,8 +198,20 @@ class GraphEventProcessor:
                         db=db,
                         project_id=project_id,
                         paper_id=paper_id,
+                        max_chunks=self.settings.graph_batch_limit,
                     )
                     if not evidence_items:
+                        # An empty re-index is still a new authoritative
+                        # generation. Fence it against newer enqueues and
+                        # retire any facts published by an older generation
+                        # before acknowledging the empty result.
+                        if not lock_graph_publication(db, event.id, worker_id):
+                            return
+                        self.repo.retire_older_generations(
+                            project_id,
+                            paper_id,
+                            event.generation_id,
+                        )
                         complete_graph_event(db, event.id, worker_id=worker_id)
                         logger.info(
                             "Completed UPSERT graph event %s (no evidence items to extract)",

@@ -74,6 +74,7 @@ def mock_repo() -> MagicMock:
         "node_count": 10,
         "fact_count": 25,
     }
+    repo.count_matching_nodes.return_value = 0
     repo.get_node_by_key.return_value = None
     repo.get_fact_by_id.return_value = None
     repo.search_nodes.return_value = []
@@ -250,6 +251,7 @@ def test_node_search_and_pagination(
         },
     ]
     mock_repo.search_nodes.return_value = fake_nodes
+    mock_repo.count_matching_nodes.return_value = 2
 
     # Valid search with query, entity_type, limit, skip
     resp = client.get(
@@ -272,10 +274,49 @@ def test_node_search_and_pagination(
         limit=10,
         skip=2,
     )
+    mock_repo.count_matching_nodes.assert_called_once_with(
+        project_id=PROJECT_A_ID,
+        query="bert",
+        entity_type="Model",
+    )
 
     # Limit capped at 100 via schema validation (Query(le=100))
     resp_over_limit = client.get(f"/api/v1/projects/{PROJECT_A_ID}/graph/nodes?limit=150")
     assert resp_over_limit.status_code == 422
+
+
+def test_filtered_node_pagination_uses_matching_total(client: TestClient, mock_repo: MagicMock):
+    matching_nodes = [
+        {
+            "key": f"model:bert-{i}",
+            "name": f"BERT {i}",
+            "type": "Model",
+            "project_id": str(PROJECT_A_ID),
+        }
+        for i in range(10)
+    ]
+    last_node = {
+        "key": "model:bert-last",
+        "name": "BERT Last",
+        "type": "Model",
+        "project_id": str(PROJECT_A_ID),
+    }
+    mock_repo.count_matching_nodes.return_value = 11
+    mock_repo.search_nodes.side_effect = [matching_nodes, [last_node]]
+
+    first = client.get(
+        f"/api/v1/projects/{PROJECT_A_ID}/graph/nodes?query=bert&entity_type=Model&limit=10"
+    ).json()
+    second = client.get(
+        f"/api/v1/projects/{PROJECT_A_ID}/graph/nodes?query=bert&entity_type=Model&limit=10&skip=10"
+    ).json()
+
+    assert len(first["items"]) == 10
+    assert first["total"] == 11
+    assert len(second["items"]) == 1
+    assert second["total"] == 11
+    assert mock_repo.search_nodes.call_args_list[0].kwargs["project_id"] == PROJECT_A_ID
+    assert mock_repo.search_nodes.call_args_list[1].kwargs["project_id"] == PROJECT_A_ID
 
 
 # ============================================================================
@@ -545,6 +586,7 @@ def test_relationships_between_endpoints(
 def test_index_endpoint_dry_run_and_enqueue(
     client: TestClient,
     db_session: Session,
+    monkeypatch,
 ) -> None:
     """Test 7: Index endpoint defaults to dry_run=True; enqueues papers upon explicit opt-in."""
     # 1. Default request body: dry_run=True
@@ -568,6 +610,14 @@ def test_index_endpoint_dry_run_and_enqueue(
         f"/api/v1/projects/{PROJECT_A_ID}/graph/index",
         json={"dry_run": False, "limit": 5},
     )
+    assert resp_live.status_code == 503
+    assert "disabled" in resp_live.json()["detail"].lower()
+
+    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
+    resp_live = client.post(
+        f"/api/v1/projects/{PROJECT_A_ID}/graph/index",
+        json={"dry_run": False, "limit": 5},
+    )
     assert resp_live.status_code == 200
     live_data = resp_live.json()
 
@@ -580,6 +630,19 @@ def test_index_endpoint_dry_run_and_enqueue(
     )
     assert len(committed_events) == live_data["enqueued_count"]
     assert all(ev.status == "PENDING" for ev in committed_events)
+
+
+def test_index_endpoint_rejects_live_enqueue_without_connected_repository(
+    client: TestClient, mock_repo: MagicMock, monkeypatch
+) -> None:
+    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
+    mock_repo.verify_connectivity.return_value = False
+    response = client.post(
+        f"/api/v1/projects/{PROJECT_A_ID}/graph/index",
+        json={"dry_run": False, "limit": 1},
+    )
+    assert response.status_code == 503
+    assert "neo4j" in response.json()["detail"].lower()
 
 
 # ============================================================================

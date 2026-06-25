@@ -14,8 +14,10 @@ from uuid import UUID
 
 import pytest
 
+from app.config import Settings
 from app.crud.graph import (
     claim_next_graph_event,
+    complete_graph_event,
     create_or_enqueue_graph_event,
     get_graph_event,
 )
@@ -456,6 +458,90 @@ async def test_expired_graph_lease_cannot_publish():
 
 
 @pytest.mark.anyio
+async def test_repository_unavailable_never_completes_or_extracts():
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="No Graph Repo Proj"))
+        paper = _setup_ready_paper(db, project.id)
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+
+    extractor = AsyncMock()
+    processor = GraphEventProcessor(
+        settings=Settings(graphrag_enabled=True), repo=None, extractor=extractor
+    )
+    with SessionLocal() as db:
+        claimed = claim_next_graph_event(db, worker_id="repo-missing")
+        assert claimed is not None
+        await processor.process_graph_event(db, event_id, worker_id="repo-missing")
+
+    with SessionLocal() as db:
+        persisted = get_graph_event(db, event_id)
+        assert persisted.status == "PENDING"
+        assert persisted.error_code == "NEO4J_UNAVAILABLE"
+    extractor.extract.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_failed_repository_connectivity_retries_without_extraction():
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Offline Graph Repo Proj"))
+        paper = _setup_ready_paper(db, project.id)
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+
+    repo = MagicMock(spec=Neo4jRepository)
+    repo.verify_connectivity.return_value = False
+    extractor = AsyncMock()
+    processor = GraphEventProcessor(
+        settings=Settings(graphrag_enabled=True), repo=repo, extractor=extractor
+    )
+    with SessionLocal() as db:
+        claimed = claim_next_graph_event(db, worker_id="repo-offline")
+        assert claimed is not None
+        await processor.process_graph_event(db, event_id, worker_id="repo-offline")
+
+    with SessionLocal() as db:
+        persisted = get_graph_event(db, event_id)
+        assert persisted.status == "PENDING"
+        assert persisted.error_code == "NEO4J_UNAVAILABLE"
+    extractor.extract.assert_not_awaited()
+    repo.upsert_facts.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_extraction_selector_honors_configured_batch_limit():
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Bounded Extraction Proj"))
+        paper = _setup_ready_paper(db, project.id)
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+
+    mock_repo = MagicMock(spec=Neo4jRepository)
+    mock_repo.verify_connectivity.return_value = True
+    extractor = AsyncMock()
+    extractor.extract.return_value = ExtractionResult(
+        accepted_entities=[], accepted_facts=[], rejected_count=0, rejection_reasons={}
+    )
+    processor = GraphEventProcessor(
+        settings=Settings(graphrag_enabled=True, graph_batch_limit=2),
+        repo=mock_repo,
+        extractor=extractor,
+    )
+    with patch(
+        "app.services.graphrag.processor.select_extraction_inputs", return_value=[MagicMock()]
+    ) as selector:
+        with SessionLocal() as db:
+            claimed = claim_next_graph_event(db, worker_id="bounded-extractor")
+            assert claimed is not None
+            await processor.process_graph_event(db, event_id, worker_id="bounded-extractor")
+
+    assert selector.call_args.kwargs["max_chunks"] == 2
+
+
+@pytest.mark.anyio
 async def test_duplicate_delivery_idempotency():
     """Test 5: Replay idempotency: Multiple duplicate delivery runs on the exact same event
     produce identical graph state and identical fact counts.
@@ -523,3 +609,49 @@ async def test_duplicate_delivery_idempotency():
         snaps = db.query(GraphFactSnapshot).filter(GraphFactSnapshot.paper_id == paper_id).all()
         assert len(snaps) == 1
         assert snaps[0].fact_id == "fact-dup-1"
+
+
+@pytest.mark.anyio
+async def test_empty_reindex_retires_old_generation_before_completion():
+    """An empty newer generation must not leave stale facts queryable."""
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Empty Reindex Proj"))
+        paper = _setup_ready_paper(db, project.id)
+        db.query(ChunkElement).filter(
+            ChunkElement.chunk_id.in_(
+                db.query(PaperChunk.id).filter(PaperChunk.paper_id == paper.id)
+            )
+        ).delete(synchronize_session=False)
+        db.query(PaperChunk).filter(PaperChunk.paper_id == paper.id).delete()
+        db.commit()
+
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+        generation_id = event.generation_id
+        project_id = project.id
+        paper_id = paper.id
+
+    repo = MagicMock(spec=Neo4jRepository)
+    processor = GraphEventProcessor(repo=repo, extractor=AsyncMock())
+    call_order = []
+    repo.retire_older_generations.side_effect = lambda *args: call_order.append("retire")
+
+    def record_completion(*args, **kwargs):
+        call_order.append("complete")
+        return complete_graph_event(*args, **kwargs)
+
+    with patch(
+        "app.services.graphrag.processor.complete_graph_event",
+        side_effect=record_completion,
+    ):
+        with SessionLocal() as db:
+            claimed = claim_next_graph_event(db, worker_id="empty-reindex")
+            assert claimed is not None
+            await processor.process_graph_event(db, event_id, worker_id="empty-reindex")
+
+    repo.retire_older_generations.assert_called_once_with(project_id, paper_id, generation_id)
+    assert call_order == ["retire", "complete"]
+    with SessionLocal() as db:
+        persisted = get_graph_event(db, event_id)
+        assert persisted.status == "COMPLETED"

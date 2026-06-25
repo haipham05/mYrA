@@ -7,9 +7,17 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.crud.chat import add_message, get_conversation
-from app.db.models import Memory, Message
+from app.db.models import Memory, Message, PaperElement, PaperPage
+from app.ingestion.parser import find_verbatim_span
 from app.schemas.chat import MessageResponse, MessageRole
-from app.schemas.evidence import AnchorStatus, Citation, CitationAnchor, EvidenceItem
+from app.schemas.evidence import (
+    AnchorStatus,
+    BoundingBox,
+    Citation,
+    CitationAnchor,
+    CoordinateOrigin,
+    EvidenceItem,
+)
 from app.schemas.memory import MemoryStatus, MemoryType
 from app.services.graphrag.neo4j_repository import Neo4jRepository
 from app.services.graphrag.router import (
@@ -441,6 +449,136 @@ def matching_verified_anchor(evidence: EvidenceItem) -> CitationAnchor | None:
     )
 
 
+def resolve_claim_anchor(
+    db: Session,
+    evidence: EvidenceItem,
+    clean_claim: str,
+    cite_count: int,
+) -> tuple[CitationAnchor | None, str | None]:
+    """Resolve a verified CitationAnchor supporting clean_claim from evidence.
+
+    Returns (matched_anchor, extracted_verbatim_phrase).
+    """
+    if not evidence.document_sha256 or not evidence.parser_version:
+        return None, None
+
+    verified_anchors = [
+        a
+        for a in evidence.anchors
+        if a.anchor_status == AnchorStatus.VERIFIED
+        and a.source_char_start is not None
+        and a.source_char_end is not None
+        and a.source_char_end > a.source_char_start
+    ]
+
+    primary = matching_verified_anchor(evidence)
+    if primary and primary in verified_anchors:
+        verified_anchors.remove(primary)
+        verified_anchors.insert(0, primary)
+
+    # 1. Direct monotonic claim support against verified anchors
+    for cand in verified_anchors:
+        if check_claim_support(clean_claim, cand.exact_quote):
+            return cand, None
+
+    # 2. Extract verbatim quoted phrases (e.g. model output wrapped in quotes)
+    if cite_count == 1:
+        # Check if candidate quotes match any verified anchor
+        for cand in verified_anchors:
+            phrase = extract_verbatim_quoted_phrase(clean_claim, cand.exact_quote)
+            if phrase is not None:
+                return cand, phrase
+
+        # Check if candidate quotes match across parent_context / canonical page text
+        # (Quotes that span across multiple elements or lines in the PDF)
+        for match in re.finditer(r'["“]([^"”]+)["”]', clean_claim):
+            candidate_raw = match.group(1).strip()
+            candidate_variants = [candidate_raw]
+            stripped = candidate_raw.rstrip(".,;:!? ")
+            if stripped != candidate_raw and len(stripped) > 0:
+                candidate_variants.append(stripped)
+
+            for cand_phrase in candidate_variants:
+                norm_candidate = re.sub(r"(\d+)\s*\.\s*(\d+)", r"\1.\2", cand_phrase)
+                if len(re.findall(r"\b\w+\b", norm_candidate)) < 3:
+                    continue
+
+                candidate_pages = sorted(
+                    list({a.page_number for a in verified_anchors} | {evidence.page_number})
+                )
+                for p_num in candidate_pages:
+                    page_rec = (
+                        db.query(PaperPage)
+                        .filter(
+                            PaperPage.paper_id == evidence.paper_id,
+                            PaperPage.page_number == p_num,
+                        )
+                        .first()
+                    )
+                    if not page_rec or not page_rec.raw_text:
+                        continue
+
+                    span = find_verbatim_span(page_rec.raw_text, cand_phrase)
+                    if span is None:
+                        continue
+
+                    start_char, end_char = span
+                    elems = (
+                        db.query(PaperElement)
+                        .filter(
+                            PaperElement.paper_id == evidence.paper_id,
+                            PaperElement.page_number == p_num,
+                        )
+                        .order_by(PaperElement.element_index)
+                        .all()
+                    )
+                    overlapping_boxes: list[BoundingBox] = []
+                    first_elem_id = None
+                    for elem in elems:
+                        e_span = find_verbatim_span(page_rec.raw_text, elem.text)
+                        if e_span and e_span[0] < end_char and e_span[1] > start_char:
+                            if first_elem_id is None:
+                                first_elem_id = elem.id
+                            if elem.bbox_x_min is not None and elem.page_width and elem.page_height:
+                                overlapping_boxes.append(
+                                    BoundingBox(
+                                        x_min=elem.bbox_x_min,
+                                        y_min=elem.bbox_y_min or 0.0,
+                                        x_max=elem.bbox_x_max or 0.0,
+                                        y_max=elem.bbox_y_max or 0.0,
+                                        page_width=elem.page_width,
+                                        page_height=elem.page_height,
+                                        origin=CoordinateOrigin(elem.coordinate_origin),
+                                        rotation=elem.rotation,
+                                    )
+                                )
+
+                    new_anchor = CitationAnchor(
+                        page_number=p_num,
+                        source_element_id=first_elem_id
+                        or (verified_anchors[0].source_element_id if verified_anchors else None),
+                        exact_quote=cand_phrase,
+                        source_char_start=start_char,
+                        source_char_end=end_char,
+                        document_sha256=evidence.document_sha256,
+                        parser_version=evidence.parser_version,
+                        anchor_status=AnchorStatus.VERIFIED,
+                        bounding_boxes=overlapping_boxes,
+                    )
+                    return new_anchor, cand_phrase
+
+    # 3. Check combined multi-element support for unquoted monotonic claims
+    for i in range(len(verified_anchors) - 1):
+        a1 = verified_anchors[i]
+        a2 = verified_anchors[i + 1]
+        if a1.page_number == a2.page_number:
+            combined = f"{a1.exact_quote} {a2.exact_quote}"
+            if check_claim_support(clean_claim, combined):
+                return a1, None
+
+    return None, None
+
+
 class ChatService:
     def __init__(
         self,
@@ -601,7 +739,8 @@ class ChatService:
             "CITATION & PROVENANCE RULES:\n"
             "- For any factual claim from papers, copy a short relevant sentence or phrase "
             "verbatim from ONE Evidence quote, preserving its words, numbers, and order, "
-            "then append that quote's citation ID such as [E1].\n"
+            "then append that quote's citation ID such as [E1]. "
+            "Wrap verbatim quotes in quotation marks.\n"
             "- Never invent a citation ID. Never use [E...] brackets for project decisions "
             "or user preferences.\n"
             "- For questions regarding project decisions, user preferences, terminology, or "
@@ -660,7 +799,9 @@ class ChatService:
         raw_answer = await llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
 
         # 5. Sentence-level citation validation and claim support checking
-        raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_answer) if s.strip()]
+        raw_sentences = [
+            s.strip() for s in re.split(r"(?<=[.!?])\s+(?!\[E\d+\])", raw_answer) if s.strip()
+        ]
 
         validated_citations: list[Citation] = []
         citation_to_display_index: dict[str, int] = {}
@@ -691,33 +832,32 @@ class ChatService:
 
             # Verify claim support against cited evidence
             sentence_supported = True
-            source_phrase: str | None = None
+            resolved_anchors_for_sentence: dict[str, tuple[CitationAnchor, str | None]] = {}
+            clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
+
             for m in cite_matches:
                 e_id = f"E{m.group(1)}"
                 evidence = evidence_map[e_id]
-                clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
-                if not matching_verified_anchor(evidence):
+                anchor, source_phrase = resolve_claim_anchor(
+                    db=db,
+                    evidence=evidence,
+                    clean_claim=clean_claim,
+                    cite_count=len(cite_matches),
+                )
+                if anchor is None:
                     sentence_supported = False
                     break
-                if not check_claim_support(clean_claim, evidence.quote):
-                    # Some otherwise useful responses wrap a verbatim excerpt in
-                    # unverified prose. Publish only the exact excerpt, and only
-                    # when one verified source is cited by this sentence.
-                    source_phrase = (
-                        extract_verbatim_quoted_phrase(clean_claim, evidence.quote)
-                        if len(cite_matches) == 1
-                        else None
-                    )
-                    if source_phrase is None:
-                        sentence_supported = False
-                        break
+                resolved_anchors_for_sentence[e_id] = (anchor, source_phrase)
 
             if not sentence_supported:
                 # Unsupported claim: discard entire sentence
                 continue
 
-            if source_phrase is not None:
-                sentence = f'"{source_phrase}" {cite_matches[0].group()}.'
+            if len(cite_matches) == 1:
+                e_id = f"E{cite_matches[0].group(1)}"
+                _, source_phrase = resolved_anchors_for_sentence[e_id]
+                if source_phrase is not None:
+                    sentence = f'"{source_phrase}" {cite_matches[0].group()}.'
 
             # Register verified citations for supported sentence
             for m in cite_matches:
@@ -725,25 +865,29 @@ class ChatService:
                 if e_id not in citation_to_display_index:
                     evidence = evidence_map[e_id]
                     citation_to_display_index[e_id] = display_idx
-                    # Determine anchor status specifically for the displayed quote and page
-                    matching_anchor = matching_verified_anchor(evidence)
-                    anchor_status = (
-                        matching_anchor.anchor_status
-                        if matching_anchor
-                        else AnchorStatus.UNRESOLVED
-                    )
+                    matched_anchor, _ = resolved_anchors_for_sentence[e_id]
+
+                    anchors_list = list(evidence.anchors)
+                    if not any(
+                        a.page_number == matched_anchor.page_number
+                        and a.exact_quote == matched_anchor.exact_quote
+                        and a.source_char_start == matched_anchor.source_char_start
+                        for a in anchors_list
+                    ):
+                        anchors_list.append(matched_anchor)
+
                     validated_citations.append(
                         Citation(
                             citation_index=display_idx,
                             evidence_id=e_id,
                             paper_id=evidence.paper_id,
-                            page_number=evidence.page_number,
-                            bounding_boxes=evidence.bounding_boxes,
-                            quote=evidence.quote,
+                            page_number=matched_anchor.page_number,
+                            bounding_boxes=matched_anchor.bounding_boxes or evidence.bounding_boxes,
+                            quote=matched_anchor.exact_quote,
                             document_sha256=evidence.document_sha256,
                             parser_version=evidence.parser_version,
-                            anchor_status=anchor_status,
-                            anchors=evidence.anchors,
+                            anchor_status=AnchorStatus.VERIFIED,
+                            anchors=anchors_list,
                         )
                     )
                     display_idx += 1

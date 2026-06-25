@@ -904,6 +904,25 @@ def test_numeric_support_reconciles_every_value_with_boundaries():
         )
         is True
     )
+    primary_and_improvement_quote = (
+        "BERT pushes the GLUE score to 80.5% (7.7% absolute improvement)."
+    )
+    assert (
+        _check_numeric_support(
+            GraphQualifierSchema(result_value=7.7, raw_value="7.7%", unit="%", metric="GLUE"),
+            [],
+            primary_and_improvement_quote,
+        )
+        is False
+    )
+    assert (
+        _check_numeric_support(
+            GraphQualifierSchema(result_value=80.5, raw_value="80.5%", unit="%", metric="GLUE"),
+            [],
+            primary_and_improvement_quote,
+        )
+        is True
+    )
 
     multi_dataset_quote = (
         "Method X reports ImageNet accuracy 90% and CIFAR accuracy 80% on test split "

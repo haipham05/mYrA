@@ -430,6 +430,52 @@ describe("GraphExplorer Component", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("ignores an interactive fact result after switching projects", async () => {
+    let resolveFact!: (fact: GraphFactDetail) => void;
+    vi.mocked(fetchFactDetail).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveFact = resolve;
+      }),
+    );
+    const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        id: "paper-123",
+        project_id: mockProjectId,
+        filename: "Attention Is All You Need.pdf",
+        status: "READY",
+        document_sha256: "aabbcc112233".padEnd(64, "0"),
+      }),
+    } as Response);
+
+    const { rerender } = render(
+      <GraphExplorer projectId={mockProjectId} apiUrl={mockApiUrl} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "List View" }));
+    await waitFor(() =>
+      expect(screen.getByText("Transformer")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByText("Transformer"));
+    await waitFor(() =>
+      expect(screen.getByText("EVALUATED_ON")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByText("EVALUATED_ON"));
+
+    await waitFor(() => {
+      expect(fetchFactDetail).toHaveBeenCalledWith(
+        mockApiUrl,
+        mockProjectId,
+        "fact-1",
+      );
+    });
+    rerender(<GraphExplorer projectId="other-project" apiUrl={mockApiUrl} />);
+    resolveFact(mockVerifiedFact);
+
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(screen.queryByTestId("mock-pdf-viewer")).not.toBeInTheDocument();
+    expect(screen.queryByText("Verified M1 Citation")).not.toBeInTheDocument();
+  });
+
   // Test 6: Selecting an unverified fact shows "Exact highlight unavailable" notice with zero guessed rectangle.
   it("selecting an unverified fact shows 'Exact highlight unavailable' notice with zero guessed rectangle", async () => {
     vi.mocked(fetchFactDetail).mockResolvedValueOnce(mockUnverifiedFact);

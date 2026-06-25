@@ -140,7 +140,11 @@ async def run_worker(
                 continue
 
             # If no ingestion job, poll for graph event
-            event = claim_next_graph_event(db, worker_id=worker_id)
+            event = (
+                claim_next_graph_event(db, worker_id=worker_id)
+                if settings.graphrag_enabled
+                else None
+            )
             if event:
                 logger.info(
                     "claimed_graph_event",
