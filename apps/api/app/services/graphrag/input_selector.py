@@ -63,7 +63,8 @@ def select_extraction_inputs(
     - Paper must have status == 'READY'.
     - Paper must have document_sha256.
     - Chunks must have chunk_type == 'child' (parent-only chunks strictly excluded).
-    - Chunks are ordered by chunk_index ASC and limited to max_chunks.
+    - A bounded sample spans the paper in chunk_index order, rather than
+      restricting small batches to title/author/abstract front matter.
     - Chunks must have non-empty, non-whitespace text.
     - Chunks must link to at least one PaperElement via ChunkElement
       (ordered by order_index ASC).
@@ -111,14 +112,28 @@ def select_extraction_inputs(
         )
         return []
 
-    chunks = (
-        db.query(PaperChunk)
+    chunk_rows = (
+        db.query(PaperChunk.id)
         .filter(
             PaperChunk.paper_id == paper_id,
             PaperChunk.chunk_type == "child",
         )
-        .order_by(PaperChunk.chunk_index.asc())
-        .limit(max_chunks)
+        .order_by(PaperChunk.chunk_index.asc(), PaperChunk.id.asc())
+        .all()
+    )
+    if len(chunk_rows) > max_chunks:
+        positions = (
+            [len(chunk_rows) // 2]
+            if max_chunks == 1
+            else [i * (len(chunk_rows) - 1) // (max_chunks - 1) for i in range(max_chunks)]
+        )
+        selected_ids = [chunk_rows[position].id for position in positions]
+    else:
+        selected_ids = [row.id for row in chunk_rows]
+    chunks = (
+        db.query(PaperChunk)
+        .filter(PaperChunk.id.in_(selected_ids), PaperChunk.paper_id == paper_id)
+        .order_by(PaperChunk.chunk_index.asc(), PaperChunk.id.asc())
         .all()
     )
 

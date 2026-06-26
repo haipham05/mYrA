@@ -129,11 +129,32 @@ ALLOWED RELATIONSHIP PREDICATES:
 PROPOSES_METHOD, USES_MODEL, EVALUATED_ON, ACHIEVES_RESULT,
 CONTRADICTS, EXTENDS, AUTHORED_BY, AFFILIATED_WITH
 
+ALLOWED ENDPOINT TYPES (subject -> object):
+PROPOSES_METHOD: Paper -> Method or Concept
+USES_MODEL: Paper -> Model or Concept
+EVALUATED_ON: Method or Model -> Dataset or Task; Paper or Result -> Dataset
+ACHIEVES_RESULT: Method, Model or Paper -> Result
+EXTENDS: Model -> Model or Method; Method -> Method
+AUTHORED_BY: Paper -> Author
+AFFILIATED_WITH: Author -> Institution
+CONTRADICTS: Claim or Result -> Claim or Result
+
 STRICT EVIDENCE GROUNDING RULES:
 1. Every fact MUST cite the exact `evidence_id` (e.g., ev_1) of the chunk from which it came.
 2. Every fact MUST include `exact_quote`, which MUST be an exact verbatim substring from that
    evidence chunk's text.
-3. If no factual relationships can be asserted with confidence, return empty lists:
+3. BOTH endpoint names MUST occur explicitly in the exact_quote. Use the spelling
+   from the quote, not an expanded title or inferred name. Do not replace "we",
+   "our model", or "this paper" with a named paper/model absent from the quote.
+4. Choose a short, self-contained quote inside ONE source element, not a paragraph
+   spanning separate source elements. Preserve all whitespace and punctuation.
+5. Qualifiers are optional. Omit any field not explicitly supported by the quote;
+   the example values above are NOT defaults. Never infer task, dataset, split,
+   metric, unit, or numeric results from neighboring sentences or background knowledge.
+6. ACHIEVES_RESULT requires an explicit result/performance assertion (achieves,
+   advances, yields, etc.). Architecture settings, layers, parameter counts, and
+   training configuration alone are NOT achieved results; omit these facts.
+7. If no factual relationships can be asserted with confidence, return empty lists:
    {"entities": [], "facts": []}.
 """
 

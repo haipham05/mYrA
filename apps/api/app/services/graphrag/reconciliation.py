@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.crud.graph import get_latest_completed_graph_event
 from app.db.models import GraphFactSnapshot, Paper
 from app.services.graphrag.neo4j_repository import Neo4jRepository
+from app.services.graphrag.verifier import result_relationship_supported
 
 logger = logging.getLogger("myra.graphrag.reconciliation")
 
@@ -48,6 +49,8 @@ def validate_snapshot_provenance(
     if paper_sha256 and snapshot.document_sha256.strip().lower() != paper_sha256.strip().lower():
         return False
     if not snapshot.subject_key or not snapshot.object_key or not snapshot.predicate:
+        return False
+    if not result_relationship_supported(snapshot.predicate, snapshot.exact_quote):
         return False
     return True
 

@@ -136,6 +136,18 @@ def create_test_chunk(
     return chunk
 
 
+@pytest.mark.parametrize(("limit", "expected"), [(1, [5]), (3, [0, 4, 9])])
+def test_small_batches_cover_more_than_front_matter(db_session, limit, expected):
+    project = create_test_project(db_session)
+    paper = create_test_paper(db_session, project.id)
+    for index in range(10):
+        element = create_test_element(db_session, paper.id, element_index=index)
+        create_test_chunk(db_session, paper.id, chunk_index=index, elements=[element])
+    items = select_extraction_inputs(db_session, project.id, paper.id, max_chunks=limit)
+    assert [item.chunk_index for item in items] == expected
+    assert len(items) <= limit
+
+
 def test_only_ready_papers_selected(db_session: Session):
     """Test 1: Only READY papers selected; PROCESSING or FAILED paper returns empty list."""
     project = create_test_project(db_session)
@@ -312,9 +324,9 @@ def test_bounded_batch_size_caps_items(db_session: Session):
     items = select_extraction_inputs(db_session, project.id, paper.id, max_chunks=2)
     assert len(items) == 2
     assert items[0].chunk_id == chunk_ids[0]
-    assert items[1].chunk_id == chunk_ids[1]
+    assert items[1].chunk_id == chunk_ids[-1]
     assert items[0].chunk_index == 0
-    assert items[1].chunk_index == 1
+    assert items[1].chunk_index == 9
     assert items[0].evidence_id == "ev_1"
     assert items[1].evidence_id == "ev_2"
 

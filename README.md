@@ -17,6 +17,23 @@ docker compose up --build
 
 Open <http://localhost:3000>. The page should show **API: Connected**. The API health endpoint is <http://localhost:8000/health> and returns `{"status":"ok","service":"myra-api"}`. Stop the foreground Compose process with Ctrl+C.
 
+## Enable GraphRAG on an existing installation
+
+With configured Supabase/GCS/DeepSeek, the current schema, existing images, and
+cached BGE weights, reuse the API, worker and local Neo4j:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.graph.yml up -d --no-build
+```
+
+Open a project's Graph Explorer from the workspace. Indexing calls DeepSeek and
+stores only source-verified facts; unsupported candidates are rejected. This
+profile reads at most eight child chunks per paper, so an empty result does not
+prove the paper has no relationships. It adds no services or public ports and
+does not edit `.env`. Use both Compose files for subsequent starts/recreation;
+running only the base file restores its configured feature setting. Models must
+already be cached because the profile loads them offline.
+
 ## Run on the host
 
 In one terminal, start the API:

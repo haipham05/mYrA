@@ -253,6 +253,24 @@ def _has_explicit_negation(text: str) -> bool:
     return any(re.search(pat, t) is not None for pat in NEGATION_PATTERNS)
 
 
+def result_relationship_supported(predicate: RelationshipPredicate | str, quote: str) -> bool:
+    """An architecture/configuration declaration alone is not an achieved result.
+
+    This conservative gate requires an explicit performance/result assertion for
+    ACHIEVES_RESULT; it does not turn mere co-occurrence into a relationship.
+    """
+    if predicate != RelationshipPredicate.ACHIEVES_RESULT:
+        return True
+    return bool(
+        re.search(
+            r"\b(?:achiev\w*|advanc\w*|attain\w*|obtain\w*|yield\w*|"
+            r"outperform\w*|improv\w*|reach\w*|scor\w*|report\w*)\b",
+            quote,
+            re.IGNORECASE,
+        )
+    )
+
+
 def verify_candidate_fact(
     db: Session,
     project_id: UUID,
@@ -296,6 +314,9 @@ def verify_candidate_fact(
     # 4. Reversed actor check
     if _check_reversed_actor(candidate.predicate, candidate.subject, candidate.object, quote_norm):
         return (False, "REVERSED_ACTOR")
+
+    if not result_relationship_supported(candidate.predicate, quote_norm):
+        return (False, "UNSUPPORTED_RESULT_RELATIONSHIP")
 
     # 5. Qualifier / Numeric check
     if not _check_qualifier_text_support(candidate.qualifiers, quote_norm):

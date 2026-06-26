@@ -772,6 +772,21 @@ class ChatService:
             "You are mYrA, an academic research assistant. "
             "Answer the QUESTION using the provided EVIDENCE quotes and PROJECT MEMORY, "
             "maintaining continuity with CONVERSATION HISTORY when relevant.\n\n"
+            "ANSWER DIRECTNESS & FLUENCY RULES:\n"
+            "- Answer directly, precisely, and concisely to the specific QUESTION asked.\n"
+            "- Always explicitly name the subject at the beginning (e.g., 'The Transformer is...', 'BERT is...'). "
+            "NEVER start answers with vague pronouns like 'It is...', 'This is...', or 'It was...'.\n"
+            "- Write fluent, natural, grammatically complete sentences. NEVER use artificial bracketed "
+            "inflections inside quotes (e.g., do NOT write 'eschew[es]' or 'rel[ies]'). If quoting, "
+            "quote clean, verbatim grammatical phrases that fit seamlessly into the sentence, or state "
+            "the facts directly in well-formed prose.\n"
+            "- Avoid redundancy: do NOT generate multiple sentences stating the same definition in different ways. "
+            "Provide one clear, authoritative definition and its key architectural principle without repetition.\n"
+            "- Rely strictly on the provided EVIDENCE quotes for factual claims, but use ONLY "
+            "the evidence necessary to answer the user's specific query.\n"
+            "- Do NOT summarize or dump all provided evidence chunks. Do not add unrequested "
+            "tangential details (such as training hardware, GPU hours, benchmark scores, "
+            "dataset names, or hyperparameter layer counts) unless the question explicitly asks for them.\n\n"
             "CITATION & PROVENANCE RULES:\n"
             "- For any factual claim from papers, support it with a citation ID such as [E1]. "
             "You may quote key phrases in quotation marks or integrate facts naturally into "
@@ -827,7 +842,12 @@ class ChatService:
         prompt_parts.append(f"EVIDENCE:\n{evidence_block}")
         if history_block:
             prompt_parts.append(f"CONVERSATION HISTORY:\n{history_block}")
-        prompt_parts.append(f"QUESTION:\n{question}")
+        prompt_parts.append(
+            f"QUESTION:\n{question}\n\n"
+            f"INSTRUCTION: Answer directly and concisely to the question above. "
+            f"Explicitly name the subject (e.g. 'The Transformer is...'), write fluent English without bracketed words like 'eschew[es]', "
+            f"avoid repeating the definition across multiple sentences, and include only the necessary facts from the evidence."
+        )
         user_prompt = "\n\n".join(prompt_parts)
 
         # 4. Generate answer with LLM

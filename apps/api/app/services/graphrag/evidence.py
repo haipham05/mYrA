@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.db.models import ChunkElement, GraphFactSnapshot, Paper, PaperChunk, PaperElement
 from app.schemas.evidence import AnchorStatus, BoundingBox, CitationAnchor, EvidenceItem
 from app.services.graphrag.provenance import resolve_graph_source_anchor
+from app.services.graphrag.verifier import result_relationship_supported
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,16 @@ def resolve_graph_fact_to_evidence(
         return (None, None, AnchorStatus.UNRESOLVED)
 
     if not prov_dict:
+        return (None, None, AnchorStatus.UNRESOLVED)
+
+    predicate = (
+        snapshot.predicate
+        if snapshot
+        else fact.get("predicate")
+        if isinstance(fact, dict)
+        else None
+    )
+    if not result_relationship_supported(predicate, str(prov_dict.get("exact_quote") or "")):
         return (None, None, AnchorStatus.UNRESOLVED)
 
     # Resolve and verify source anchor against live Postgres ground truth

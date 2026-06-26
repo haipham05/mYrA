@@ -21,7 +21,7 @@ from tests.fixtures.graphrag.corpus_fixtures import (
 )
 
 from app.db.base import Base
-from app.db.models import GraphFactSnapshot, Paper
+from app.db.models import GraphFactSnapshot, Paper, PaperChunk, PaperElement, PaperPage
 from app.schemas.graph import (
     ClaimPolarity,
     EntityType,
@@ -37,6 +37,66 @@ from app.services.graphrag.snapshots import (
     persist_verified_fact_snapshots,
 )
 from app.services.graphrag.verifier import verify_candidate_fact
+
+
+@pytest.mark.parametrize(
+    ("subject", "object_name", "quote", "expected"),
+    [
+        (
+            "BERTLARGE",
+            "L=24, H=1024, A=16, Total Parameters=340M",
+            "BERTLARGE (L=24, H=1024, A=16, Total Parameters=340M)",
+            False,
+        ),
+        (
+            "ELMo",
+            "state of the art for several major NLP benchmarks",
+            "ELMo advances the state of the art for several major NLP benchmarks",
+            True,
+        ),
+    ],
+)
+def test_result_relation_requires_result_assertion(
+    db_session, subject, object_name, quote, expected
+):
+    rel = validate_manifest(load_manifest()).projects["project_a"].papers[0].relationships[2]
+    paper = db_session.get(Paper, rel.provenance.paper_id)
+    page = (
+        db_session.query(PaperPage)
+        .filter_by(paper_id=paper.id, page_number=rel.provenance.page_number)
+        .one()
+    )
+    page.raw_text = quote
+    db_session.get(PaperChunk, rel.provenance.chunk_id).text = quote
+    db_session.get(PaperElement, rel.provenance.element_id).text = quote
+    db_session.flush()
+    candidate = GraphFactCandidate(
+        subject=GraphEntitySchema(id="model", name=subject, type=EntityType.MODEL),
+        predicate=RelationshipPredicate.ACHIEVES_RESULT,
+        object=GraphEntitySchema(id="result", name=object_name, type=EntityType.RESULT),
+        provenance=GraphProvenanceSchema(
+            paper_id=paper.id,
+            chunk_id=rel.provenance.chunk_id,
+            element_id=rel.provenance.element_id,
+            page_number=page.page_number,
+            exact_quote=quote,
+            char_start=0,
+            char_end=len(quote),
+            document_sha256=paper.document_sha256,
+        ),
+    )
+    assert verify_candidate_fact(db_session, PROJECT_A_ID, candidate) == (
+        expected,
+        None if expected else "UNSUPPORTED_RESULT_RELATIONSHIP",
+    )
+    # Older persisted snapshots must also abstain on readback after the repair.
+    from app.services.graphrag.evidence import resolve_graph_fact_to_evidence
+
+    snapshot = persist_verified_fact_snapshots(
+        db_session, PROJECT_A_ID, paper.id, "legacy", None, [candidate]
+    )[0]
+    evidence, _, _ = resolve_graph_fact_to_evidence(db_session, PROJECT_A_ID, snapshot)
+    assert bool(evidence) is expected
 
 
 @pytest.fixture

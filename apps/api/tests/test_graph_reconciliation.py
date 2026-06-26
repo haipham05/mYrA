@@ -671,6 +671,16 @@ def test_validate_snapshot_provenance_edge_cases() -> None:
     # Mismatched paper sha256
     assert validate_snapshot_provenance(valid_snap, paper_sha256="different_hash") is False
 
+    # A snapshot accepted by an older verifier must not reintroduce a false
+    # achievement edge during a rebuild.
+    valid_snap.predicate = "ACHIEVES_RESULT"
+    valid_snap.exact_quote = "BERTLARGE (L=24, H=1024, A=16, Total Parameters=340M)"
+    valid_snap.char_end = len(valid_snap.exact_quote)
+    assert validate_snapshot_provenance(valid_snap, paper_sha256="hash123") is False
+    valid_snap.exact_quote = "ELMo advances the state of the art for several major NLP benchmarks"
+    valid_snap.char_end = len(valid_snap.exact_quote)
+    assert validate_snapshot_provenance(valid_snap, paper_sha256="hash123") is True
+
 
 def test_rebuild_paper_not_found_raises() -> None:
     """Verify rebuild_paper_graph_from_snapshots raises ValueError when paper does not exist."""

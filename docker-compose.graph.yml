@@ -1,0 +1,16 @@
+# Enable the existing GraphRAG services without changing .env or rebuilding images.
+# This bounded profile indexes up to eight child chunks per paper; it is not a
+# full-document coverage guarantee. Retains root Compose ports, mounts and volumes.
+services:
+  api:
+    environment:
+      MYRA_GRAPHRAG_ENABLED: "true"
+      MYRA_GRAPH_BATCH_LIMIT: "8"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+  worker:
+    environment:
+      MYRA_GRAPHRAG_ENABLED: "true"
+      MYRA_GRAPH_BATCH_LIMIT: "8"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
