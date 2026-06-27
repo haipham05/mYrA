@@ -25,7 +25,7 @@ from app.services.graphrag.router import (
     retrieve_graph_evidence,
     route_query_intent,
 )
-from app.services.llm import get_llm_provider
+from app.services.llm import generate_with_metadata, get_llm_provider
 from app.services.memory_service import (
     capture_conversation_memories,
     format_memories_for_prompt,
@@ -774,19 +774,27 @@ class ChatService:
             "maintaining continuity with CONVERSATION HISTORY when relevant.\n\n"
             "ANSWER DIRECTNESS & FLUENCY RULES:\n"
             "- Answer directly, precisely, and concisely to the specific QUESTION asked.\n"
-            "- Always explicitly name the subject at the beginning (e.g., 'The Transformer is...', 'BERT is...'). "
-            "NEVER start answers with vague pronouns like 'It is...', 'This is...', or 'It was...'.\n"
-            "- Write fluent, natural, grammatically complete sentences. NEVER use artificial bracketed "
-            "inflections inside quotes (e.g., do NOT write 'eschew[es]' or 'rel[ies]'). If quoting, "
-            "quote clean, verbatim grammatical phrases that fit seamlessly into the sentence, or state "
+            "- Always explicitly name the subject at the beginning (e.g., "
+            "'The Transformer is...', 'BERT is...'). "
+            "NEVER start answers with vague pronouns like "
+            "'It is...', 'This is...', or 'It was...'.\n"
+            "- Write fluent, natural, grammatically complete sentences. "
+            "NEVER use artificial bracketed "
+            "inflections inside quotes (e.g., do NOT write 'eschew[es]' or 'rel[ies]'). "
+            "If quoting, "
+            "quote clean, verbatim grammatical phrases that fit seamlessly into "
+            "the sentence, or state "
             "the facts directly in well-formed prose.\n"
-            "- Avoid redundancy: do NOT generate multiple sentences stating the same definition in different ways. "
-            "Provide one clear, authoritative definition and its key architectural principle without repetition.\n"
+            "- Avoid redundancy: do NOT generate multiple sentences stating the same "
+            "definition in different ways. "
+            "Provide one clear, authoritative definition and its key architectural "
+            "principle without repetition.\n"
             "- Rely strictly on the provided EVIDENCE quotes for factual claims, but use ONLY "
             "the evidence necessary to answer the user's specific query.\n"
             "- Do NOT summarize or dump all provided evidence chunks. Do not add unrequested "
             "tangential details (such as training hardware, GPU hours, benchmark scores, "
-            "dataset names, or hyperparameter layer counts) unless the question explicitly asks for them.\n\n"
+            "dataset names, or hyperparameter layer counts) unless the question "
+            "explicitly asks for them.\n\n"
             "CITATION & PROVENANCE RULES:\n"
             "- For any factual claim from papers, support it with a citation ID such as [E1]. "
             "You may quote key phrases in quotation marks or integrate facts naturally into "
@@ -845,14 +853,19 @@ class ChatService:
         prompt_parts.append(
             f"QUESTION:\n{question}\n\n"
             f"INSTRUCTION: Answer directly and concisely to the question above. "
-            f"Explicitly name the subject (e.g. 'The Transformer is...'), write fluent English without bracketed words like 'eschew[es]', "
-            f"avoid repeating the definition across multiple sentences, and include only the necessary facts from the evidence."
+            f"Explicitly name the subject (e.g. 'The Transformer is...'), write fluent "
+            f"English without bracketed words like 'eschew[es]', "
+            f"avoid repeating the definition across multiple sentences, and include "
+            f"only the necessary facts from the evidence."
         )
         user_prompt = "\n\n".join(prompt_parts)
 
         # 4. Generate answer with LLM
         llm = get_llm_provider()
-        raw_answer = await llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+        generation = await generate_with_metadata(
+            llm, system_prompt=system_prompt, user_prompt=user_prompt
+        )
+        raw_answer = generation.content
 
         # 5. Sentence-level citation validation and claim support checking
         protected_answer = re.sub(
@@ -1005,8 +1018,13 @@ class ChatService:
             validated_citations = []
 
         # 6. Save assistant message
-        model_name = getattr(llm, "model_name", llm.provider_name)
-        token_count = max(1, len(formatted_answer.split()))
+        model_name = (
+            generation.reported_model
+            or generation.requested_model
+            or getattr(llm, "model_name", None)
+            or getattr(llm, "provider_name", "unknown")
+        )
+        token_count_estimate = max(1, len(formatted_answer.split()))
         assistant_msg: Message = add_message(
             db=db,
             conversation_id=conversation_id,
@@ -1015,7 +1033,7 @@ class ChatService:
             citations=[c.model_dump(mode="json") for c in validated_citations],
             evidence=[e.model_dump(mode="json") for e in evidence_items],
             model_name=model_name,
-            token_count=token_count,
+            token_count=token_count_estimate,
         )
 
         # 7. Post-turn memory capture (extract decisions/preferences from turns)
@@ -1034,7 +1052,20 @@ class ChatService:
                 "latency_ms": round(latency_ms, 2),
                 "evidence_count": len(evidence_items),
                 "citations_count": len(validated_citations),
-                "token_count": token_count,
+                "token_count_estimate": token_count_estimate,
+                "provider_usage": (
+                    {
+                        "prompt_tokens": generation.usage.prompt_tokens,
+                        "completion_tokens": generation.usage.completion_tokens,
+                        "total_tokens": generation.usage.total_tokens,
+                        "prompt_cache_hit_tokens": generation.usage.prompt_cache_hit_tokens,
+                        "prompt_cache_miss_tokens": generation.usage.prompt_cache_miss_tokens,
+                    }
+                    if generation.usage is not None
+                    else None
+                ),
+                "provider_response_id": generation.response_id,
+                "provider_model": generation.reported_model,
             },
         )
 

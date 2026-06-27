@@ -9,6 +9,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.crud.corpus import bump_corpus_revision
 from app.db.models import Paper, PaperPage
 from app.ingestion.parser import DocumentParser
 from app.storage.base import ObjectStorage
@@ -123,6 +124,8 @@ async def backfill_missing_page_text(
             db.rollback()
             updated: tuple[int, ...] = ()
         else:
+            if missing:
+                bump_corpus_revision(db, paper.project_id)
             db.commit()
             updated = missing
 

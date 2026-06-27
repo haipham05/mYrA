@@ -15,6 +15,7 @@ from app.config import Settings
 from app.crud.project import get_project
 from app.db.models import GraphEvent, GraphFactSnapshot, Paper, Project
 from app.db.session import get_db
+from app.observability.context import get_operation_context
 from app.schemas.evidence import AnchorStatus, Citation
 from app.schemas.graph import (
     GraphFactDetailResponse,
@@ -527,6 +528,7 @@ def trigger_graph_index(
         paper_ids=req.paper_ids,
         limit=req.limit,
         dry_run=req.dry_run,
+        trace_context=get_operation_context(),
     )
 
     return GraphIndexResponse(

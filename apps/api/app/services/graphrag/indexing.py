@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.crud.graph import create_or_enqueue_graph_event, get_active_graph_events_for_paper
 from app.db.models import Paper
+from app.observability.context import OperationContext
 
 logger = logging.getLogger("myra.graphrag.indexing")
 
@@ -20,6 +21,7 @@ def enqueue_existing_papers_for_graph(
     paper_ids: list[UUID | str] | None = None,
     limit: int = 10,
     dry_run: bool = True,
+    trace_context: OperationContext | None = None,
 ) -> dict[str, Any]:
     """Enqueue existing READY papers for GraphRAG extraction.
 
@@ -106,6 +108,7 @@ def enqueue_existing_papers_for_graph(
                 project_id=paper.project_id,
                 paper_id=paper.id,
                 action="UPSERT",
+                trace_context=trace_context,
             )
             enqueued_count += 1
 

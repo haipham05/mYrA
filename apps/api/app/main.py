@@ -12,6 +12,7 @@ from app.api.v1 import api_router
 from app.config import Settings
 from app.db.session import get_db
 from app.logging import configure_logging
+from app.observability.context import OperationContext, use_operation_context
 
 settings = Settings.from_environment()
 api_v1 = APIRouter(prefix="/api/v1")
@@ -42,13 +43,16 @@ app.add_middleware(
 
 @app.middleware("http")
 async def correlation_id_middleware(request: Request, call_next) -> Response:
-    correlation_id = (
-        request.headers.get("X-Correlation-ID")
-        or request.headers.get("X-Request-ID")
-        or uuid4().hex
+    incoming_correlation_id = request.headers.get("X-Correlation-ID") or request.headers.get(
+        "X-Request-ID"
     )
+    context = OperationContext.validated(correlation_id=incoming_correlation_id)
+    correlation_id = context.correlation_id or uuid4().hex
+    context = OperationContext.validated(correlation_id=correlation_id)
     request.state.correlation_id = correlation_id
-    response = await call_next(request)
+    request.state.operation_context = context
+    with use_operation_context(context):
+        response = await call_next(request)
     response.headers["X-Correlation-ID"] = correlation_id
     response.headers["X-Request-ID"] = correlation_id
     return response

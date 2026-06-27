@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.crud.corpus import read_corpus_revision
 from app.db.base import Base
 from app.db.models import Paper, PaperChunk, PaperElement, PaperPage, Project
 from app.ingestion.parser import ParsedPage, ParseResult
@@ -119,6 +120,7 @@ async def test_dry_run_then_restore_only_missing_text_and_repeat_is_idempotent(
     )
     assert preview.missing_page_numbers == (1,)
     assert preview.updated_page_numbers == ()
+    assert read_corpus_revision(db_session, project.id) == 0
     assert db_session.get(PaperPage, pages[0].id).raw_text is None
 
     restored = await backfill_missing_page_text(
@@ -131,6 +133,7 @@ async def test_dry_run_then_restore_only_missing_text_and_repeat_is_idempotent(
         dry_run=False,
     )
     assert restored.updated_page_numbers == (1,)
+    assert read_corpus_revision(db_session, project.id) == 1
     assert db_session.get(PaperPage, pages[0].id).raw_text == "Restored page one."
     assert db_session.get(PaperPage, pages[1].id).raw_text == "Existing page text stays intact."
     assert db_session.query(PaperElement.id).filter_by(paper_id=paper.id).scalar() == element_id
@@ -148,6 +151,7 @@ async def test_dry_run_then_restore_only_missing_text_and_repeat_is_idempotent(
     )
     assert repeated.missing_page_numbers == ()
     assert repeated.updated_page_numbers == ()
+    assert read_corpus_revision(db_session, project.id) == 1
 
 
 @pytest.mark.anyio

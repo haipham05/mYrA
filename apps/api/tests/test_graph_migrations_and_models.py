@@ -49,12 +49,18 @@ def test_migration_lifecycle_upgrade_downgrade():
 
         engine = create_engine(db_url)
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "g1a2b3c4d5e6"
+        assert current_rev == "i9c8d1e6b2f4"
         assert current_rev in heads
         check_schema_compatibility(engine)
 
         # 2. Inspect created tables
         inspector = inspect(engine)
+        project_cols = {col["name"]: col for col in inspector.get_columns("projects")}
+        assert "corpus_revision" in project_cols
+        assert project_cols["corpus_revision"]["nullable"] is False
+        job_cols = {col["name"]: col for col in inspector.get_columns("jobs")}
+        for expected_col in ["correlation_id", "trace_id", "parent_span_id", "trace_sampled"]:
+            assert expected_col in job_cols
         tables = inspector.get_table_names()
         assert "graph_events" in tables
         assert "graph_fact_snapshots" in tables
@@ -79,6 +85,10 @@ def test_migration_lifecycle_upgrade_downgrade():
             "created_at",
             "updated_at",
             "completed_at",
+            "correlation_id",
+            "trace_id",
+            "parent_span_id",
+            "trace_sampled",
         ]:
             assert expected_col in event_cols, f"Missing column {expected_col} in graph_events"
 
@@ -133,11 +143,13 @@ def test_migration_lifecycle_upgrade_downgrade():
         assert "memories" in tables_after_downgrade
         assert "papers" in tables_after_downgrade
         assert "projects" in tables_after_downgrade
+        assert "corpus_revision" not in {col["name"] for col in inspector.get_columns("projects")}
+        assert "trace_id" not in {col["name"] for col in inspector.get_columns("jobs")}
 
         # 4. Re-upgrade back to head
         command.upgrade(cfg, "head")
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "g1a2b3c4d5e6"
+        assert current_rev == "i9c8d1e6b2f4"
         check_schema_compatibility(engine)
 
 
@@ -184,6 +196,10 @@ def test_graph_event_model_creation_and_defaults():
             assert event.status == "PENDING"
             assert event.attempts == 0
             assert event.max_attempts == 3
+            assert event.correlation_id is None
+            assert event.trace_id is None
+            assert event.parent_span_id is None
+            assert event.trace_sampled is False
             assert event.lease_owner is None
             assert event.lease_expires_at is None
             assert event.error_code is None
@@ -191,6 +207,7 @@ def test_graph_event_model_creation_and_defaults():
             assert event.completed_at is None
             assert event.created_at is not None
             assert event.updated_at is not None
+            assert project.corpus_revision == 0
 
             # Assert project relationship
             assert event.project.id == project.id

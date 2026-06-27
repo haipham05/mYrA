@@ -14,6 +14,7 @@ from app.crud.graph import (
 from app.crud.job import claim_next_job, release_job, renew_job_lease
 from app.db.session import SessionLocal
 from app.logging import configure_logging
+from app.observability.context import OperationContext, use_operation_context
 from app.services.graphrag.processor import GraphEventProcessor
 from app.services.ingestion import IngestionPipeline
 
@@ -81,6 +82,28 @@ async def run_worker(
             except Exception:
                 pass
 
+    async def _process_job_with_context(db, job):
+        context = OperationContext.validated(
+            correlation_id=job.correlation_id,
+            trace_id=job.trace_id,
+            span_id=job.parent_span_id,
+            sampled=job.trace_sampled,
+        )
+        with use_operation_context(context):
+            await pipeline.process_paper(
+                db, paper_id=job.paper_id, job_id=job.id, worker_id=worker_id
+            )
+
+    async def _process_graph_event_with_context(db, event):
+        context = OperationContext.validated(
+            correlation_id=event.correlation_id,
+            trace_id=event.trace_id,
+            span_id=event.parent_span_id,
+            sampled=event.trace_sampled,
+        )
+        with use_operation_context(context):
+            await processor.process_graph_event(db, event_id=event.id, worker_id=worker_id)
+
     while running:
         db = SessionLocal()
         try:
@@ -90,11 +113,7 @@ async def run_worker(
                     "claimed_job",
                     extra={"job_id": str(job.id), "paper_id": str(job.paper_id)},
                 )
-                processing_task = asyncio.create_task(
-                    pipeline.process_paper(
-                        db, paper_id=job.paper_id, job_id=job.id, worker_id=worker_id
-                    )
-                )
+                processing_task = asyncio.create_task(_process_job_with_context(db, job))
                 active_processing_task = processing_task
                 heartbeat_task = asyncio.create_task(
                     _heartbeat(
@@ -154,9 +173,7 @@ async def run_worker(
                         "action": event.action,
                     },
                 )
-                processing_task = asyncio.create_task(
-                    processor.process_graph_event(db, event_id=event.id, worker_id=worker_id)
-                )
+                processing_task = asyncio.create_task(_process_graph_event_with_context(db, event))
                 active_processing_task = processing_task
                 heartbeat_task = asyncio.create_task(
                     _graph_heartbeat(

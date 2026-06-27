@@ -3,7 +3,9 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.crud.corpus import bump_corpus_revision
 from app.db.models import Job
+from app.observability.context import OperationContext
 from app.services.job_state_machine import validate_job_transition
 
 
@@ -11,8 +13,17 @@ class LostJobLeaseError(RuntimeError):
     """This worker no longer owns the job and must not publish its work."""
 
 
-def create_job(db: Session, paper_id: UUID) -> Job:
-    job = Job(paper_id=paper_id, status="PENDING", stage="QUEUED", progress=0.0)
+def create_job(db: Session, paper_id: UUID, trace_context: OperationContext | None = None) -> Job:
+    job = Job(
+        paper_id=paper_id,
+        status="PENDING",
+        stage="QUEUED",
+        progress=0.0,
+        correlation_id=trace_context.correlation_id if trace_context else None,
+        trace_id=trace_context.trace_id if trace_context else None,
+        parent_span_id=trace_context.span_id if trace_context else None,
+        trace_sampled=trace_context.sampled if trace_context else False,
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -224,8 +235,11 @@ def retry_job(db: Session, job_id: UUID | str) -> Job:
     job.is_retryable = False
 
     if job.paper:
+        was_ready = job.paper.status == "READY"
         job.paper.status = "PROCESSING"
         job.paper.error_message = None
+        if was_ready:
+            bump_corpus_revision(db, job.paper.project_id)
 
     db.commit()
     db.refresh(job)

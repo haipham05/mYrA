@@ -2,7 +2,9 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.crud.corpus import bump_corpus_revision
 from app.db.models import Job, Paper, PaperElement, PaperPage
+from app.observability.context import OperationContext
 
 
 def create_paper(
@@ -21,6 +23,8 @@ def create_paper(
         status=status,
     )
     db.add(paper)
+    if status == "READY":
+        bump_corpus_revision(db, project_id)
     db.commit()
     db.refresh(paper)
     return paper
@@ -33,6 +37,7 @@ def create_paper_with_job(
     storage_path: str,
     document_sha256: str | None = None,
     status: str = "PROCESSING",
+    trace_context: OperationContext | None = None,
 ) -> tuple[Paper, Job]:
     """Atomically create paper and job within a single database transaction."""
     paper = Paper(
@@ -44,11 +49,17 @@ def create_paper_with_job(
     )
     db.add(paper)
     db.flush()
+    if status == "READY":
+        bump_corpus_revision(db, project_id)
     job = Job(
         paper_id=paper.id,
         status="PENDING",
         stage="QUEUED",
         progress=0.0,
+        correlation_id=trace_context.correlation_id if trace_context else None,
+        trace_id=trace_context.trace_id if trace_context else None,
+        parent_span_id=trace_context.span_id if trace_context else None,
+        trace_sampled=trace_context.sampled if trace_context else False,
     )
     db.add(job)
     db.commit()
@@ -87,7 +98,10 @@ def update_paper_status(
     paper = get_paper(db, paper_id)
     if not paper:
         return None
+    was_ready = paper.status == "READY"
     paper.status = status
+    if was_ready != (status == "READY"):
+        bump_corpus_revision(db, paper.project_id)
     if page_count is not None:
         paper.page_count = page_count
     if error_message is not None:

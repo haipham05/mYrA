@@ -93,3 +93,44 @@ def test_log_formatter_emits_json() -> None:
     assert formatted["logger"] == "myra.api"
     assert formatted["message"] == "ready"
     assert "timestamp" in formatted
+
+
+def test_log_formatter_keeps_safe_metrics_and_context_only() -> None:
+    from app.observability import OperationContext, use_operation_context
+
+    record = logging.LogRecord("myra.api", logging.INFO, __file__, 1, "ready", (), None)
+    record.latency_ms = 12.5
+    record.evidence_count = 3
+    record.prompt = "private research question"
+    record.provider_usage = {"prompt_tokens": 24, "completion_tokens": 7}
+    record.requested_model = "deepseek-chat"
+    record.reported_model = "deepseek-chat-2026-01"
+    record.response_id = "resp-test-123"
+
+    context = OperationContext.validated(correlation_id="request-123")
+    with use_operation_context(context):
+        formatted = json.loads(JsonFormatter().format(record))
+
+    assert formatted["correlation_id"] == "request-123"
+    assert formatted["latency_ms"] == 12.5
+    assert formatted["evidence_count"] == 3
+    assert formatted["provider_usage"] == {"prompt_tokens": 24, "completion_tokens": 7}
+    assert formatted["requested_model"] == "deepseek-chat"
+    assert formatted["reported_model"] == "deepseek-chat-2026-01"
+    assert formatted["response_id"] == "resp-test-123"
+    assert "prompt" not in formatted
+
+
+def test_log_formatter_redacts_sensitive_text() -> None:
+    record = logging.LogRecord(
+        "myra.api",
+        logging.INFO,
+        __file__,
+        1,
+        "provider failed for owner@example.com",
+        (),
+        None,
+    )
+    formatted = json.loads(JsonFormatter().format(record))
+    assert "owner@example.com" not in formatted["message"]
+    assert "[EMAIL REDACTED]" in formatted["message"]

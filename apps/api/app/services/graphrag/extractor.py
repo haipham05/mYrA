@@ -32,7 +32,7 @@ from app.services.graphrag.input_selector import (
     ExtractionSourceElement,
     ExtractionSourcePage,
 )
-from app.services.llm import LLMProvider
+from app.services.llm import LLMProvider, generate_with_metadata
 
 logger = logging.getLogger("myra.graphrag.extractor")
 
@@ -626,14 +626,37 @@ class GraphExtractionAdapter:
 
         for attempt in range(1, self.max_retries + 2):
             try:
-                raw_response = await asyncio.wait_for(
-                    self.llm_provider.generate(
+                generation = await asyncio.wait_for(
+                    generate_with_metadata(
+                        self.llm_provider,
                         system_prompt=SYSTEM_PROMPT,
                         user_prompt=user_prompt,
                     ),
                     timeout=self.timeout_seconds,
                 )
-                return strip_markdown_fences(raw_response)
+                logger.info(
+                    "graph_extraction_generation_completed",
+                    extra={
+                        "attempt": attempt,
+                        "requested_model": generation.requested_model,
+                        "reported_model": generation.reported_model,
+                        "response_id": generation.response_id,
+                        "provider_usage": (
+                            {
+                                "prompt_tokens": generation.usage.prompt_tokens,
+                                "completion_tokens": generation.usage.completion_tokens,
+                                "total_tokens": generation.usage.total_tokens,
+                                "prompt_cache_hit_tokens": generation.usage.prompt_cache_hit_tokens,
+                                "prompt_cache_miss_tokens": (
+                                    generation.usage.prompt_cache_miss_tokens
+                                ),
+                            }
+                            if generation.usage is not None
+                            else None
+                        ),
+                    },
+                )
+                return strip_markdown_fences(generation.content)
             except TimeoutError as exc:
                 if attempt > self.max_retries:
                     logger.warning(

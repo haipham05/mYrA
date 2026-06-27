@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     FetchedValue,
@@ -32,6 +33,9 @@ class Project(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    corpus_revision: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -205,6 +209,10 @@ class Job(Base):
     is_retryable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    parent_span_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    trace_sampled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -387,6 +395,12 @@ class GraphEvent(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     max_attempts: Mapped[int] = mapped_column(
         Integer, default=3, server_default="3", nullable=False
+    )
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    parent_span_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    trace_sampled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
     )
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(

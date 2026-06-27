@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.crud.corpus import bump_corpus_revision
 from app.db.models import Job, Paper
 from app.schemas.job import JobStage, JobStatus
 from app.schemas.paper import PaperStatus
@@ -92,10 +93,13 @@ async def reconcile_stranded_resources_async(
                 )
                 job.is_retryable = False
                 if paper:
+                    was_ready = paper.status == PaperStatus.READY
                     paper.status = PaperStatus.FAILED
                     paper.error_message = (
                         "[PROCESSING_TIMEOUT] Job exceeded lease timeout and maximum retries"
                     )
+                    if was_ready:
+                        bump_corpus_revision(db, paper.project_id)
         else:
             report.stuck_jobs_recovered.append(job_id_str)
             if not dry_run:

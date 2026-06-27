@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import GraphEvent, Paper
+from app.observability.context import OperationContext
 
 
 class LostGraphLeaseError(RuntimeError):
@@ -19,6 +20,7 @@ def create_or_enqueue_graph_event(
     generation_id: str | None = None,
     ontology_version: str = "1.0.0",
     extractor_version: str = "1.0.0",
+    trace_context: OperationContext | None = None,
 ) -> GraphEvent:
     """Enqueue a GraphEvent in the current transaction without committing.
 
@@ -47,6 +49,10 @@ def create_or_enqueue_graph_event(
         status="PENDING",
         attempts=0,
         max_attempts=3,
+        correlation_id=trace_context.correlation_id if trace_context else None,
+        trace_id=trace_context.trace_id if trace_context else None,
+        parent_span_id=trace_context.span_id if trace_context else None,
+        trace_sampled=trace_context.sampled if trace_context else False,
     )
     db.add(event)
     return event

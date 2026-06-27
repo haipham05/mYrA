@@ -1,6 +1,34 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any
 
 from app.config import Settings
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationUsage:
+    """Provider-reported token usage for one generation call."""
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationResult:
+    """Immutable result and provider metadata for one generation call."""
+
+    content: str
+    requested_model: str | None = None
+    reported_model: str | None = None
+    response_id: str | None = None
+    usage: GenerationUsage | None = None
+
+
+def _optional_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class LLMProvider(ABC):
@@ -13,6 +41,29 @@ class LLMProvider(ABC):
     async def generate(self, system_prompt: str, user_prompt: str) -> str:
         pass
 
+    async def generate_result(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        """Backward-compatible metadata adapter for existing providers."""
+        return GenerationResult(content=await self.generate(system_prompt, user_prompt))
+
+
+async def generate_with_metadata(
+    provider: object, system_prompt: str, user_prompt: str
+) -> GenerationResult:
+    """Use the metadata API for real providers and preserve duck-typed test doubles.
+
+    Unspecced AsyncMock instances intentionally follow the legacy ``generate`` path:
+    their dynamically-created ``generate_result`` child would otherwise return a mock.
+    """
+    if isinstance(provider, LLMProvider):
+        return await provider.generate_result(system_prompt, user_prompt)
+
+    content = await provider.generate(system_prompt=system_prompt, user_prompt=user_prompt)  # type: ignore[attr-defined]
+    if isinstance(content, GenerationResult):
+        return content
+    if not isinstance(content, str):
+        raise TypeError("LLM provider generate() must return text")
+    return GenerationResult(content=content)
+
 
 class DeepSeekLLMProvider(LLMProvider):
     """DeepSeek API client."""
@@ -20,12 +71,16 @@ class DeepSeekLLMProvider(LLMProvider):
     def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com") -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.model_name = "deepseek-chat"
 
     @property
     def provider_name(self) -> str:
         return "deepseek"
 
     async def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return (await self.generate_result(system_prompt, user_prompt)).content
+
+    async def generate_result(self, system_prompt: str, user_prompt: str) -> GenerationResult:
         import httpx
 
         headers = {
@@ -33,7 +88,7 @@ class DeepSeekLLMProvider(LLMProvider):
             "Content-Type": "application/json",
         }
         payload = {
-            "model": "deepseek-chat",
+            "model": self.model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -48,7 +103,25 @@ class DeepSeekLLMProvider(LLMProvider):
             )
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            raw_usage = data.get("usage")
+            usage = None
+            if isinstance(raw_usage, dict):
+                usage = GenerationUsage(
+                    prompt_tokens=_optional_int(raw_usage.get("prompt_tokens")),
+                    completion_tokens=_optional_int(raw_usage.get("completion_tokens")),
+                    total_tokens=_optional_int(raw_usage.get("total_tokens")),
+                    prompt_cache_hit_tokens=_optional_int(raw_usage.get("prompt_cache_hit_tokens")),
+                    prompt_cache_miss_tokens=_optional_int(
+                        raw_usage.get("prompt_cache_miss_tokens")
+                    ),
+                )
+            return GenerationResult(
+                content=data["choices"][0]["message"]["content"],
+                requested_model=self.model_name,
+                reported_model=data.get("model") if isinstance(data.get("model"), str) else None,
+                response_id=data.get("id") if isinstance(data.get("id"), str) else None,
+                usage=usage,
+            )
 
 
 class FakeLLMProvider(LLMProvider):

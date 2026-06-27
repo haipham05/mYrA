@@ -6,12 +6,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.crud.corpus import bump_corpus_revision
 from app.crud.graph import create_or_enqueue_graph_event
 from app.crud.job import LostJobLeaseError, fence_job_for_publish, get_job, update_job_progress
 from app.crud.paper import get_paper
 from app.db.models import ChunkElement, PaperChunk, PaperElement, PaperPage
 from app.ingestion.chunker import DocumentChunker
 from app.ingestion.parser import DocumentParser
+from app.observability.context import get_operation_context
 from app.schemas.job import JobStage, JobStatus
 from app.schemas.paper import PaperStatus
 from app.services.embedding import get_embedding_provider
@@ -194,12 +196,14 @@ class IngestionPipeline:
             paper.page_count = len(parse_result.pages)
             paper.status = PaperStatus.READY
             paper.error_message = None
+            bump_corpus_revision(db, paper.project_id)
             if getattr(self.settings, "graphrag_enabled", False):
                 create_or_enqueue_graph_event(
                     db=db,
                     project_id=paper.project_id,
                     paper_id=paper.id,
                     action="UPSERT",
+                    trace_context=get_operation_context(),
                 )
             job.status = JobStatus.COMPLETED
             job.stage = JobStage.COMPLETED
@@ -234,8 +238,11 @@ class IngestionPipeline:
 
             else:
                 msg = f"[{classified.code.value}] {classified.sanitized_message}"
+                was_ready = paper.status == PaperStatus.READY
                 paper.status = PaperStatus.FAILED
                 paper.error_message = msg
+                if was_ready:
+                    bump_corpus_revision(db, paper.project_id)
                 current_job.stage = JobStage.FAILED
                 current_job.progress = 1.0
                 current_job.status = JobStatus.FAILED

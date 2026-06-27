@@ -46,6 +46,8 @@ def main() -> None:
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
         # Import only after isolating the database: app.db.session creates its engine at import.
+        from fastapi.testclient import TestClient
+
         from app.crud.job import claim_next_job, get_job
         from app.db.models import PaperChunk, PaperElement
         from app.db.session import SessionLocal, create_tables, engine
@@ -54,7 +56,6 @@ def main() -> None:
         from app.services.ingestion import IngestionPipeline
         from app.services.llm import get_llm_provider
         from app.storage.factory import get_storage
-        from fastapi.testclient import TestClient
 
         create_tables()
         paper_id: UUID | None = None
@@ -136,18 +137,15 @@ def main() -> None:
                     "conversation creation",
                 )
                 llm = get_llm_provider()
-                original_generate = llm.generate
+                original_generate_result = llm.generate_result
                 generated: dict[str, str] = {}
 
-                async def capture_generation(
-                    system_prompt: str, user_prompt: str
-                ) -> str:
-                    generated["text"] = await original_generate(
-                        system_prompt, user_prompt
-                    )
-                    return generated["text"]
+                async def capture_generation_result(system_prompt: str, user_prompt: str):
+                    result = await original_generate_result(system_prompt, user_prompt)
+                    generated["text"] = result.content
+                    return result
 
-                llm.generate = capture_generation
+                llm.generate_result = capture_generation_result
                 answer = require_status(
                     client.post(
                         f"/api/v1/conversations/{conversation['id']}/messages",

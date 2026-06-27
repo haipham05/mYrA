@@ -24,6 +24,7 @@ from app.crud.paper import create_paper_with_job, list_papers_by_project
 from app.crud.project import create_project, get_project, list_projects
 from app.db.models import Job, Paper
 from app.db.session import get_db
+from app.observability.context import get_operation_context
 from app.schemas.paper import PaperListResponse, PaperResponse, PaperStatus, PaperUploadResponse
 from app.schemas.project import ProjectCreate, ProjectListResponse, ProjectResponse
 from app.storage.factory import get_storage
@@ -161,7 +162,9 @@ async def upload_paper(
                     )
                 if existing_paper.status == PaperStatus.FAILED:
                     # Recover failed paper by creating a new job and re-queuing
-                    new_job = create_job(db, existing_paper.id)
+                    new_job = create_job(
+                        db, existing_paper.id, trace_context=get_operation_context()
+                    )
                     existing_paper.status = PaperStatus.PROCESSING
                     existing_paper.error_message = None
                     db.commit()
@@ -225,6 +228,7 @@ async def upload_paper(
             storage_path=storage_path,
             document_sha256=document_sha256,
             status=PaperStatus.PROCESSING,
+            trace_context=get_operation_context(),
         )
     except Exception as err:
         db.rollback()

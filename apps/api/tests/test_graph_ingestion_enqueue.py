@@ -10,6 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
+from app.crud.corpus import read_corpus_revision
 from app.crud.graph import (
     create_or_enqueue_graph_event,
     get_active_graph_events_for_paper,
@@ -257,6 +258,7 @@ async def test_reindexing_paper_yields_new_unique_generation_id(env):
     await pipeline.process_paper(db, paper.id, job1.id)
     db.refresh(paper)
     assert paper.status == PaperStatus.READY
+    assert read_corpus_revision(db, proj.id) == 1
 
     events_1 = db.query(GraphEvent).filter(GraphEvent.paper_id == paper.id).all()
     assert len(events_1) == 1
@@ -268,6 +270,7 @@ async def test_reindexing_paper_yields_new_unique_generation_id(env):
     await pipeline.process_paper(db, paper.id, job2.id)
     db.refresh(paper)
     assert paper.status == PaperStatus.READY
+    assert read_corpus_revision(db, proj.id) == 2
 
     events_2 = (
         db.query(GraphEvent)
