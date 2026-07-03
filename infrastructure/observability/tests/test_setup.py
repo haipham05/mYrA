@@ -20,7 +20,7 @@ def test_setup_creates_private_files_and_preserves_credentials_on_rerun(
 
     setup(state_dir)
     credential_path = state_dir / "credentials.json"
-    retention_path = state_dir / "retention-state.json"
+    retention_path = state_dir / "retention" / "retention-state.json"
     first_credentials = credential_path.read_bytes()
     state = json.loads(first_credentials)
     personal_key = state["personal_project"]["secret_key"]
@@ -35,6 +35,7 @@ def test_setup_creates_private_files_and_preserves_credentials_on_rerun(
     assert (state_dir / "app.env").read_text(encoding="utf-8") == first_app_env
     assert personal_key in first_app_env
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(retention_path.parent.stat().st_mode) == 0o700
     assert all(
         stat.S_IMODE(path.stat().st_mode) == 0o600
         for path in state_dir.iterdir()
@@ -56,6 +57,25 @@ def test_setup_preserves_manual_synthetic_project_keys(tmp_path: Path) -> None:
 
     assert "pk-lf-user-created" in synthetic_env.read_text(encoding="utf-8")
     assert stat.S_IMODE(synthetic_env.stat().st_mode) == 0o600
+
+
+def test_setup_migrates_legacy_retention_state_into_separate_mount_directory(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "private-state"
+    state_dir.mkdir()
+    legacy = state_dir / "retention-state.json"
+    legacy_state = {
+        "format_version": 1,
+        "projects": {"personal": {"last_success_at": "2026-10-01T12:00:00Z"}},
+    }
+    legacy.write_text(json.dumps(legacy_state), encoding="utf-8")
+
+    setup(state_dir)
+
+    migrated = state_dir / "retention" / "retention-state.json"
+    assert json.loads(migrated.read_text(encoding="utf-8")) == legacy_state
+    assert legacy.read_text(encoding="utf-8") == json.dumps(legacy_state)
 
 
 def test_setup_refuses_symlink_state_or_output(tmp_path: Path) -> None:

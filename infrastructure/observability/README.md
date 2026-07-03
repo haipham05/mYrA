@@ -43,10 +43,11 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml ps --al
 
 The explicit service list avoids starting or rebuilding the existing mYrA app,
 web, worker, and Neo4j. The retention service runs a bounded cleanup pass hourly
-and persists only progress metadata in `retention-state.json`; it needs the
+and persists only progress metadata in `.local/observability/retention/`; it needs the
 synthetic project keys before both-project cleanup can succeed. API and worker
-mount that single state file read-only so text export can fail closed when
-cleanup is stale. Use `docker compose ... logs --tail=100 langfuse-web
+mount only that state directory read-only so text export can fail closed when
+cleanup is stale; the scheduler reads credentials from the private state mount
+and writes status to the separate directory. Use `docker compose ... logs --tail=100 langfuse-web
 langfuse-worker langfuse-retention` for metadata-only diagnostics; never publish
 environment output. The overlay reuses the repository's base default network
 only for app-to-console access. Langfuse's database/object-store/queue network

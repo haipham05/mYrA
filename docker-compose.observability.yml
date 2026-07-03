@@ -7,12 +7,12 @@ services:
         required: true
     environment:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
-      MYRA_RETENTION_STATE_PATH: /run/myra-observability/retention-state.json
+      MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
       MYRA_OBSERVABILITY_ENABLED: "true"
     volumes:
       - type: bind
-        source: ./.local/observability/retention-state.json
-        target: /run/myra-observability/retention-state.json
+        source: ./.local/observability/retention
+        target: /run/myra-retention
         read_only: true
         bind:
           create_host_path: false
@@ -26,12 +26,12 @@ services:
         required: true
     environment:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
-      MYRA_RETENTION_STATE_PATH: /run/myra-observability/retention-state.json
+      MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
       MYRA_OBSERVABILITY_ENABLED: "true"
     volumes:
       - type: bind
-        source: ./.local/observability/retention-state.json
-        target: /run/myra-observability/retention-state.json
+        source: ./.local/observability/retention
+        target: /run/myra-retention
         read_only: true
         bind:
           create_host_path: false
@@ -47,10 +47,11 @@ services:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
     entrypoint: ["/bin/sh", "-ec"]
     command:
-      - while true; do python /app/infrastructure/observability/retention.py --state-dir /run/myra-observability || true; sleep 3600; done
+      - while true; do python /app/infrastructure/observability/retention.py --credentials-dir /run/observability --state-dir /run/myra-retention || true; sleep 3600; done
     volumes:
       - ./infrastructure/observability:/app/infrastructure/observability:ro
-      - ./.local/observability:/run/myra-observability:rw
+      - ./.local/observability:/run/observability:ro
+      - ./.local/observability/retention:/run/myra-retention:rw
     networks:
       - default
 
@@ -60,6 +61,8 @@ services:
     env_file:
       - path: .local/observability/langfuse-web.env
         required: true
+    environment:
+      HOSTNAME: 0.0.0.0
     depends_on:
       langfuse-postgres:
         condition: service_healthy
@@ -87,6 +90,8 @@ services:
     env_file:
       - path: .local/observability/langfuse-worker.env
         required: true
+    environment:
+      HOSTNAME: 0.0.0.0
     depends_on:
       langfuse-postgres:
         condition: service_healthy

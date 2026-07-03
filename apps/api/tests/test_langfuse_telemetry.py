@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
+import app.observability.telemetry as telemetry_module
 from app.observability.context import (
     OperationContext,
     get_operation_context,
@@ -16,6 +21,7 @@ from app.observability.telemetry import (
     TelemetryAdapter,
     TelemetryConfig,
     _FailureCountingExporter,
+    get_telemetry,
 )
 
 
@@ -86,6 +92,42 @@ def configured(**overrides: Any) -> TelemetryConfig:
     return TelemetryConfig(**fields)
 
 
+def reset_default_telemetry(monkeypatch) -> None:
+    monkeypatch.setattr(telemetry_module, "_default_telemetry", None)
+    for name in (
+        "MYRA_OBSERVABILITY_ENABLED",
+        "MYRA_TRACE_SAMPLE_RATE",
+        "MYRA_RETENTION_STATE_PATH",
+        "LANGFUSE_BASE_URL",
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def write_retention_state(path, *, failure: str | None = None, stale: str | None = None) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "projects": {
+                    label: {
+                        "last_success_at": (
+                            datetime.now(UTC)
+                            - (timedelta(hours=3) if stale == label else timedelta(minutes=5))
+                        )
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                        "last_failure_at": failure if label == "synthetic" else None,
+                    }
+                    for label in ("personal", "synthetic")
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_disabled_adapter_does_not_initialize_client_or_make_network_attempt() -> None:
     attempts = 0
 
@@ -103,6 +145,39 @@ def test_disabled_adapter_does_not_initialize_client_or_make_network_attempt() -
     assert not adapter.enabled
 
 
+def test_shared_accessor_is_lazy_singleton_and_disabled_without_config(monkeypatch) -> None:
+    reset_default_telemetry(monkeypatch)
+    first = get_telemetry()
+    second = get_telemetry()
+    assert first is second
+    assert not first.enabled
+
+
+def test_shared_accessor_is_singleton_during_concurrent_first_access(monkeypatch) -> None:
+    reset_default_telemetry(monkeypatch)
+    original_adapter = telemetry_module.TelemetryAdapter
+    constructions: list[TelemetryAdapter] = []
+
+    class DelayedAdapter(original_adapter):
+        def __init__(self) -> None:
+            time.sleep(0.02)
+            super().__init__()
+            constructions.append(self)
+
+    monkeypatch.setattr(telemetry_module, "TelemetryAdapter", DelayedAdapter)
+    barrier = threading.Barrier(12)
+
+    def access() -> TelemetryAdapter:
+        barrier.wait()
+        return get_telemetry()
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        adapters = list(pool.map(lambda _: access(), range(12)))
+
+    assert len(constructions) == 1
+    assert all(adapter is constructions[0] for adapter in adapters)
+
+
 def test_incomplete_configuration_stays_noop() -> None:
     attempts = 0
 
@@ -114,6 +189,87 @@ def test_incomplete_configuration_stays_noop() -> None:
     adapter = TelemetryAdapter(config=configured(secret_key=None), client_factory=factory)
     assert attempts == 0
     assert adapter.dropped_count == 0
+
+
+def test_retention_gate_is_opt_in_and_fresh_state_allows_text(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("MYRA_RETENTION_STATE_PATH", raising=False)
+    client = FakeClient()
+    adapter = TelemetryAdapter(client, config=configured())
+    with adapter.stage("without-gate", input={"question": "allowed"}):
+        pass
+    assert client.calls[0]["input"] == {"question": "allowed"}
+
+    state_path = tmp_path / "retention-state.json"
+    write_retention_state(state_path)
+    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
+    client = FakeClient()
+    adapter = TelemetryAdapter(client, config=configured())
+    with adapter.stage("with-fresh-gate", input={"question": "allowed"}):
+        pass
+    assert client.calls[0]["input"] == {"question": "allowed"}
+
+
+@pytest.mark.parametrize("state_mode", ["missing", "invalid"])
+def test_missing_or_invalid_retention_state_drops_text_but_keeps_metadata(
+    monkeypatch, tmp_path, state_mode
+) -> None:
+    state_path = tmp_path / "retention-state.json"
+    if state_mode == "invalid":
+        state_path.write_text("not-json", encoding="utf-8")
+    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
+    client = FakeClient()
+    adapter = TelemetryAdapter(client, config=configured())
+
+    with adapter.stage(
+        "paper.answer",
+        input={"question": "private question"},
+        metadata={"outcome": "success", "evidence": "private quote", "attempt": 1},
+        generation=True,
+    ) as span:
+        assert span is not None
+        adapter.generation_metadata(
+            span,
+            model="deepseek-chat",
+            usage={"input": 12, "output": 3},
+            output="private answer",
+        )
+    adapter.event(
+        "answer.completed",
+        input={"question": "private question"},
+        output={"answer": "private answer"},
+        metadata={"outcome": "success", "citation_text": "private quote"},
+    )
+
+    assert "input" not in client.calls[0]
+    assert client.calls[0]["metadata"] == {"outcome": "success", "attempt": 1}
+    assert "output" not in client.observation.updates[0]
+    assert client.observation.updates[0]["usage_details"] == {"input": 12, "output": 3}
+    assert client.events[0]["input"] is None
+    assert client.events[0]["output"] is None
+    assert client.events[0]["metadata"] == {"outcome": "success"}
+
+
+@pytest.mark.parametrize("problem", ["personal_failure", "synthetic_failure", "stale"])
+def test_retention_gate_requires_both_recent_failure_free_projects(
+    monkeypatch, tmp_path, problem
+) -> None:
+    state_path = tmp_path / "retention-state.json"
+    if problem == "stale":
+        write_retention_state(state_path, stale="synthetic")
+    elif problem == "personal_failure":
+        write_retention_state(state_path, failure=None)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["projects"]["personal"]["last_failure_at"] = datetime.now(UTC).isoformat()
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    else:
+        write_retention_state(state_path, failure=datetime.now(UTC).isoformat())
+    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
+    client = FakeClient()
+    adapter = TelemetryAdapter(client, config=configured())
+    with adapter.stage("must-not-send-text", input={"question": "private"}, metadata={"count": 2}):
+        pass
+    assert "input" not in client.calls[0]
+    assert client.calls[0]["metadata"] == {"count": 2}
 
 
 def test_stage_sanitizes_explicit_payload_and_propagates_valid_context() -> None:
@@ -279,6 +435,30 @@ def test_events_and_lifecycle_failures_are_isolated_and_context_does_not_leak() 
     adapter.flush()
     adapter.shutdown()
     assert adapter.dropped_count == 2
+
+
+def test_event_does_not_create_root_trace_for_unsampled_persisted_context() -> None:
+    client = FakeClient()
+    adapter = TelemetryAdapter(client, config=configured())
+
+    unsampled = OperationContext.validated(
+        correlation_id="job-correlation",
+        trace_id="e" * 32,
+        span_id="f" * 16,
+        sampled=False,
+    )
+    with use_operation_context(unsampled):
+        adapter.event("job.retry", metadata={"attempt": 2})
+    assert client.events == []
+
+    # Metadata-only activity with no persisted trace context remains supported.
+    with use_operation_context(OperationContext.validated(correlation_id="standalone")):
+        adapter.event("maintenance.finished", metadata={"attempt": 2})
+    assert len(client.events) == 1
+    assert client.events[0]["metadata"] == {
+        "attempt": 2,
+        "correlation_id": "standalone",
+    }
 
 
 def test_async_export_failures_are_counted_without_raising() -> None:

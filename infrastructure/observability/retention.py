@@ -574,12 +574,13 @@ def cleanup(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    parser.add_argument("--credentials-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--base-url", default=os.environ.get("LANGFUSE_BASE_URL"))
     args = parser.parse_args(argv)
     try:
         if not args.base_url:
             raise RetentionError("base_url_not_configured")
-        projects = load_projects(args.state_dir)
+        projects = load_projects(args.credentials_dir)
         state, success = cleanup(
             base_url=args.base_url,
             projects=projects,

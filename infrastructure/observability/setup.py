@@ -240,13 +240,36 @@ def setup(state_dir: Path = DEFAULT_STATE_DIR) -> None:
             "LANGFUSE_SECRET_KEY=\n",
         )
 
-    retention_path = state_dir / "retention-state.json"
+    retention_directory = state_dir / "retention"
+    if retention_directory.is_symlink():
+        raise ValueError(f"Refusing symlink output directory: {retention_directory}")
+    retention_directory.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(retention_directory, 0o700)
+    retention_path = retention_directory / "retention-state.json"
     if retention_path.is_symlink():
         raise ValueError(f"Refusing symlink output file: {retention_path}")
     if not retention_path.exists():
+        legacy_retention_path = state_dir / "retention-state.json"
+        if legacy_retention_path.is_symlink():
+            raise ValueError(f"Refusing symlink output file: {legacy_retention_path}")
+        initial_state: dict[str, Any] = {"format_version": 1, "projects": {}}
+        if legacy_retention_path.is_file():
+            try:
+                legacy_state = json.loads(
+                    legacy_retention_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                raise ValueError("Existing retention state is invalid") from None
+            if (
+                not isinstance(legacy_state, dict)
+                or legacy_state.get("format_version") != 1
+                or not isinstance(legacy_state.get("projects"), dict)
+            ):
+                raise ValueError("Existing retention state is invalid")
+            initial_state = legacy_state
         _write_private_file(
             retention_path,
-            json.dumps({"format_version": 1, "projects": {}}, indent=2) + "\n",
+            json.dumps(initial_state, indent=2) + "\n",
         )
 
 
