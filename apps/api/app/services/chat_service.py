@@ -9,6 +9,7 @@ from app.config import Settings
 from app.crud.chat import add_message, get_conversation
 from app.db.models import Memory, Message, PaperElement, PaperPage
 from app.ingestion.parser import find_verbatim_span
+from app.observability.telemetry import Observation, TelemetryAdapter, get_telemetry
 from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import (
     AnchorStatus,
@@ -641,6 +642,24 @@ class ChatService:
         conversation_id: UUID,
         question: str,
     ) -> MessageResponse:
+        telemetry = get_telemetry()
+        with telemetry.operation(
+            "chat.answer",
+            input={"question": question},
+            metadata={"conversation_id": str(conversation_id)},
+        ) as observation:
+            return await self._answer_question(
+                db, conversation_id, question, telemetry, observation
+            )
+
+    async def _answer_question(
+        self,
+        db: Session,
+        conversation_id: UUID,
+        question: str,
+        telemetry: TelemetryAdapter,
+        observation: Observation | None,
+    ) -> MessageResponse:
         start_time = time.perf_counter()
         conv = get_conversation(db, conversation_id)
         if not conv:
@@ -862,9 +881,55 @@ class ChatService:
 
         # 4. Generate answer with LLM
         llm = get_llm_provider()
-        generation = await generate_with_metadata(
-            llm, system_prompt=system_prompt, user_prompt=user_prompt
-        )
+        selected_evidence = [
+            {
+                "evidence_id": item.id,
+                "paper_title": item.paper_title,
+                "page_number": item.page_number,
+                "quote": item.quote,
+                "context": item.parent_context,
+            }
+            for item in evidence_items
+        ]
+        with telemetry.stage(
+            "chat.generation",
+            generation=True,
+            input={
+                "question": question,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "selected_evidence": selected_evidence,
+            },
+            metadata={"attempt": 1},
+        ) as generation_observation:
+            generation = await generate_with_metadata(
+                llm, system_prompt=system_prompt, user_prompt=user_prompt
+            )
+            generation_usage = (
+                {
+                    key: value
+                    for key, value in {
+                        "prompt_tokens": generation.usage.prompt_tokens,
+                        "completion_tokens": generation.usage.completion_tokens,
+                        "total_tokens": generation.usage.total_tokens,
+                        "prompt_cache_hit_tokens": generation.usage.prompt_cache_hit_tokens,
+                        "prompt_cache_miss_tokens": generation.usage.prompt_cache_miss_tokens,
+                    }.items()
+                    if value is not None
+                }
+                if generation.usage is not None
+                else None
+            )
+            telemetry.generation_metadata(
+                generation_observation,
+                model=generation.reported_model or generation.requested_model,
+                usage=generation_usage,
+                output=generation.content,
+            )
+            if generation_observation is not None:
+                generation_observation.update(
+                    metadata={"attempt": 1, "response_id": generation.response_id}
+                )
         raw_answer = generation.content
 
         # 5. Sentence-level citation validation and claim support checking
@@ -878,6 +943,12 @@ class ChatService:
         citation_to_display_index: dict[str, int] = {}
         display_idx = 1
         retained_paragraphs: list[str] = []
+        citation_validation = {
+            "citation_markers": 0,
+            "accepted_citations": 0,
+            "rejected_unknown_id": 0,
+            "rejected_unsupported_claim": 0,
+        }
 
         paragraphs = [p for p in protected_answer.split("\n\n") if p.strip()]
         for para in paragraphs:
@@ -886,6 +957,7 @@ class ChatService:
             for line in para_lines:
                 clean_line = line.strip()
                 cite_matches_in_line = list(re.finditer(r"\[E(\d+)\]", clean_line))
+                citation_validation["citation_markers"] += len(cite_matches_in_line)
 
                 # Retain section headers and transition/introductory lines
                 is_structure = (
@@ -927,6 +999,7 @@ class ChatService:
 
                     if not all_valid_ids:
                         # Hallucinated unknown citation: discard entire sentence
+                        citation_validation["rejected_unknown_id"] += len(cite_matches)
                         continue
 
                     # Verify claim support against cited evidence
@@ -950,6 +1023,7 @@ class ChatService:
 
                     if not sentence_supported:
                         # Unsupported claim: discard entire sentence
+                        citation_validation["rejected_unsupported_claim"] += len(cite_matches)
                         continue
 
                     # Register verified citations for supported sentence
@@ -985,6 +1059,7 @@ class ChatService:
                                     anchors=anchors_list,
                                 )
                             )
+                            citation_validation["accepted_citations"] += 1
                             display_idx += 1
 
                     def replace_cite(m: re.Match) -> str:
@@ -1016,6 +1091,34 @@ class ChatService:
                 "Insufficient evidence available in the uploaded papers to answer this question."
             )
             validated_citations = []
+
+        if observation is not None:
+            observation.update(
+                output=formatted_answer,
+                metadata={
+                    "citation_validation": citation_validation,
+                    "citation_count": len(validated_citations),
+                    "abstained": not bool(validated_citations or decision_preference_memories),
+                    "generation_attempts": [
+                        {
+                            "attempt": 1,
+                            "requested_model": generation.requested_model,
+                            "reported_model": generation.reported_model,
+                            "response_id": generation.response_id,
+                            "usage": generation_usage,
+                        }
+                    ],
+                    "outcome": "success",
+                },
+            )
+        telemetry.event(
+            "chat.citation_validation",
+            metadata={
+                **citation_validation,
+                "citation_count": len(validated_citations),
+                "abstained": not bool(validated_citations or decision_preference_memories),
+            },
+        )
 
         # 6. Save assistant message
         model_name = (

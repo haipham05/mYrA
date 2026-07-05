@@ -23,6 +23,7 @@ from app.db.models import (
     PaperPage,
 )
 from app.ingestion.parser import find_verbatim_span
+from app.observability.telemetry import get_telemetry
 from app.schemas.evidence import (
     AnchorStatus,
     BoundingBox,
@@ -581,6 +582,26 @@ def resolve_paper_memory_source(
     project_id: UUID,
     source: MemorySource | MemorySourceCreate,
 ) -> tuple[EvidenceItem | None, CitationAnchor | None, AnchorStatus]:
+    """Resolve a paper source and record its verification outcome without ORM serialization."""
+    telemetry = get_telemetry()
+    with telemetry.stage(
+        "memory.source_resolution",
+        metadata={"source_type": str(source.source_type)},
+    ) as observation:
+        result = _resolve_paper_memory_source(db, project_id, source)
+        if observation is not None:
+            evidence, anchor, status = result
+            observation.update(
+                output={"outcome": status.value, "verified": bool(evidence and anchor)}
+            )
+        return result
+
+
+def _resolve_paper_memory_source(
+    db: Session,
+    project_id: UUID,
+    source: MemorySource | MemorySourceCreate,
+) -> tuple[EvidenceItem | None, CitationAnchor | None, AnchorStatus]:
     """Deterministically resolve a paper memory source to an M1-compatible verified EvidenceItem
     and CitationAnchor.
 
@@ -870,6 +891,37 @@ def consolidate_memory_candidate(
     candidate: MemoryCreate,
     embedding: list[float] | None = None,
 ) -> Memory:
+    """Validate, consolidate, and trace a deliberately selected memory candidate."""
+    telemetry = get_telemetry()
+    selected_candidate = {
+        "memory_type": candidate.memory_type.value,
+        "title": candidate.title,
+        "content": candidate.content,
+    }
+    with telemetry.stage(
+        "memory.consolidation",
+        input={"candidate": selected_candidate},
+        metadata={"source_count": len(candidate.sources)},
+    ) as observation:
+        try:
+            memory = _consolidate_memory_candidate(db, project_id, candidate, embedding)
+        except ValueError:
+            if observation is not None:
+                observation.update(output={"outcome": "rejected"})
+            raise
+        if observation is not None:
+            observation.update(
+                output={"outcome": "consolidated", "memory_type": memory.memory_type}
+            )
+        return memory
+
+
+def _consolidate_memory_candidate(
+    db: Session,
+    project_id: UUID,
+    candidate: MemoryCreate,
+    embedding: list[float] | None = None,
+) -> Memory:
     """Idempotently insert or supersede memory in the target project.
 
     Enforces:
@@ -932,6 +984,20 @@ def consolidate_memory_candidate(
 
 
 def capture_conversation_memories(
+    db: Session,
+    project_id: UUID,
+    conversation_id: UUID,
+) -> list[Memory]:
+    """Capture selected memories while tracing aggregate outcomes only."""
+    telemetry = get_telemetry()
+    with telemetry.stage("memory.capture") as observation:
+        memories = _capture_conversation_memories(db, project_id, conversation_id)
+        if observation is not None:
+            observation.update(output={"captured_count": len(memories), "outcome": "completed"})
+        return memories
+
+
+def _capture_conversation_memories(
     db: Session,
     project_id: UUID,
     conversation_id: UUID,
@@ -1014,6 +1080,42 @@ def score_memory_relevance(
 
 
 def retrieve_project_memories(
+    db: Session,
+    project_id: UUID,
+    query: str,
+    limit: int = 5,
+    record_access: bool = True,
+    query_embedding: list[float] | None = None,
+) -> list[Memory]:
+    """Look up project memories and trace selected query/results under retention policy."""
+    telemetry = get_telemetry()
+    with telemetry.stage(
+        "memory.lookup",
+        input={"query": query},
+        metadata={"requested_limit": limit, "record_access": record_access},
+    ) as observation:
+        memories = _retrieve_project_memories(
+            db,
+            project_id,
+            query,
+            limit=limit,
+            record_access=record_access,
+            query_embedding=query_embedding,
+        )
+        if observation is not None:
+            observation.update(
+                output={
+                    "memory_count": len(memories),
+                    "memory_types": sorted({memory.memory_type for memory in memories}),
+                    "memories": [
+                        {"title": memory.title, "content": memory.content} for memory in memories
+                    ],
+                }
+            )
+        return memories
+
+
+def _retrieve_project_memories(
     db: Session,
     project_id: UUID,
     query: str,

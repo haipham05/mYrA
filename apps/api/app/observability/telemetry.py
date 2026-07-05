@@ -241,10 +241,12 @@ class _BoundedObservation:
         budget: _ObservationPayloadBudget,
         *,
         allow_text: bool,
+        on_update_failure: Callable[[BaseException], None],
     ) -> None:
         self._observation = observation
         self._budget = budget
         self._allow_text = allow_text
+        self._on_update_failure = on_update_failure
 
     @property
     def trace_id(self) -> str | None:
@@ -266,7 +268,10 @@ class _BoundedObservation:
                 kwargs["metadata"] = _metadata_without_text(metadata)
         safe = self._budget.fit(kwargs)
         if safe:
-            return self._observation.update(**safe)
+            try:
+                return self._observation.update(**safe)
+            except Exception as exc:
+                self._on_update_failure(exc)
         return None
 
 
@@ -537,6 +542,7 @@ class TelemetryAdapter:
                     observation,
                     _ObservationPayloadBudget(initial_payload),
                     allow_text=allow_text,
+                    on_update_failure=lambda exc: self._drop("observation_update", exc),
                 )
                 with use_operation_context(active_context):
                     try:

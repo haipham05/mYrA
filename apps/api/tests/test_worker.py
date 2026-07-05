@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import pytest
 
 from app.crud.job import create_job
@@ -7,11 +9,11 @@ from app.db.session import SessionLocal
 from app.schemas.project import ProjectCreate
 from app.storage.factory import set_storage
 from app.storage.local import MemoryStorage
-from app.worker import run_worker
+from app.worker import _persisted_job_outcome, run_worker
 
 
 @pytest.mark.anyio
-async def test_run_worker_once():
+async def test_run_worker_once(monkeypatch):
     # Initialize in-memory storage
     mem_storage = MemoryStorage()
     set_storage(mem_storage)
@@ -71,7 +73,30 @@ startxref
     db.close()
 
     # Run worker once
+    captured = []
+
+    class Observation:
+        def update(self, **kwargs):
+            captured[-1]["updates"].append(kwargs)
+
+    class Telemetry:
+        @contextmanager
+        def operation(self, name, *, metadata=None):
+            captured.append({"name": name, "metadata": metadata, "updates": []})
+            yield Observation()
+
+    import app.worker
+
+    monkeypatch.setattr(app.worker, "get_telemetry", lambda: Telemetry())
     await run_worker(poll_interval=0.1, once=True)
+
+    assert len(captured) == 1
+    assert captured[0]["name"] == "worker.ingestion_attempt"
+    assert captured[0]["metadata"]["job_id"] == str(job_id)
+    assert captured[0]["metadata"]["attempt_number"] == 1
+    assert captured[0]["metadata"]["queue_age_basis"] == "since_initial_enqueue"
+    assert captured[0]["metadata"]["initial_queue_age_seconds"] >= 0
+    assert captured[0]["updates"] == [{"metadata": {"outcome": "success"}}]
 
     # Verify job completed and paper ready
     db2 = SessionLocal()
@@ -85,3 +110,20 @@ startxref
     db2.close()
 
     set_storage(None)
+
+
+@pytest.mark.parametrize(
+    ("status", "assigned_worker", "expected"),
+    [
+        ("COMPLETED", "worker-1", "success"),
+        ("PENDING", None, "retry_scheduled"),
+        ("FAILED", None, "failed"),
+        ("PROCESSING", "worker-2", "abandoned"),
+        ("PROCESSING", "worker-1", "incomplete"),
+    ],
+)
+def test_persisted_job_attempt_outcome(status, assigned_worker, expected):
+    from types import SimpleNamespace
+
+    job = SimpleNamespace(status=status, worker_id=assigned_worker)
+    assert _persisted_job_outcome(job, "worker-1") == expected

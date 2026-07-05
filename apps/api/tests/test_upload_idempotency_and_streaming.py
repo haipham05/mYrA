@@ -1,4 +1,5 @@
 import io
+from contextlib import contextmanager
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -193,3 +194,67 @@ def test_upload_storage_compensation_on_db_failure():
         )
         assert res.status_code == 500
         assert "Failed to initialize paper record" in res.json()["detail"]
+
+
+def test_upload_records_safe_route_storage_and_queue_telemetry():
+    class Observation:
+        def __init__(self, name: str, initial: dict | None = None):
+            self.name = name
+            self.metadata = [initial or {}]
+
+        def update(self, **kwargs):
+            self.metadata.append(kwargs.get("metadata", {}))
+
+    class Telemetry:
+        def __init__(self):
+            self.observations = []
+
+        @contextmanager
+        def operation(self, name, **kwargs):
+            observation = Observation(name, kwargs.get("metadata"))
+            self.observations.append(observation)
+            yield observation
+
+        @contextmanager
+        def stage(self, name, **kwargs):
+            observation = Observation(name, kwargs.get("metadata"))
+            self.observations.append(observation)
+            yield observation
+
+        def event(self, *args, **kwargs):
+            raise AssertionError("successful upload must not emit a failure event")
+
+    telemetry = Telemetry()
+    client = TestClient(app)
+    project = client.post("/api/v1/projects", json={"name": "Telemetry Project"})
+    project_id = project.json()["id"]
+    pdf_bytes = _make_pdf("sensitive extracted research text")
+
+    with patch("app.api.v1.projects.get_telemetry", return_value=telemetry):
+        response = client.post(
+            f"/api/v1/projects/{project_id}/papers",
+            files={"file": ("private-paper.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
+        )
+
+    assert response.status_code == 202
+    assert [observation.name for observation in telemetry.observations] == [
+        "api.projects.upload_paper",
+        "ingestion.storage.upload",
+        "ingestion.queue.create_job",
+    ]
+    route_metadata = telemetry.observations[0].metadata[-1]
+    assert route_metadata["outcome"] == "accepted"
+    assert route_metadata["http_status"] == 202
+    assert route_metadata["paper_id"] == response.json()["paper_id"]
+    assert route_metadata["job_id"] == response.json()["job_id"]
+
+    storage_metadata = telemetry.observations[1].metadata[-1]
+    assert storage_metadata["outcome"] == "stored"
+    assert storage_metadata["bytes"] == len(pdf_bytes)
+    queue_metadata = telemetry.observations[2].metadata[-1]
+    assert queue_metadata["outcome"] == "queued"
+    assert queue_metadata["job_id"] == response.json()["job_id"]
+    serialized = repr(telemetry.observations)
+    assert "sensitive extracted research text" not in serialized
+    assert "private-paper.pdf" not in serialized
+    assert pdf_bytes.hex() not in serialized

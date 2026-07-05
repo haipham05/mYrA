@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
@@ -43,6 +44,26 @@ from app.services.memory_service import (
     resolve_paper_memory_source,
     retrieve_project_memories,
 )
+
+
+class _RecordingTelemetry:
+    def __init__(self) -> None:
+        self.observations: list[dict] = []
+
+    @contextmanager
+    def stage(self, name: str, **kwargs):
+        observation = {
+            "name": name,
+            "input": kwargs.get("input"),
+            "metadata": kwargs.get("metadata"),
+        }
+        self.observations.append(observation)
+
+        class Span:
+            def update(self, **values):
+                observation.update(values)
+
+        yield Span()
 
 
 @pytest.fixture
@@ -191,6 +212,93 @@ def test_idempotency_and_supersession(db: Session) -> None:
     mem3 = create_memory(db, project_id=project.id, memory_in=cand3)
     with pytest.raises(ValueError, match="must be ACTIVE"):
         supersede_memory(db, old_memory=mem1, new_memory=mem3)
+
+
+def test_memory_telemetry_records_selected_content_and_lookup_counts(db, monkeypatch):
+    from app.services import memory_service
+
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr(memory_service, "get_telemetry", lambda: telemetry)
+    project = Project(name="Telemetry Memory Project")
+    db.add(project)
+    db.commit()
+
+    candidate = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Use AURC",
+        content="We decided to use AURC for evaluation.",
+    )
+    created = consolidate_memory_candidate(db, project.id, candidate, embedding=[])
+    found = retrieve_project_memories(db, project.id, "AURC evaluation", record_access=False)
+
+    assert found[0].id == created.id
+    consolidation, lookup = telemetry.observations
+    assert consolidation["name"] == "memory.consolidation"
+    assert consolidation["input"]["candidate"]["content"] == candidate.content
+    assert consolidation["output"]["outcome"] == "consolidated"
+    assert lookup["name"] == "memory.lookup"
+    assert lookup["input"] == {"query": "AURC evaluation"}
+    assert lookup["output"]["memory_count"] == 1
+    assert lookup["output"]["memories"][0]["content"] == candidate.content
+    assert not any("embedding" in str(entry).lower() for entry in telemetry.observations)
+
+
+def test_memory_telemetry_marks_rejected_candidate_without_changing_error(db, monkeypatch):
+    from app.services import memory_service
+
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr(memory_service, "get_telemetry", lambda: telemetry)
+    project = Project(name="Telemetry Rejection Project")
+    db.add(project)
+    db.commit()
+    candidate = MemoryCreate(
+        memory_type=MemoryType.DECISION,
+        title="Foreign source",
+        content="A decision with a forged message source.",
+        sources=[
+            MemorySourceCreate(
+                source_type=MemorySourceType.MESSAGE,
+                message_id=uuid4(),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="cannot forge message source memory"):
+        consolidate_memory_candidate(db, project.id, candidate, embedding=[])
+
+    assert telemetry.observations[0]["output"] == {"outcome": "rejected"}
+
+
+def test_memory_source_resolution_and_capture_emit_safe_outcomes(db, monkeypatch):
+    from app.services import memory_service
+
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr(memory_service, "get_telemetry", lambda: telemetry)
+    project = Project(name="Telemetry Source Project")
+    db.add(project)
+    db.commit()
+    source = MemorySourceCreate(
+        source_type=MemorySourceType.PAPER_CHUNK,
+        paper_id=uuid4(),
+        page_number=1,
+        quote_text="A deliberately selected research quote.",
+    )
+
+    evidence, anchor, status = resolve_paper_memory_source(db, project.id, source)
+    conversation = Conversation(project_id=project.id, title="Empty conversation")
+    db.add(conversation)
+    db.commit()
+    captured = capture_conversation_memories(db, project.id, conversation.id)
+
+    assert evidence is None and anchor is None
+    assert status == AnchorStatus.UNRESOLVED
+    assert captured == []
+    resolution, capture = telemetry.observations
+    assert resolution["name"] == "memory.source_resolution"
+    assert resolution["output"] == {"outcome": "unresolved", "verified": False}
+    assert "quote_text" not in str(resolution)
+    assert capture["name"] == "memory.capture"
+    assert capture["output"] == {"captured_count": 0, "outcome": "completed"}
 
 
 def test_paper_fact_validation_and_forgery_prevention(db: Session) -> None:

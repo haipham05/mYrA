@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -39,6 +40,45 @@ def test_cosine_similarity():
 
     assert cosine_similarity([], [1.0]) == 0.0
     assert cosine_similarity([0.0, 0.0], [0.0, 0.0]) == 0.0
+
+
+def test_retrieval_observation_records_metadata_without_content():
+    recorded = []
+
+    class Observation:
+        def update(self, **kwargs):
+            recorded.append(kwargs)
+
+    class Telemetry:
+        @contextmanager
+        def stage(self, name, *, metadata):
+            assert name == "retrieval.dense_search"
+            assert "query" not in metadata
+            yield Observation()
+
+    with retrieval_module._retrieval_observation(
+        Telemetry(), "retrieval.dense_search", {"backend": "test", "candidate_limit": 5}
+    ) as observation:
+        observation.update(metadata={"candidate_count": 2})
+
+    result = recorded[0]["metadata"]
+    assert result["candidate_count"] == 2
+    assert result["candidate_limit"] == 5
+    assert result["outcome"] == "success"
+    assert result["duration_ms"] >= 0
+    assert not any("text" in key or "query" in key for key in result)
+
+
+def test_retrieval_observation_failure_does_not_change_product_exception():
+    class BrokenTelemetry:
+        def stage(self, *_args, **_kwargs):
+            raise RuntimeError("telemetry unavailable")
+
+    expected = ValueError("retrieval failed")
+    with pytest.raises(ValueError) as raised:
+        with retrieval_module._retrieval_observation(BrokenTelemetry(), "retrieval", {}):
+            raise expected
+    assert raised.value is expected
 
 
 def test_vector_type_processor():
@@ -152,7 +192,23 @@ def test_unknown_retrieval_providers_fail(monkeypatch):
         get_reranker()
 
 
-def test_retriever_project_isolation():
+def test_retriever_project_isolation(monkeypatch):
+    observed = []
+
+    class RecordingObservation:
+        def update(self, **kwargs):
+            observed.append(kwargs.get("metadata", {}))
+
+    class RecordingTelemetry:
+        @contextmanager
+        def stage(self, name, *, metadata=None, **_kwargs):
+            observed.append({"name": name, **(metadata or {})})
+            yield RecordingObservation()
+
+        def event(self, name, *, metadata=None, **_kwargs):
+            observed.append({"name": name, **(metadata or {})})
+
+    monkeypatch.setattr(retrieval_module, "get_telemetry", lambda: RecordingTelemetry())
     create_tables()
     db = SessionLocal()
     embedder = DeterministicEmbeddingProvider(dimension=1024)
@@ -234,6 +290,17 @@ def test_retriever_project_isolation():
     assert all(e.paper_id == paper1.id for e in ev1)
     # Ensure no leaked data from Project 2
     assert not any(e.paper_id == paper2.id for e in ev1)
+    stage_names = {entry.get("name") for entry in observed if isinstance(entry, dict)}
+    assert {
+        "retrieval",
+        "retrieval.query_embedding",
+        "retrieval.dense_search",
+        "retrieval.fts_search",
+        "retrieval.fusion",
+        "retrieval.reranking",
+        "retrieval.evidence_built",
+    } <= stage_names
+    assert all("quantum computing" not in str(entry) for entry in observed)
 
     # Query Project 2 for "quantum" -> should find no results or only project 2 items
     ev2 = retriever.retrieve(db, project_id=p2.id, query="quantum computing")

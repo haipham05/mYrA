@@ -1,7 +1,9 @@
 import math
 import os
 import re
+import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager, nullcontext
 from uuid import UUID
 
 from sqlalchemy import text
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
 from app.ingestion.parser import find_verbatim_span
+from app.observability.telemetry import get_telemetry
 from app.schemas.evidence import (
     AnchorStatus,
     BoundingBox,
@@ -17,6 +20,59 @@ from app.schemas.evidence import (
     EvidenceItem,
 )
 from app.services.embedding import get_embedding_provider
+
+
+class _RetrievalObservation:
+    def __init__(self, observation, metadata: dict) -> None:
+        self._observation = observation
+        self.metadata = dict(metadata)
+
+    def update(self, *, metadata: dict) -> None:
+        self.metadata.update(metadata)
+
+
+@contextmanager
+def _retrieval_observation(telemetry, name: str, metadata: dict):
+    """Record bounded metadata while ensuring tracing can never change retrieval."""
+    started = time.perf_counter()
+    manager = nullcontext(None)
+    observation = None
+    try:
+        manager = telemetry.stage(name, metadata=metadata)
+        observation = manager.__enter__()
+    except Exception:
+        manager = nullcontext(None)
+        observation = None
+
+    recorder = _RetrievalObservation(observation, metadata) if observation is not None else None
+    error = None
+    try:
+        yield recorder
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        if recorder is not None:
+            try:
+                observation.update(
+                    metadata={
+                        **recorder.metadata,
+                        "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                        "outcome": "error" if error is not None else "success",
+                        **({"error_code": type(error).__name__} if error else {}),
+                    }
+                )
+            except Exception:
+                pass
+        try:
+            manager.__exit__(
+                type(error) if error is not None else None,
+                error,
+                error.__traceback__ if error is not None else None,
+            )
+        except Exception:
+            # Export and SDK teardown are outside the retrieval result contract.
+            pass
 
 
 def cosine_similarity(v1: list[float], v2: list[float]) -> float:
@@ -203,6 +259,7 @@ class HybridRetriever:
         query_vec: list[float],
         embedding_model: str,
         embedding_version: str,
+        telemetry=None,
     ) -> list[PaperChunk]:
         """Execute database-native pgvector cosine distance and PostgreSQL full-text search."""
         vec_str = "[" + ",".join(str(float(x)) for x in query_vec) + "]"
@@ -221,16 +278,28 @@ class HybridRetriever:
             ORDER BY pc.embedding_vec <=> :query_vec ASC
             LIMIT :limit;
         """)
-        dense_rows = db.execute(
-            dense_sql,
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.dense_search",
             {
-                "project_id": project_id,
-                "query_vec": vec_str,
+                "backend": "postgres_pgvector",
                 "embedding_model": embedding_model,
-                "embedding_version": embedding_version,
-                "limit": self.top_candidates,
+                "embedding_revision": embedding_version,
+                "candidate_limit": self.top_candidates,
             },
-        ).fetchall()
+        ) as observation:
+            dense_rows = db.execute(
+                dense_sql,
+                {
+                    "project_id": project_id,
+                    "query_vec": vec_str,
+                    "embedding_model": embedding_model,
+                    "embedding_version": embedding_version,
+                    "limit": self.top_candidates,
+                },
+            ).fetchall()
+            if observation is not None:
+                observation.update(metadata={"candidate_count": len(dense_rows)})
         dense_cids = [row[0] for row in dense_rows]
 
         # 2. PostgreSQL Full-Text Search with plainto_tsquery and ts_rank
@@ -247,27 +316,47 @@ class HybridRetriever:
             ORDER BY ts_rank(pc.tsv_content, plainto_tsquery('english', :query)) DESC
             LIMIT :limit;
         """)
-        fts_rows = db.execute(
-            fts_sql,
-            {
-                "project_id": project_id,
-                "query": fts_query,
-                "limit": self.top_candidates,
-            },
-        ).fetchall()
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.fts_search",
+            {"backend": "postgres_fts", "candidate_limit": self.top_candidates},
+        ) as observation:
+            fts_rows = db.execute(
+                fts_sql,
+                {
+                    "project_id": project_id,
+                    "query": fts_query,
+                    "limit": self.top_candidates,
+                },
+            ).fetchall()
+            if observation is not None:
+                observation.update(metadata={"candidate_count": len(fts_rows)})
         fts_cids = [row[0] for row in fts_rows]
 
         # 3. Reciprocal Rank Fusion (RRF)
-        rrf_scores: dict[UUID, float] = {}
-        for rank, cid in enumerate(dense_cids):
-            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (self.rrf_k + rank + 1))
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.fusion",
+            {
+                "policy_revision": "rrf-v1",
+                "fusion_method": "reciprocal_rank_fusion",
+                "rrf_k": self.rrf_k,
+                "dense_candidate_count": len(dense_cids),
+                "fts_candidate_count": len(fts_cids),
+            },
+        ) as observation:
+            rrf_scores: dict[UUID, float] = {}
+            for rank, cid in enumerate(dense_cids):
+                rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (self.rrf_k + rank + 1))
 
-        for rank, cid in enumerate(fts_cids):
-            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (self.rrf_k + rank + 1))
+            for rank, cid in enumerate(fts_cids):
+                rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (self.rrf_k + rank + 1))
 
-        sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)[
-            : self.top_candidates
-        ]
+            sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)[
+                : self.top_candidates
+            ]
+            if observation is not None:
+                observation.update(metadata={"candidate_count": len(sorted_cids)})
 
         if not sorted_cids:
             return []
@@ -275,7 +364,8 @@ class HybridRetriever:
         # Fetch candidate chunks and preserve RRF ordering
         chunks = db.query(PaperChunk).filter(PaperChunk.id.in_(sorted_cids)).all()
         chunk_map = {c.id: c for c in chunks}
-        return [chunk_map[cid] for cid in sorted_cids if cid in chunk_map]
+        hydrated = [chunk_map[cid] for cid in sorted_cids if cid in chunk_map]
+        return hydrated
 
     def _retrieve_fallback(
         self,
@@ -285,6 +375,7 @@ class HybridRetriever:
         query_vec: list[float],
         embedding_model: str,
         embedding_version: str,
+        telemetry=None,
     ) -> list[PaperChunk]:
         """In-memory scoring fallback for SQLite / test environments."""
         chunks = (
@@ -300,37 +391,73 @@ class HybridRetriever:
         if not chunks:
             return []
 
-        dense_scores = []
-        for chunk in chunks:
-            if (
-                chunk.embedding_model != embedding_model
-                or chunk.embedding_version != embedding_version
-            ):
-                continue
-            vec = chunk.embedding_vec or chunk.embedding or []
-            sim = cosine_similarity(query_vec, vec)
-            dense_scores.append((chunk, sim))
-        dense_scores.sort(key=lambda x: x[1], reverse=True)
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.dense_search",
+            {
+                "backend": "in_memory_cosine",
+                "embedding_model": embedding_model,
+                "embedding_revision": embedding_version,
+                "candidate_limit": self.top_candidates,
+            },
+        ) as observation:
+            dense_scores = []
+            for chunk in chunks:
+                if (
+                    chunk.embedding_model != embedding_model
+                    or chunk.embedding_version != embedding_version
+                ):
+                    continue
+                vec = chunk.embedding_vec or chunk.embedding or []
+                sim = cosine_similarity(query_vec, vec)
+                dense_scores.append((chunk, sim))
+            dense_scores.sort(key=lambda x: x[1], reverse=True)
+            if observation is not None:
+                observation.update(metadata={"candidate_count": len(dense_scores)})
 
-        query_terms = set(query.lower().split())
-        lexical_scores = []
-        for chunk in chunks:
-            chunk_lower = chunk.text.lower()
-            matches = sum(1 for term in query_terms if term in chunk_lower)
-            lexical_scores.append((chunk, matches))
-        lexical_scores.sort(key=lambda x: x[1], reverse=True)
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.fts_search",
+            {"backend": "in_memory_lexical", "candidate_limit": self.top_candidates},
+        ) as observation:
+            query_terms = set(query.lower().split())
+            lexical_scores = []
+            for chunk in chunks:
+                chunk_lower = chunk.text.lower()
+                matches = sum(1 for term in query_terms if term in chunk_lower)
+                lexical_scores.append((chunk, matches))
+            lexical_scores.sort(key=lambda x: x[1], reverse=True)
+            if observation is not None:
+                observation.update(metadata={"candidate_count": len(lexical_scores)})
 
-        rrf_scores: dict[UUID, float] = {}
-        for rank, (chunk, _) in enumerate(dense_scores[: self.top_candidates]):
-            rrf_scores[chunk.id] = rrf_scores.get(chunk.id, 0.0) + (1.0 / (self.rrf_k + rank + 1))
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.fusion",
+            {
+                "policy_revision": "rrf-v1",
+                "fusion_method": "reciprocal_rank_fusion",
+                "rrf_k": self.rrf_k,
+                "dense_candidate_count": len(dense_scores[: self.top_candidates]),
+                "fts_candidate_count": len(lexical_scores[: self.top_candidates]),
+            },
+        ) as observation:
+            rrf_scores: dict[UUID, float] = {}
+            for rank, (chunk, _) in enumerate(dense_scores[: self.top_candidates]):
+                rrf_scores[chunk.id] = rrf_scores.get(chunk.id, 0.0) + (
+                    1.0 / (self.rrf_k + rank + 1)
+                )
 
-        for rank, (chunk, _) in enumerate(lexical_scores[: self.top_candidates]):
-            rrf_scores[chunk.id] = rrf_scores.get(chunk.id, 0.0) + (1.0 / (self.rrf_k + rank + 1))
+            for rank, (chunk, _) in enumerate(lexical_scores[: self.top_candidates]):
+                rrf_scores[chunk.id] = rrf_scores.get(chunk.id, 0.0) + (
+                    1.0 / (self.rrf_k + rank + 1)
+                )
 
-        chunk_lookup = {c.id: c for c in chunks}
-        sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)[
-            : self.top_candidates
-        ]
+            chunk_lookup = {c.id: c for c in chunks}
+            sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)[
+                : self.top_candidates
+            ]
+            if observation is not None:
+                observation.update(metadata={"candidate_count": len(sorted_cids)})
         return [chunk_lookup[cid] for cid in sorted_cids]
 
     def retrieve(
@@ -339,8 +466,37 @@ class HybridRetriever:
         project_id: UUID,
         query: str,
     ) -> list[EvidenceItem]:
+        try:
+            telemetry = get_telemetry()
+        except Exception:
+            telemetry = None
+        with _retrieval_observation(
+            telemetry,
+            "retrieval",
+            {
+                "policy_revision": "hybrid-rrf-v1",
+                "candidate_limit": self.top_candidates,
+                "evidence_limit": self.top_evidence,
+                "rrf_k": self.rrf_k,
+            },
+        ):
+            return self._retrieve_impl(db, project_id, query, telemetry)
+
+    def _retrieve_impl(
+        self, db: Session, project_id: UUID, query: str, telemetry
+    ) -> list[EvidenceItem]:
         embed_provider = get_embedding_provider()
-        query_vec = embed_provider.embed_query(query)
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.query_embedding",
+            {
+                "embedding_model": embed_provider.model_name,
+                "embedding_revision": embed_provider.model_version,
+            },
+        ) as observation:
+            query_vec = embed_provider.embed_query(query)
+            if observation is not None:
+                observation.update(metadata={"vector_dimensions": len(query_vec)})
 
         # Check if database dialect is PostgreSQL
         is_postgres = False
@@ -358,6 +514,7 @@ class HybridRetriever:
                 query_vec=query_vec,
                 embedding_model=embed_provider.model_name,
                 embedding_version=embed_provider.model_version,
+                telemetry=telemetry,
             )
         else:
             candidate_chunks = self._retrieve_fallback(
@@ -367,6 +524,7 @@ class HybridRetriever:
                 query_vec=query_vec,
                 embedding_model=embed_provider.model_name,
                 embedding_version=embed_provider.model_version,
+                telemetry=telemetry,
             )
 
         if not candidate_chunks:
@@ -375,12 +533,26 @@ class HybridRetriever:
         # Rerank candidates
         reranker = get_reranker()
         docs = [c.text for c in candidate_chunks]
-        reranked_order = reranker.rerank(query, docs)
+        with _retrieval_observation(
+            telemetry,
+            "retrieval.reranking",
+            {
+                "reranker_model": reranker.model_name,
+                "reranker_revision": getattr(reranker, "model_version", "unversioned"),
+                "policy_revision": "top-evidence-v1",
+                "input_candidate_count": len(candidate_chunks),
+                "evidence_limit": self.top_evidence,
+            },
+        ) as observation:
+            reranked_order = reranker.rerank(query, docs)
+            if observation is not None:
+                observation.update(metadata={"ranked_candidate_count": len(reranked_order)})
 
         top_chunks = [candidate_chunks[idx] for idx, _ in reranked_order[: self.top_evidence]]
 
         # Build EvidenceItems with exact provenance mapping and parent expansion
         evidence_items: list[EvidenceItem] = []
+        evidence_started = time.perf_counter()
         for i, chunk in enumerate(top_chunks):
             evidence_id = f"E{i + 1}"
             paper = db.query(Paper).filter(Paper.id == chunk.paper_id).first()
@@ -563,4 +735,16 @@ class HybridRetriever:
                 )
             )
 
+        try:
+            telemetry.event(
+                "retrieval.evidence_built",
+                metadata={
+                    "policy_revision": "evidence-provenance-v1",
+                    "candidate_count": len(candidate_chunks),
+                    "evidence_count": len(evidence_items),
+                    "duration_ms": round((time.perf_counter() - evidence_started) * 1000, 2),
+                },
+            )
+        except Exception:
+            pass
         return evidence_items

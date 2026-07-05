@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import tempfile
+from time import perf_counter
 from uuid import UUID, uuid4
 
 from fastapi import (
@@ -25,6 +26,7 @@ from app.crud.project import create_project, get_project, list_projects
 from app.db.models import Job, Paper
 from app.db.session import get_db
 from app.observability.context import get_operation_context
+from app.observability.telemetry import TelemetryAdapter, get_telemetry
 from app.schemas.paper import PaperListResponse, PaperResponse, PaperStatus, PaperUploadResponse
 from app.schemas.project import ProjectCreate, ProjectListResponse, ProjectResponse
 from app.storage.factory import get_storage
@@ -83,6 +85,43 @@ async def upload_paper(
     file: UploadFile = File(...),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
+) -> PaperUploadResponse:
+    telemetry = get_telemetry()
+    with telemetry.operation(
+        "api.projects.upload_paper",
+        metadata={
+            "http_method": "POST",
+            "route_template": "/api/v1/projects/{project_id}/papers",
+        },
+    ) as operation:
+        result = await _upload_paper(
+            project_id=project_id,
+            response=response,
+            file=file,
+            idempotency_key=idempotency_key,
+            db=db,
+            telemetry=telemetry,
+        )
+        if operation is not None:
+            operation.update(
+                metadata={
+                    "outcome": "accepted" if result.status == PaperStatus.PROCESSING else "ready",
+                    "http_status": response.status_code or status.HTTP_202_ACCEPTED,
+                    "paper_id": str(result.paper_id),
+                    "job_id": str(result.job_id),
+                }
+            )
+        return result
+
+
+async def _upload_paper(
+    *,
+    project_id: UUID,
+    response: Response,
+    file: UploadFile,
+    idempotency_key: str | None,
+    db: Session,
+    telemetry: TelemetryAdapter,
 ) -> PaperUploadResponse:
     project = get_project(db, project_id)
     if not project:
@@ -162,12 +201,42 @@ async def upload_paper(
                     )
                 if existing_paper.status == PaperStatus.FAILED:
                     # Recover failed paper by creating a new job and re-queuing
-                    new_job = create_job(
-                        db, existing_paper.id, trace_context=get_operation_context()
-                    )
-                    existing_paper.status = PaperStatus.PROCESSING
-                    existing_paper.error_message = None
-                    db.commit()
+                    queue_started = perf_counter()
+                    with telemetry.stage(
+                        "ingestion.queue.create_job",
+                        metadata={"reason": "retry_failed_paper"},
+                    ) as queue_observation:
+                        try:
+                            new_job = create_job(
+                                db, existing_paper.id, trace_context=get_operation_context()
+                            )
+                            existing_paper.status = PaperStatus.PROCESSING
+                            existing_paper.error_message = None
+                            db.commit()
+                        except Exception as err:
+                            if queue_observation is not None:
+                                queue_observation.update(
+                                    metadata={
+                                        "outcome": "failed",
+                                        "duration_ms": round(
+                                            (perf_counter() - queue_started) * 1000, 2
+                                        ),
+                                        "error_code": type(err).__name__,
+                                    }
+                                )
+                            raise
+                        if queue_observation is not None:
+                            queue_observation.update(
+                                metadata={
+                                    "outcome": "queued",
+                                    "duration_ms": round(
+                                        (perf_counter() - queue_started) * 1000, 2
+                                    ),
+                                    "paper_id": str(existing_paper.id),
+                                    "job_id": str(new_job.id),
+                                    "retry_count": new_job.retry_count,
+                                }
+                            )
                     response.status_code = status.HTTP_202_ACCEPTED
                     return PaperUploadResponse(
                         paper_id=existing_paper.id,
@@ -205,12 +274,44 @@ async def upload_paper(
         storage = get_storage(settings)
 
         # 4. Stream from the spool into the selected storage backend.
+        storage_started = perf_counter()
         try:
-            spooled.seek(0)
-            storage_path = await storage.put_stream(
-                storage_key, spooled, content_type="application/pdf"
-            )
+            with telemetry.stage(
+                "ingestion.storage.upload",
+                metadata={"backend": type(storage).__name__},
+            ) as storage_observation:
+                try:
+                    spooled.seek(0)
+                    storage_path = await storage.put_stream(
+                        storage_key, spooled, content_type="application/pdf"
+                    )
+                except Exception as err:
+                    if storage_observation is not None:
+                        storage_observation.update(
+                            metadata={
+                                "outcome": "failed",
+                                "duration_ms": round((perf_counter() - storage_started) * 1000, 2),
+                                "error_code": type(err).__name__,
+                            }
+                        )
+                    raise
+                if storage_observation is not None:
+                    storage_observation.update(
+                        metadata={
+                            "outcome": "stored",
+                            "duration_ms": round((perf_counter() - storage_started) * 1000, 2),
+                            "bytes": total_bytes,
+                        }
+                    )
         except Exception as err:
+            telemetry.event(
+                "ingestion.storage.upload_failed",
+                metadata={
+                    "outcome": "failed",
+                    "duration_ms": round((perf_counter() - storage_started) * 1000, 2),
+                    "error_code": type(err).__name__,
+                },
+            )
             logger.error("Failed to store PDF", exc_info=err)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -220,16 +321,42 @@ async def upload_paper(
         spooled.close()
 
     # 5. Create paper & job transactionally in a single DB commit; compensate storage on DB failure
+    queue_started = perf_counter()
     try:
-        paper, job = create_paper_with_job(
-            db,
-            project_id=project_id,
-            filename=filename,
-            storage_path=storage_path,
-            document_sha256=document_sha256,
-            status=PaperStatus.PROCESSING,
-            trace_context=get_operation_context(),
-        )
+        with telemetry.stage(
+            "ingestion.queue.create_job",
+            metadata={"reason": "new_paper"},
+        ) as queue_observation:
+            try:
+                paper, job = create_paper_with_job(
+                    db,
+                    project_id=project_id,
+                    filename=filename,
+                    storage_path=storage_path,
+                    document_sha256=document_sha256,
+                    status=PaperStatus.PROCESSING,
+                    trace_context=get_operation_context(),
+                )
+            except Exception as err:
+                if queue_observation is not None:
+                    queue_observation.update(
+                        metadata={
+                            "outcome": "failed",
+                            "duration_ms": round((perf_counter() - queue_started) * 1000, 2),
+                            "error_code": type(err).__name__,
+                        }
+                    )
+                raise
+            if queue_observation is not None:
+                queue_observation.update(
+                    metadata={
+                        "outcome": "queued",
+                        "duration_ms": round((perf_counter() - queue_started) * 1000, 2),
+                        "paper_id": str(paper.id),
+                        "job_id": str(job.id),
+                        "retry_count": job.retry_count,
+                    }
+                )
     except Exception as err:
         db.rollback()
         try:

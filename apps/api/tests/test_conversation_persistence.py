@@ -1,4 +1,5 @@
-from unittest.mock import AsyncMock, patch
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,7 @@ from app.db.models import Message, Project
 from app.db.session import get_db
 from app.main import app
 from app.schemas.chat import MessageRole
+from app.schemas.evidence import EvidenceItem
 from app.services.chat_service import ChatService
 
 
@@ -327,3 +329,91 @@ async def test_chat_service_multiturn_context_and_token_count(db):
         assert db_msg is not None
         assert db_msg.token_count == res.token_count
         assert db_msg.model_name == "test-chat-model"
+
+
+@pytest.mark.anyio
+async def test_chat_service_records_selected_text_generation_and_citation_outcome(db):
+    class RecordingObservation:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+
+    class RecordingTelemetry:
+        def __init__(self):
+            self.calls = []
+            self.events = []
+
+        @contextmanager
+        def operation(self, name, **kwargs):
+            observation = RecordingObservation()
+            self.calls.append(("operation", name, kwargs, observation))
+            yield observation
+
+        @contextmanager
+        def stage(self, name, **kwargs):
+            observation = RecordingObservation()
+            self.calls.append(("stage", name, kwargs, observation))
+            yield observation
+
+        def generation_metadata(self, observation, **kwargs):
+            observation.updates.append({"generation_metadata": kwargs})
+
+        def event(self, name, **kwargs):
+            self.events.append((name, kwargs))
+
+    project = Project(name="Telemetry Project")
+    db.add(project)
+    db.commit()
+    conversation = create_conversation(db, project_id=project.id, title="Telemetry Chat")
+    telemetry = RecordingTelemetry()
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        EvidenceItem(
+            id="E1",
+            paper_id=uuid4(),
+            paper_title="Attention paper",
+            chunk_id=uuid4(),
+            quote="Attention maps queries and keys to values.",
+            page_number=1,
+        )
+    ]
+    service = ChatService(retriever=retriever)
+
+    with (
+        patch("app.services.chat_service.get_telemetry", return_value=telemetry),
+        patch("app.services.chat_service.get_llm_provider") as get_provider,
+    ):
+        provider = AsyncMock()
+        provider.provider_name = "test-provider"
+        provider.model_name = "test-model"
+        provider.generate.return_value = "There is not enough evidence to answer."
+        get_provider.return_value = provider
+
+        response = await service.answer_question(db, conversation.id, "Explain attention")
+
+    assert response.content == (
+        "Insufficient evidence available in the uploaded papers to answer this question."
+    )
+    operation = next(call for call in telemetry.calls if call[1] == "chat.answer")
+    assert operation[2]["input"] == {"question": "Explain attention"}
+    generation = next(call for call in telemetry.calls if call[1] == "chat.generation")
+    assert generation[2]["generation"] is True
+    assert "Explain attention" in generation[2]["input"]["user_prompt"]
+    assert generation[2]["input"]["selected_evidence"] == [
+        {
+            "evidence_id": "E1",
+            "paper_title": "Attention paper",
+            "page_number": 1,
+            "quote": "Attention maps queries and keys to values.",
+            "context": None,
+        }
+    ]
+    generation_metadata = generation[3].updates[0]["generation_metadata"]
+    assert generation_metadata["usage"] is None
+    assert generation_metadata["output"] == "There is not enough evidence to answer."
+    final_update = operation[3].updates[-1]
+    assert final_update["output"] == response.content
+    assert final_update["metadata"]["abstained"] is True
+    assert telemetry.events[0][0] == "chat.citation_validation"

@@ -22,7 +22,7 @@ from app.db.models import GraphEvent, GraphFactSnapshot, Job, Paper
 from app.db.session import SessionLocal, create_tables
 from app.schemas.project import ProjectCreate
 from app.services.graphrag.processor import GraphEventProcessor
-from app.worker import run_worker
+from app.worker import _persisted_graph_outcome, run_worker
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -30,6 +30,23 @@ def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt
+
+
+@pytest.mark.parametrize(
+    ("status", "owner", "expected"),
+    [
+        ("COMPLETED", None, "success"),
+        ("PENDING", None, "retry_scheduled"),
+        ("FAILED", None, "failed"),
+        ("PROCESSING", "worker-2", "abandoned"),
+        ("PROCESSING", "worker-1", "incomplete"),
+    ],
+)
+def test_persisted_graph_attempt_outcome(status, owner, expected):
+    from types import SimpleNamespace
+
+    event = SimpleNamespace(status=status, lease_owner=owner)
+    assert _persisted_graph_outcome(event, "worker-1") == expected
 
 
 @pytest.fixture(autouse=True)
@@ -427,6 +444,9 @@ async def test_worker_run_once_processes_graph_event(monkeypatch):
         db.commit()
         event_id = event.id
 
+    telemetry = MagicMock()
+    monkeypatch.setattr("app.worker.get_telemetry", lambda: telemetry)
+
     monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
     monkeypatch.setenv("NEO4J_URI", "bolt://127.0.0.1:17687")
     ready_repo = MagicMock()
@@ -441,6 +461,14 @@ async def test_worker_run_once_processes_graph_event(monkeypatch):
         persisted = get_graph_event(db, event_id)
         assert persisted.status == "COMPLETED"
         assert persisted.completed_at is not None
+
+    telemetry.operation.assert_called_once()
+    operation_name = telemetry.operation.call_args.args[0]
+    metadata = telemetry.operation.call_args.kwargs["metadata"]
+    assert operation_name == "worker.graph_event_attempt"
+    assert metadata["event_id"] == str(event_id)
+    assert metadata["attempt_number"] == 1
+    assert metadata["queue_age_basis"] == "since_initial_enqueue"
 
 
 @pytest.mark.anyio

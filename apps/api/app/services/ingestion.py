@@ -1,12 +1,15 @@
 import asyncio
 import hashlib
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.crud.corpus import bump_corpus_revision
+from app.crud.corpus import bump_corpus_revision, read_corpus_revision
 from app.crud.graph import create_or_enqueue_graph_event
 from app.crud.job import LostJobLeaseError, fence_job_for_publish, get_job, update_job_progress
 from app.crud.paper import get_paper
@@ -14,11 +17,39 @@ from app.db.models import ChunkElement, PaperChunk, PaperElement, PaperPage
 from app.ingestion.chunker import DocumentChunker
 from app.ingestion.parser import DocumentParser
 from app.observability.context import get_operation_context
+from app.observability.telemetry import TelemetryAdapter, get_telemetry
 from app.schemas.job import JobStage, JobStatus
 from app.schemas.paper import PaperStatus
 from app.services.embedding import get_embedding_provider
 from app.services.error_sanitizer import classify_and_sanitize_error
 from app.storage.factory import get_storage
+
+
+@contextmanager
+def _tracked_stage(
+    telemetry: TelemetryAdapter, name: str, *, attempt: int
+) -> Iterator[object | None]:
+    """Record stage timing/outcome without allowing telemetry to affect ingestion."""
+    started = time.perf_counter()
+    outcome = "success"
+    with telemetry.stage(name, metadata={"attempt": attempt}) as observation:
+        try:
+            yield observation
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            if observation is not None:
+                try:
+                    observation.update(
+                        metadata={
+                            "outcome": outcome,
+                            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                        }
+                    )
+                except Exception:
+                    # Export/SDK errors must not alter the pipeline result.
+                    pass
 
 
 def is_transient_error(err: Exception) -> bool:
@@ -59,6 +90,25 @@ class IngestionPipeline:
             paper_id = UUID(paper_id)
         if isinstance(job_id, str):
             job_id = UUID(job_id)
+        telemetry = get_telemetry()
+        job = get_job(db, job_id)
+        attempt = (job.retry_count + 1) if job else 1
+        with telemetry.operation("ingestion.process_paper", metadata={"attempt": attempt}):
+            await self._process_paper(db, paper_id, job_id, worker_id, telemetry, attempt)
+
+    async def _process_paper(
+        self,
+        db: Session,
+        paper_id: UUID | str,
+        job_id: UUID | str,
+        worker_id: str | None,
+        telemetry: TelemetryAdapter,
+        attempt: int,
+    ) -> None:
+        if isinstance(paper_id, str):
+            paper_id = UUID(paper_id)
+        if isinstance(job_id, str):
+            job_id = UUID(job_id)
         paper = get_paper(db, paper_id)
         job = get_job(db, job_id)
         if not paper or not job:
@@ -77,10 +127,11 @@ class IngestionPipeline:
             elif key.startswith("memory://"):
                 key = key.replace("memory://", "")
 
-            try:
-                pdf_bytes = await storage.get(key)
-            except FileNotFoundError:
-                pdf_bytes = await storage.get(paper.storage_path)
+            with _tracked_stage(telemetry, "ingestion.storage_read", attempt=attempt):
+                try:
+                    pdf_bytes = await storage.get(key)
+                except FileNotFoundError:
+                    pdf_bytes = await storage.get(paper.storage_path)
 
             # 2. Parse PDF
             update_job_progress(
@@ -89,13 +140,29 @@ class IngestionPipeline:
             document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
             if paper.document_sha256 and paper.document_sha256 != document_sha256:
                 raise ValueError("Stored PDF checksum does not match the uploaded document")
-            parse_result = await asyncio.to_thread(self.parser.parse, pdf_bytes)
+            with _tracked_stage(telemetry, "ingestion.parse", attempt=attempt) as observation:
+                parse_result = await asyncio.to_thread(self.parser.parse, pdf_bytes)
+                if observation is not None:
+                    observation.update(
+                        metadata={
+                            "page_count": len(parse_result.pages),
+                            "element_count": len(parse_result.elements),
+                        }
+                    )
 
             # 3. Chunk elements
             update_job_progress(
                 db, job_id, stage=JobStage.CHUNKING, progress=0.5, worker_id=worker_id
             )
-            chunk_specs = await asyncio.to_thread(self.chunker.chunk, parse_result.elements)
+            with _tracked_stage(telemetry, "ingestion.chunk", attempt=attempt) as observation:
+                chunk_specs = await asyncio.to_thread(self.chunker.chunk, parse_result.elements)
+                if observation is not None:
+                    observation.update(
+                        metadata={
+                            "chunk_count": len(chunk_specs),
+                            "child_chunk_count": sum(c.chunk_type == "child" for c in chunk_specs),
+                        }
+                    )
 
             # 4. Embeddings
             update_job_progress(
@@ -104,17 +171,26 @@ class IngestionPipeline:
             embed_provider = get_embedding_provider()
             child_chunks = [c for c in chunk_specs if c.chunk_type == "child"]
             child_texts = [c.text for c in child_chunks]
-            child_embeddings = (
-                await asyncio.to_thread(embed_provider.embed_documents, child_texts)
-                if child_texts
-                else []
-            )
+            with _tracked_stage(telemetry, "ingestion.embed", attempt=attempt) as observation:
+                child_embeddings = (
+                    await asyncio.to_thread(embed_provider.embed_documents, child_texts)
+                    if child_texts
+                    else []
+                )
+                if observation is not None:
+                    observation.update(
+                        metadata={
+                            "embedding_count": len(child_embeddings),
+                            "model_revision": str(embed_provider.model_version),
+                        }
+                    )
 
             embedding_map = {
                 c.chunk_index: emb for c, emb in zip(child_chunks, child_embeddings, strict=False)
             }
 
             # 5. The conditional UPDATE locks this job row through publication.
+            publish_started = time.perf_counter()
             update_job_progress(
                 db, job_id, stage=JobStage.INDEXING, progress=0.85, worker_id=worker_id
             )
@@ -197,6 +273,7 @@ class IngestionPipeline:
             paper.status = PaperStatus.READY
             paper.error_message = None
             bump_corpus_revision(db, paper.project_id)
+            corpus_revision = read_corpus_revision(db, paper.project_id)
             if getattr(self.settings, "graphrag_enabled", False):
                 create_or_enqueue_graph_event(
                     db=db,
@@ -211,9 +288,22 @@ class IngestionPipeline:
             job.error_message = None
             job.is_retryable = False
             db.commit()
+            telemetry.event(
+                "ingestion.index_publication",
+                metadata={
+                    "outcome": "success",
+                    "duration_ms": round((time.perf_counter() - publish_started) * 1000, 2),
+                    "page_count": len(parse_result.pages),
+                    "element_count": len(parse_result.elements),
+                    "chunk_count": len(chunk_specs),
+                    "corpus_revision": corpus_revision,
+                },
+            )
+            telemetry.event("ingestion.completed", metadata={"attempt": attempt})
 
         except LostJobLeaseError:
             db.rollback()
+            telemetry.event("ingestion.abandoned", metadata={"attempt": attempt})
             return
         except Exception as err:
             db.rollback()
@@ -235,6 +325,10 @@ class IngestionPipeline:
                 current_job.error_message = msg[:500]
                 current_job.is_retryable = True
                 db.commit()
+                telemetry.event(
+                    "ingestion.retry_scheduled",
+                    metadata={"attempt": attempt, "retryable": True},
+                )
 
             else:
                 msg = f"[{classified.code.value}] {classified.sanitized_message}"
@@ -249,3 +343,11 @@ class IngestionPipeline:
                 current_job.error_message = msg[:500]
                 current_job.is_retryable = False
                 db.commit()
+                telemetry.event(
+                    "ingestion.failed",
+                    metadata={
+                        "attempt": attempt,
+                        "retryable": False,
+                        "error_code": classified.code.value,
+                    },
+                )

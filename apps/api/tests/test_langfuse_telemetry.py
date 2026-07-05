@@ -145,6 +145,25 @@ def test_disabled_adapter_does_not_initialize_client_or_make_network_attempt() -
     assert not adapter.enabled
 
 
+def test_sdk_update_failure_does_not_escape_product_operation() -> None:
+    client = FakeClient()
+
+    def fail_update(**_: Any) -> None:
+        raise OSError("telemetry backend unavailable")
+
+    client.observation.update = fail_update  # type: ignore[method-assign]
+    adapter = TelemetryAdapter(client, config=configured())
+
+    product_result = "unchanged"
+    with adapter.operation("test.operation") as observation:
+        assert observation is not None
+        observation.update(metadata={"outcome": "success"})
+        product_result = "operation completed"
+
+    assert product_result == "operation completed"
+    assert adapter.dropped_count == 1
+
+
 def test_shared_accessor_is_lazy_singleton_and_disabled_without_config(monkeypatch) -> None:
     reset_default_telemetry(monkeypatch)
     first = get_telemetry()

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import signal
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from app.config import Settings
@@ -15,10 +16,45 @@ from app.crud.job import claim_next_job, release_job, renew_job_lease
 from app.db.session import SessionLocal
 from app.logging import configure_logging
 from app.observability.context import OperationContext, use_operation_context
+from app.observability.telemetry import get_telemetry
 from app.services.graphrag.processor import GraphEventProcessor
 from app.services.ingestion import IngestionPipeline
 
 logger = logging.getLogger("myra.worker")
+
+
+def _initial_queue_age_seconds(created_at: datetime | None) -> float | None:
+    """Return age since original enqueue; retry delay is not derivable from this value."""
+    if created_at is None:
+        return None
+    normalized = created_at if created_at.tzinfo else created_at.replace(tzinfo=UTC)
+    return round(max(0.0, (datetime.now(UTC) - normalized.astimezone(UTC)).total_seconds()), 3)
+
+
+def _persisted_job_outcome(job, worker_id: str) -> str:
+    """Map durable job state to an honest attempt outcome after processors return."""
+    if job.status == "COMPLETED":
+        return "success"
+    if job.status == "PENDING":
+        return "retry_scheduled"
+    if job.status == "FAILED":
+        return "failed"
+    if job.status == "PROCESSING" and job.worker_id != worker_id:
+        return "abandoned"
+    return "incomplete"
+
+
+def _persisted_graph_outcome(event, worker_id: str) -> str:
+    """Map durable graph-event state to an honest attempt outcome."""
+    if event.status == "COMPLETED":
+        return "success"
+    if event.status == "PENDING":
+        return "retry_scheduled"
+    if event.status == "FAILED":
+        return "failed"
+    if event.status == "PROCESSING" and event.lease_owner != worker_id:
+        return "abandoned"
+    return "incomplete"
 
 
 async def run_worker(
@@ -90,9 +126,27 @@ async def run_worker(
             sampled=job.trace_sampled,
         )
         with use_operation_context(context):
-            await pipeline.process_paper(
-                db, paper_id=job.paper_id, job_id=job.id, worker_id=worker_id
-            )
+            telemetry = get_telemetry()
+            with telemetry.operation(
+                "worker.ingestion_attempt",
+                metadata={
+                    "job_id": str(job.id),
+                    "paper_id": str(job.paper_id),
+                    "attempt_number": int(job.retry_count) + 1,
+                    "initial_queue_age_seconds": _initial_queue_age_seconds(job.created_at),
+                    "queue_age_basis": "since_initial_enqueue",
+                },
+            ) as observation:
+                await pipeline.process_paper(
+                    db, paper_id=job.paper_id, job_id=job.id, worker_id=worker_id
+                )
+                try:
+                    db.refresh(job)
+                    outcome = _persisted_job_outcome(job, worker_id)
+                except Exception:
+                    outcome = "unknown"
+                if observation is not None:
+                    observation.update(metadata={"outcome": outcome})
 
     async def _process_graph_event_with_context(db, event):
         context = OperationContext.validated(
@@ -102,7 +156,26 @@ async def run_worker(
             sampled=event.trace_sampled,
         )
         with use_operation_context(context):
-            await processor.process_graph_event(db, event_id=event.id, worker_id=worker_id)
+            telemetry = get_telemetry()
+            with telemetry.operation(
+                "worker.graph_event_attempt",
+                metadata={
+                    "event_id": str(event.id),
+                    "paper_id": str(event.paper_id),
+                    "action": event.action,
+                    "attempt_number": int(event.attempts) + 1,
+                    "initial_queue_age_seconds": _initial_queue_age_seconds(event.created_at),
+                    "queue_age_basis": "since_initial_enqueue",
+                },
+            ) as observation:
+                await processor.process_graph_event(db, event_id=event.id, worker_id=worker_id)
+                try:
+                    db.refresh(event)
+                    outcome = _persisted_graph_outcome(event, worker_id)
+                except Exception:
+                    outcome = "unknown"
+                if observation is not None:
+                    observation.update(metadata={"outcome": outcome})
 
     while running:
         db = SessionLocal()

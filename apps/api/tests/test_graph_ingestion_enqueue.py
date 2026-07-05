@@ -1,5 +1,6 @@
 import hashlib
 import io
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -57,6 +58,33 @@ trailer << /Size 6 /Root 1 0 R >>
 startxref
 406
 %%EOF"""
+
+
+class RecordingTelemetry:
+    def __init__(self):
+        self.stages = {}
+        self.events = []
+
+    @contextmanager
+    def operation(self, name, **_kwargs):
+        yield None
+
+    @contextmanager
+    def stage(self, name, **_kwargs):
+        observation = _RecordingObservation()
+        self.stages[name] = observation
+        yield observation
+
+    def event(self, name, *, metadata=None, **_kwargs):
+        self.events.append((name, metadata or {}))
+
+
+class _RecordingObservation:
+    def __init__(self):
+        self.metadata = {}
+
+    def update(self, *, metadata=None, **_kwargs):
+        self.metadata.update(metadata or {})
 
 
 class MockParser:
@@ -158,6 +186,39 @@ async def test_successful_ingestion_graphrag_enabled_enqueues_event(env):
     assert event.max_attempts == 3
     assert event.ontology_version == "1.0.0"
     assert event.extractor_version == "1.0.0"
+
+
+@pytest.mark.anyio
+async def test_ingestion_telemetry_records_stage_counts_without_document_text(env, monkeypatch):
+    db, storage, _ = env
+    proj = create_project(db, ProjectCreate(name="Telemetry Ingestion Proj"))
+    pdf_sha = hashlib.sha256(TINY_PDF_BYTES).hexdigest()
+    storage_key = f"papers/{proj.id}/telemetry.pdf"
+    await storage.put(storage_key, TINY_PDF_BYTES)
+    paper = create_paper(db, proj.id, "telemetry.pdf", storage_key, document_sha256=pdf_sha)
+    job = create_job(db, paper.id)
+    telemetry = RecordingTelemetry()
+    monkeypatch.setattr("app.services.ingestion.get_telemetry", lambda: telemetry)
+
+    await IngestionPipeline(parser=MockParser()).process_paper(db, paper.id, job.id)
+
+    assert set(telemetry.stages) == {
+        "ingestion.storage_read",
+        "ingestion.parse",
+        "ingestion.chunk",
+        "ingestion.embed",
+    }
+    assert telemetry.stages["ingestion.parse"].metadata["page_count"] == 1
+    assert telemetry.stages["ingestion.parse"].metadata["element_count"] == 1
+    assert telemetry.stages["ingestion.chunk"].metadata["chunk_count"] > 0
+    assert telemetry.stages["ingestion.embed"].metadata["embedding_count"] > 0
+    assert all(stage.metadata["outcome"] == "success" for stage in telemetry.stages.values())
+    event_names = [name for name, _ in telemetry.events]
+    assert "ingestion.index_publication" in event_names
+    assert "ingestion.completed" in event_names
+    emitted = repr((telemetry.stages, telemetry.events))
+    assert "Graph Ingestion Enqueue Test Element" not in emitted
+    assert "BT /F1" not in emitted
 
 
 @pytest.mark.anyio
