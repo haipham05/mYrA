@@ -19,6 +19,7 @@ Verifies:
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -941,6 +942,62 @@ def test_retrieve_graph_evidence_no_fact_ids(db: Session):
         )
         assert items == []
         assert notice is None
+
+
+def test_graph_telemetry_distinguishes_neo4j_outage_and_unresolved_evidence(db, monkeypatch):
+    class Span:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+
+    class RecordingTelemetry:
+        def __init__(self):
+            self.spans = []
+
+        @contextmanager
+        def stage(self, name, **kwargs):
+            span = Span()
+            self.spans.append((name, kwargs, span))
+            yield span
+
+    recorder = RecordingTelemetry()
+    monkeypatch.setattr("app.services.graphrag.router.get_telemetry", lambda: recorder)
+
+    items, outage = retrieve_graph_evidence(
+        db=db,
+        repo=None,
+        project_id=uuid4(),
+        query="does graph work",
+        intent=GraphIntent.FACTUAL,
+    )
+    assert items == []
+    assert outage == "Graph service is not configured; using text retrieval."
+    assert recorder.spans[0][2].updates[-1]["metadata"]["outcome"] == "unavailable"
+
+    monkeypatch.setattr(
+        "app.services.graphrag.router.retrieve_graph_candidates_for_query",
+        lambda **kwargs: ([{"fact_id": "fact-1"}], None),
+    )
+    monkeypatch.setattr(
+        "app.services.graphrag.router.resolve_graph_facts_to_evidence",
+        lambda **kwargs: [],
+    )
+    items, outage = retrieve_graph_evidence(
+        db=db,
+        repo=MagicMock(spec=Neo4jRepository),
+        project_id=uuid4(),
+        query="does graph work",
+        intent=GraphIntent.FACTUAL,
+    )
+    assert items == []
+    assert outage is None
+    assert recorder.spans[1][2].updates[-1]["metadata"]["outcome"] == "success"
+    resolution = recorder.spans[2][2].updates[-1]["metadata"]
+    assert resolution["candidate_fact_count"] == 1
+    assert resolution["verified_evidence_count"] == 0
+    assert resolution["outcome"] == "unresolved"
 
 
 @pytest.mark.anyio

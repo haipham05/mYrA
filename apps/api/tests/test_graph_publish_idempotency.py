@@ -473,7 +473,8 @@ async def test_repository_unavailable_never_completes_or_extracts():
     with SessionLocal() as db:
         claimed = claim_next_graph_event(db, worker_id="repo-missing")
         assert claimed is not None
-        await processor.process_graph_event(db, event_id, worker_id="repo-missing")
+        completed = await processor.process_graph_event(db, event_id, worker_id="repo-missing")
+        assert completed is False
 
     with SessionLocal() as db:
         persisted = get_graph_event(db, event_id)
@@ -648,7 +649,8 @@ async def test_empty_reindex_retires_old_generation_before_completion():
         with SessionLocal() as db:
             claimed = claim_next_graph_event(db, worker_id="empty-reindex")
             assert claimed is not None
-            await processor.process_graph_event(db, event_id, worker_id="empty-reindex")
+            completed = await processor.process_graph_event(db, event_id, worker_id="empty-reindex")
+            assert completed is True
 
     repo.retire_older_generations.assert_called_once_with(project_id, paper_id, generation_id)
     assert call_order == ["retire", "complete"]

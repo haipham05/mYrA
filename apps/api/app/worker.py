@@ -31,9 +31,11 @@ def _initial_queue_age_seconds(created_at: datetime | None) -> float | None:
     return round(max(0.0, (datetime.now(UTC) - normalized.astimezone(UTC)).total_seconds()), 3)
 
 
-def _persisted_job_outcome(job, worker_id: str) -> str:
+def _persisted_job_outcome(job, worker_id: str, claimed_retry_count: int) -> str:
     """Map durable job state to an honest attempt outcome after processors return."""
     if job.status == "COMPLETED":
+        if job.worker_id != worker_id or job.retry_count != claimed_retry_count:
+            return "abandoned"
         return "success"
     if job.status == "PENDING":
         return "retry_scheduled"
@@ -44,9 +46,11 @@ def _persisted_job_outcome(job, worker_id: str) -> str:
     return "incomplete"
 
 
-def _persisted_graph_outcome(event, worker_id: str) -> str:
+def _persisted_graph_outcome(event, worker_id: str, claimed_attempts: int) -> str:
     """Map durable graph-event state to an honest attempt outcome."""
     if event.status == "COMPLETED":
+        if event.attempts != claimed_attempts:
+            return "abandoned"
         return "success"
     if event.status == "PENDING":
         return "retry_scheduled"
@@ -127,6 +131,7 @@ async def run_worker(
         )
         with use_operation_context(context):
             telemetry = get_telemetry()
+            claimed_retry_count = int(job.retry_count)
             with telemetry.operation(
                 "worker.ingestion_attempt",
                 metadata={
@@ -142,7 +147,7 @@ async def run_worker(
                 )
                 try:
                     db.refresh(job)
-                    outcome = _persisted_job_outcome(job, worker_id)
+                    outcome = _persisted_job_outcome(job, worker_id, claimed_retry_count)
                 except Exception:
                     outcome = "unknown"
                 if observation is not None:
@@ -157,6 +162,7 @@ async def run_worker(
         )
         with use_operation_context(context):
             telemetry = get_telemetry()
+            claimed_attempts = int(event.attempts)
             with telemetry.operation(
                 "worker.graph_event_attempt",
                 metadata={
@@ -168,10 +174,14 @@ async def run_worker(
                     "queue_age_basis": "since_initial_enqueue",
                 },
             ) as observation:
-                await processor.process_graph_event(db, event_id=event.id, worker_id=worker_id)
+                completed_by_attempt = await processor.process_graph_event(
+                    db, event_id=event.id, worker_id=worker_id
+                )
                 try:
                     db.refresh(event)
-                    outcome = _persisted_graph_outcome(event, worker_id)
+                    outcome = _persisted_graph_outcome(event, worker_id, claimed_attempts)
+                    if outcome == "success" and not completed_by_attempt:
+                        outcome = "abandoned"
                 except Exception:
                     outcome = "unknown"
                 if observation is not None:

@@ -15,6 +15,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.observability.telemetry import get_telemetry
 from app.schemas.evidence import EvidenceItem
 from app.services.graphrag.evidence import (
     extract_fact_ids_from_candidates,
@@ -313,13 +314,26 @@ def retrieve_graph_evidence(
     if intent is None:
         intent = route_query_intent(query)
 
-    candidates, outage_notice = retrieve_graph_candidates_for_query(
-        db=db,
-        repo=repo,
-        project_id=project_id,
-        query=query,
-        intent=intent,
-    )
+    telemetry = get_telemetry()
+    with telemetry.stage(
+        "graph.neo4j_query",
+        metadata={"intent": intent.value},
+    ) as query_span:
+        candidates, outage_notice = retrieve_graph_candidates_for_query(
+            db=db,
+            repo=repo,
+            project_id=project_id,
+            query=query,
+            intent=intent,
+        )
+        if query_span is not None:
+            query_span.update(
+                metadata={
+                    "intent": intent.value,
+                    "candidate_count": len(candidates),
+                    "outcome": "unavailable" if outage_notice else "success",
+                }
+            )
 
     if not candidates:
         return ([], outage_notice)
@@ -328,11 +342,26 @@ def retrieve_graph_evidence(
     if not fact_ids:
         return ([], outage_notice)
 
-    verified_evidence_items = resolve_graph_facts_to_evidence(
-        db=db,
-        project_id=project_id,
-        facts=fact_ids,
-        prefix="G",
-    )
+    with telemetry.stage(
+        "graph.evidence_resolution",
+        metadata={"candidate_fact_count": len(fact_ids)},
+    ) as resolution_span:
+        verified_evidence_items = resolve_graph_facts_to_evidence(
+            db=db,
+            project_id=project_id,
+            facts=fact_ids,
+            prefix="G",
+        )
+        if resolution_span is not None:
+            resolution_span.update(
+                metadata={
+                    "candidate_fact_count": len(fact_ids),
+                    "verified_evidence_count": len(verified_evidence_items),
+                    "rejected_or_duplicate_count": max(
+                        0, len(fact_ids) - len(verified_evidence_items)
+                    ),
+                    "outcome": "resolved" if verified_evidence_items else "unresolved",
+                }
+            )
 
     return (verified_evidence_items, outage_notice)

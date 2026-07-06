@@ -33,20 +33,23 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 @pytest.mark.parametrize(
-    ("status", "owner", "expected"),
+    ("status", "owner", "current_attempts", "claimed_attempts", "expected"),
     [
-        ("COMPLETED", None, "success"),
-        ("PENDING", None, "retry_scheduled"),
-        ("FAILED", None, "failed"),
-        ("PROCESSING", "worker-2", "abandoned"),
-        ("PROCESSING", "worker-1", "incomplete"),
+        ("COMPLETED", None, 0, 0, "success"),
+        ("COMPLETED", None, 1, 0, "abandoned"),
+        ("PENDING", None, 1, 1, "retry_scheduled"),
+        ("FAILED", None, 1, 1, "failed"),
+        ("PROCESSING", "worker-2", 1, 0, "abandoned"),
+        ("PROCESSING", "worker-1", 1, 1, "incomplete"),
     ],
 )
-def test_persisted_graph_attempt_outcome(status, owner, expected):
+def test_persisted_graph_attempt_outcome(
+    status, owner, current_attempts, claimed_attempts, expected
+):
     from types import SimpleNamespace
 
-    event = SimpleNamespace(status=status, lease_owner=owner)
-    assert _persisted_graph_outcome(event, "worker-1") == expected
+    event = SimpleNamespace(status=status, lease_owner=owner, attempts=current_attempts)
+    assert _persisted_graph_outcome(event, "worker-1", claimed_attempts) == expected
 
 
 @pytest.fixture(autouse=True)
@@ -204,7 +207,7 @@ async def test_shutdown_release(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_failure_isolation_paper_remains_ready():
+async def test_failure_isolation_paper_remains_ready(caplog):
     """Test 4: Failure isolation: Graph event error or timeout marks the GraphEvent
     as FAILED/retried, while Paper.status remains READY and paper is completely untouched.
     """
@@ -252,7 +255,10 @@ async def test_failure_isolation_paper_remains_ready():
         claimed = claim_next_graph_event(db, worker_id="worker-fail-1")
         assert claimed is not None
         assert claimed.id == event_id
-        await processor.process_graph_event(db, event_id, worker_id="worker-fail-1")
+        completed = await processor.process_graph_event(db, event_id, worker_id="worker-fail-1")
+        assert completed is False
+
+    assert "Neo4j Bolt connection timed out" not in caplog.text
 
     with SessionLocal() as db:
         ev = get_graph_event(db, event_id)
@@ -340,7 +346,8 @@ async def test_event_completion_and_delete_action():
         claimed_upsert = claim_next_graph_event(db, worker_id="worker-complete")
         assert claimed_upsert is not None
         assert claimed_upsert.id == upsert_id
-        await processor.process_graph_event(db, upsert_id, worker_id="worker-complete")
+        completed = await processor.process_graph_event(db, upsert_id, worker_id="worker-complete")
+        assert completed is True
 
     with SessionLocal() as db:
         ev = get_graph_event(db, upsert_id)
@@ -358,7 +365,8 @@ async def test_event_completion_and_delete_action():
         claimed_delete = claim_next_graph_event(db, worker_id="worker-delete")
         assert claimed_delete is not None
         assert claimed_delete.id == delete_id
-        await processor.process_graph_event(db, delete_id, worker_id="worker-delete")
+        completed = await processor.process_graph_event(db, delete_id, worker_id="worker-delete")
+        assert completed is True
 
     with SessionLocal() as db:
         ev = get_graph_event(db, delete_id)

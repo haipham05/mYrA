@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import asdict
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError
 
 from app.ingestion.parser import find_verbatim_span, normalize_text
+from app.observability.telemetry import get_telemetry
 from app.schemas.graph import (
     VALID_ENDPOINT_CONSTRAINTS,
     EntityType,
@@ -623,17 +625,97 @@ class GraphExtractionAdapter:
             return json.dumps({"entities": [], "facts": []})
 
         user_prompt = self.format_user_prompt(evidence_items)
+        telemetry = get_telemetry()
 
         for attempt in range(1, self.max_retries + 2):
-            try:
-                generation = await asyncio.wait_for(
-                    generate_with_metadata(
-                        self.llm_provider,
-                        system_prompt=SYSTEM_PROMPT,
-                        user_prompt=user_prompt,
-                    ),
-                    timeout=self.timeout_seconds,
-                )
+            with telemetry.stage(
+                "graph.extraction.attempt",
+                input={"system_prompt": SYSTEM_PROMPT, "user_prompt": user_prompt},
+                metadata={"attempt": attempt, "max_attempts": self.max_retries + 1},
+                generation=True,
+            ) as observation:
+                try:
+                    generation = await asyncio.wait_for(
+                        generate_with_metadata(
+                            self.llm_provider,
+                            system_prompt=SYSTEM_PROMPT,
+                            user_prompt=user_prompt,
+                        ),
+                        timeout=self.timeout_seconds,
+                    )
+                    telemetry.generation_metadata(
+                        observation,
+                        model=generation.reported_model or generation.requested_model,
+                        usage=(
+                            {
+                                key: value
+                                for key, value in asdict(generation.usage).items()
+                                if value is not None
+                            }
+                            if generation.usage is not None
+                            else None
+                        ),
+                        output=generation.content,
+                    )
+                    if observation is not None:
+                        observation.update(
+                            metadata={
+                                "attempt": attempt,
+                                "max_attempts": self.max_retries + 1,
+                                "response_id": generation.response_id,
+                                "requested_model": generation.requested_model,
+                                "reported_model": generation.reported_model,
+                                "outcome": "success",
+                            }
+                        )
+                except TimeoutError as exc:
+                    if observation is not None:
+                        observation.update(
+                            metadata={
+                                "attempt": attempt,
+                                "outcome": "timeout",
+                                "error_code": type(exc).__name__,
+                            }
+                        )
+                    if attempt > self.max_retries:
+                        logger.warning(
+                            "LLM extraction timed out after %d attempts",
+                            attempt,
+                        )
+                        raise GraphExtractionTimeoutError(
+                            f"LLM extraction timed out after {attempt} attempts"
+                        ) from exc
+                    logger.warning(
+                        "LLM extraction timed out (attempt %d/%d), retrying...",
+                        attempt,
+                        self.max_retries + 1,
+                    )
+                    continue
+                except Exception as exc:
+                    if observation is not None:
+                        observation.update(
+                            metadata={
+                                "attempt": attempt,
+                                "outcome": "failed",
+                                "error_code": type(exc).__name__,
+                            }
+                        )
+                    if attempt > self.max_retries:
+                        logger.warning(
+                            "LLM extraction failed after %d attempts with error: %s",
+                            attempt,
+                            type(exc).__name__,
+                        )
+                        raise GraphExtractionError(
+                            f"LLM extraction failed after {attempt} attempts: {type(exc).__name__}"
+                        ) from exc
+                    logger.warning(
+                        "LLM extraction failed (attempt %d/%d) with %s, retrying...",
+                        attempt,
+                        self.max_retries + 1,
+                        type(exc).__name__,
+                    )
+                    continue
                 logger.info(
                     "graph_extraction_generation_completed",
                     extra={
@@ -657,36 +739,6 @@ class GraphExtractionAdapter:
                     },
                 )
                 return strip_markdown_fences(generation.content)
-            except TimeoutError as exc:
-                if attempt > self.max_retries:
-                    logger.warning(
-                        "LLM extraction timed out after %d attempts",
-                        attempt,
-                    )
-                    raise GraphExtractionTimeoutError(
-                        f"LLM extraction timed out after {attempt} attempts"
-                    ) from exc
-                logger.warning(
-                    "LLM extraction timed out (attempt %d/%d), retrying...",
-                    attempt,
-                    self.max_retries + 1,
-                )
-            except Exception as exc:
-                if attempt > self.max_retries:
-                    logger.warning(
-                        "LLM extraction failed after %d attempts with error: %s",
-                        attempt,
-                        type(exc).__name__,
-                    )
-                    raise GraphExtractionError(
-                        f"LLM extraction failed after {attempt} attempts: {type(exc).__name__}"
-                    ) from exc
-                logger.warning(
-                    "LLM extraction failed (attempt %d/%d) with %s, retrying...",
-                    attempt,
-                    self.max_retries + 1,
-                    type(exc).__name__,
-                )
 
         return json.dumps({"entities": [], "facts": []})
 

@@ -113,17 +113,20 @@ startxref
 
 
 @pytest.mark.parametrize(
-    ("status", "assigned_worker", "expected"),
+    ("status", "assigned_worker", "current_retry_count", "claimed_retry_count", "expected"),
     [
-        ("COMPLETED", "worker-1", "success"),
-        ("PENDING", None, "retry_scheduled"),
-        ("FAILED", None, "failed"),
-        ("PROCESSING", "worker-2", "abandoned"),
-        ("PROCESSING", "worker-1", "incomplete"),
+        ("COMPLETED", "worker-1", 0, 0, "success"),
+        ("COMPLETED", "worker-2", 1, 0, "abandoned"),
+        ("PENDING", None, 1, 0, "retry_scheduled"),
+        ("FAILED", None, 0, 0, "failed"),
+        ("PROCESSING", "worker-2", 1, 0, "abandoned"),
+        ("PROCESSING", "worker-1", 0, 0, "incomplete"),
     ],
 )
-def test_persisted_job_attempt_outcome(status, assigned_worker, expected):
+def test_persisted_job_attempt_outcome(
+    status, assigned_worker, current_retry_count, claimed_retry_count, expected
+):
     from types import SimpleNamespace
 
-    job = SimpleNamespace(status=status, worker_id=assigned_worker)
-    assert _persisted_job_outcome(job, "worker-1") == expected
+    job = SimpleNamespace(status=status, worker_id=assigned_worker, retry_count=current_retry_count)
+    assert _persisted_job_outcome(job, "worker-1", claimed_retry_count) == expected

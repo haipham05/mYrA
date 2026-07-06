@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import contextmanager
 from uuid import UUID, uuid4
 
 import pytest
@@ -35,7 +36,7 @@ from app.services.graphrag.input_selector import (
     ExtractionSourceElement,
     ExtractionSourcePage,
 )
-from app.services.llm import FakeLLMProvider, LLMProvider
+from app.services.llm import FakeLLMProvider, GenerationResult, GenerationUsage, LLMProvider
 
 SAMPLE_PROJECT_ID = UUID("11111111-1111-1111-1111-111111111111")
 SAMPLE_PAPER_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -833,6 +834,76 @@ async def test_generic_exception_retry_and_failure():
             evidence_items=[ev],
         )
     assert provider.attempts == 2
+
+
+@pytest.mark.anyio
+async def test_graph_generation_telemetry_records_each_attempt_and_provider_usage(monkeypatch):
+    class Observation:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+
+    class RecordingTelemetry:
+        def __init__(self):
+            self.stages = []
+            self.generation_metadata_calls = []
+
+        @contextmanager
+        def stage(self, name, **kwargs):
+            observation = Observation()
+            self.stages.append((name, kwargs, observation))
+            yield observation
+
+        def generation_metadata(self, observation, **kwargs):
+            self.generation_metadata_calls.append((observation, kwargs))
+
+    class RetryProvider(LLMProvider):
+        def __init__(self):
+            self.attempts = 0
+
+        @property
+        def provider_name(self):
+            return "test-provider"
+
+        async def generate(self, system_prompt, user_prompt):
+            raise AssertionError("metadata generation method should be used")
+
+        async def generate_result(self, system_prompt, user_prompt):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("controlled retry")
+            return GenerationResult(
+                content='{"entities": [], "facts": []}',
+                requested_model="requested-model",
+                reported_model="reported-model",
+                response_id="response-1",
+                usage=GenerationUsage(prompt_tokens=12, completion_tokens=3, total_tokens=15),
+            )
+
+    recorder = RecordingTelemetry()
+    monkeypatch.setattr("app.services.graphrag.extractor.get_telemetry", lambda: recorder)
+    provider = RetryProvider()
+    adapter = GraphExtractionAdapter(llm_provider=provider, max_retries=1)
+
+    result = await adapter.generate_raw([make_evidence_item(text="selected evidence text")])
+
+    assert json.loads(result) == {"entities": [], "facts": []}
+    assert provider.attempts == 2
+    assert [stage[0] for stage in recorder.stages] == [
+        "graph.extraction.attempt",
+        "graph.extraction.attempt",
+    ]
+    assert "selected evidence text" in recorder.stages[0][1]["input"]["user_prompt"]
+    assert recorder.stages[0][2].updates[-1]["metadata"]["outcome"] == "failed"
+    assert recorder.stages[1][2].updates[-1]["metadata"]["outcome"] == "success"
+    assert recorder.generation_metadata_calls[0][1]["model"] == "reported-model"
+    assert recorder.generation_metadata_calls[0][1]["usage"] == {
+        "prompt_tokens": 12,
+        "completion_tokens": 3,
+        "total_tokens": 15,
+    }
 
 
 def test_invalid_fact_and_entity_branches():

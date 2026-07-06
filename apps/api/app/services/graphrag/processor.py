@@ -23,6 +23,7 @@ from app.crud.graph import (
     lock_graph_publication,
 )
 from app.db.models import Paper
+from app.observability.telemetry import get_telemetry
 from app.services.graphrag.extractor import (
     ExtractionResult,
     GraphExtractionAdapter,
@@ -73,13 +74,18 @@ class GraphEventProcessor:
         db: Session,
         event_id: UUID | str,
         worker_id: str,
-    ) -> None:
+    ) -> bool:
         """Execute processing for a single claimed GraphEvent.
 
         Guarantees that Paper records are NEVER modified or marked failed.
+
+        Returns True only after this invocation durably acknowledges completion;
+        every stale, failed, unavailable, or retry path returns False.
         """
         if isinstance(event_id, str):
             event_id = UUID(event_id)
+
+        telemetry = get_telemetry()
 
         event = get_graph_event(db, event_id)
         if not event or event.status != "PROCESSING" or event.lease_owner != worker_id:
@@ -88,7 +94,7 @@ class GraphEventProcessor:
                 event_id,
                 worker_id,
             )
-            return
+            return False
 
         now = datetime.now(tz=UTC)
         if event.lease_expires_at:
@@ -102,9 +108,13 @@ class GraphEventProcessor:
                     expiry,
                     now,
                 )
-                return
+                return False
 
         if self.repo is None:
+            telemetry.event(
+                "graph.event.unavailable",
+                metadata={"stage": "repository", "outcome": "unavailable"},
+            )
             fail_graph_event(
                 db,
                 event.id,
@@ -113,12 +123,16 @@ class GraphEventProcessor:
                 error_message="Graph repository is not configured.",
                 is_transient=True,
             )
-            return
+            return False
         try:
             repository_ready = bool(self.repo.verify_connectivity())
         except Exception:
             repository_ready = False
         if not repository_ready:
+            telemetry.event(
+                "graph.event.unavailable",
+                metadata={"stage": "connectivity", "outcome": "unavailable"},
+            )
             fail_graph_event(
                 db,
                 event.id,
@@ -127,12 +141,12 @@ class GraphEventProcessor:
                 error_message="Graph repository connectivity check failed.",
                 is_transient=True,
             )
-            return
+            return False
 
         try:
             if event.action == "DELETE":
                 if not lock_graph_publication(db, event.id, worker_id):
-                    return
+                    return False
                 if self.repo is not None:
                     try:
                         self.repo.delete_paper_facts(
@@ -153,10 +167,14 @@ class GraphEventProcessor:
                             error_message=str(repo_err),
                             is_transient=True,
                         )
-                        return
+                        return False
                 complete_graph_event(db, event.id, worker_id=worker_id)
+                telemetry.event(
+                    "graph.event.completed",
+                    metadata={"action": "delete", "outcome": "success"},
+                )
                 logger.info("Completed DELETE graph event %s", event.id)
-                return
+                return True
 
             elif event.action == "UPSERT":
                 # Validate that paper exists and is READY
@@ -170,7 +188,7 @@ class GraphEventProcessor:
                         error_message=f"Paper {event.paper_id} not found in database",
                         is_transient=False,
                     )
-                    return
+                    return False
 
                 if paper.status != "READY":
                     fail_graph_event(
@@ -183,7 +201,7 @@ class GraphEventProcessor:
                         ),
                         is_transient=True,
                     )
-                    return
+                    return False
 
                 project_id = UUID(str(event.project_id))
                 paper_id = UUID(str(event.paper_id))
@@ -196,39 +214,59 @@ class GraphEventProcessor:
                 )
 
                 if not snapshots:
-                    evidence_items = select_extraction_inputs(
-                        db=db,
-                        project_id=project_id,
-                        paper_id=paper_id,
-                        max_chunks=self.settings.graph_batch_limit,
-                    )
+                    with telemetry.stage(
+                        "graph.input_selection",
+                        metadata={"configured_chunk_limit": self.settings.graph_batch_limit},
+                    ) as selection_span:
+                        evidence_items = select_extraction_inputs(
+                            db=db,
+                            project_id=project_id,
+                            paper_id=paper_id,
+                            max_chunks=self.settings.graph_batch_limit,
+                        )
+                        if selection_span is not None:
+                            selection_span.update(
+                                metadata={
+                                    "configured_chunk_limit": self.settings.graph_batch_limit,
+                                    "selected_chunk_count": len(evidence_items),
+                                    "outcome": "selected" if evidence_items else "empty",
+                                }
+                            )
                     if not evidence_items:
                         # An empty re-index is still a new authoritative
                         # generation. Fence it against newer enqueues and
                         # retire any facts published by an older generation
                         # before acknowledging the empty result.
                         if not lock_graph_publication(db, event.id, worker_id):
-                            return
+                            return False
                         self.repo.retire_older_generations(
                             project_id,
                             paper_id,
                             event.generation_id,
                         )
                         complete_graph_event(db, event.id, worker_id=worker_id)
+                        telemetry.event(
+                            "graph.event.completed",
+                            metadata={"action": "upsert", "outcome": "empty"},
+                        )
                         logger.info(
                             "Completed UPSERT graph event %s (no evidence items to extract)",
                             event.id,
                         )
-                        return
+                        return True
 
                     if self.extractor is None:
                         raise RuntimeError("Graph extractor is not configured")
 
-                    raw_result = await self.extractor.extract(
-                        project_id,
-                        paper_id,
-                        evidence_items,
-                    )
+                    with telemetry.stage(
+                        "graph.extraction",
+                        metadata={"selected_chunk_count": len(evidence_items)},
+                    ):
+                        raw_result = await self.extractor.extract(
+                            project_id,
+                            paper_id,
+                            evidence_items,
+                        )
                     if isinstance(raw_result, ExtractionResult):
                         extraction_result = raw_result
                     elif isinstance(raw_result, str):
@@ -255,14 +293,21 @@ class GraphEventProcessor:
 
                     valid_candidates = []
                     verification_rejections: Counter[str] = Counter()
-                    for candidate in extraction_result.accepted_facts:
-                        is_valid, rejection_reason = verify_candidate_fact(
-                            db, project_id, candidate
-                        )
-                        if is_valid:
-                            valid_candidates.append(candidate)
-                        else:
-                            verification_rejections[rejection_reason or "UNKNOWN"] += 1
+                    with telemetry.stage(
+                        "graph.schema_provenance_verification",
+                        metadata={
+                            "schema_rejected_count": extraction_result.rejected_count,
+                            "candidate_fact_count": len(extraction_result.accepted_facts),
+                        },
+                    ) as verification_span:
+                        for candidate in extraction_result.accepted_facts:
+                            is_valid, rejection_reason = verify_candidate_fact(
+                                db, project_id, candidate
+                            )
+                            if is_valid:
+                                valid_candidates.append(candidate)
+                            else:
+                                verification_rejections[rejection_reason or "UNKNOWN"] += 1
 
                     if verification_rejections:
                         logger.info(
@@ -290,6 +335,34 @@ class GraphEventProcessor:
                             dict(sorted(safe_extraction_rejections.items())),
                         )
 
+                    aggregate_rejections = Counter(verification_rejections)
+                    aggregate_rejections.update(
+                        {
+                            reason: count
+                            for reason, count in extraction_result.rejection_reasons.items()
+                            if re.fullmatch(r"[A-Z0-9_]{1,64}", reason)
+                            and isinstance(count, int)
+                            and count > 0
+                        }
+                    )
+                    if verification_span is not None:
+                        verification_span.update(
+                            metadata={
+                                "candidate_fact_count": len(extraction_result.accepted_facts),
+                                "verified_fact_count": len(valid_candidates),
+                                "schema_rejected_count": extraction_result.rejected_count,
+                                "provenance_rejected_count": sum(verification_rejections.values()),
+                                "rejection_counts": dict(sorted(aggregate_rejections.items())),
+                                "outcome": (
+                                    "all_rejected"
+                                    if extraction_result.rejected_count and not valid_candidates
+                                    else "verified"
+                                    if valid_candidates
+                                    else "empty"
+                                ),
+                            }
+                        )
+
                     if not valid_candidates and (
                         extraction_result.accepted_facts or extraction_result.rejected_count
                     ):
@@ -307,29 +380,48 @@ class GraphEventProcessor:
                             ),
                             is_transient=False,
                         )
+                        telemetry.event(
+                            "graph.extraction.all_rejected",
+                            metadata={
+                                "candidate_fact_count": len(extraction_result.accepted_facts),
+                                "schema_rejected_count": extraction_result.rejected_count,
+                                "provenance_rejected_count": sum(verification_rejections.values()),
+                                "outcome": "all_rejected",
+                            },
+                        )
                         logger.warning(
                             "Graph event %s failed: no extracted facts passed verification",
                             event.id,
                         )
-                        return
+                        return False
 
-                    snapshots = persist_verified_fact_snapshots(
-                        db=db,
-                        project_id=project_id,
-                        paper_id=paper_id,
-                        generation_id=event.generation_id,
-                        event_id=event.id,
-                        verified_candidates=valid_candidates,
-                        ontology_version=event.ontology_version or "1.0.0",
-                    )
-                    # Commit db transaction so snapshots are durably stored in PostgreSQL
-                    # BEFORE touching Neo4j!
-                    db.commit()
+                    with telemetry.stage(
+                        "graph.sql_snapshot_publication",
+                        metadata={"verified_fact_count": len(valid_candidates)},
+                    ) as sql_span:
+                        snapshots = persist_verified_fact_snapshots(
+                            db=db,
+                            project_id=project_id,
+                            paper_id=paper_id,
+                            generation_id=event.generation_id,
+                            event_id=event.id,
+                            verified_candidates=valid_candidates,
+                            ontology_version=event.ontology_version or "1.0.0",
+                        )
+                        # Commit DB snapshots durably before publishing to Neo4j.
+                        db.commit()
+                        if sql_span is not None:
+                            sql_span.update(
+                                metadata={
+                                    "snapshot_count": len(snapshots),
+                                    "outcome": "published",
+                                }
+                            )
 
                 # Lock/recheck after extraction and durable snapshot commit, as close
                 # as possible to publication; newer enqueues serialize on Paper.
                 if not lock_graph_publication(db, event.id, worker_id):
-                    return
+                    return False
 
                 # Publish to Neo4j (if self.repo is configured/present)
                 if self.repo is not None:
@@ -378,24 +470,53 @@ class GraphEventProcessor:
                             for s in snapshots
                         ]
 
-                        self.repo.upsert_nodes(project_id, nodes)
-                        self.repo.upsert_facts(
-                            project_id,
-                            paper_id,
-                            event.generation_id,
-                            facts,
-                        )
+                        with telemetry.stage(
+                            "graph.neo4j_publication",
+                            metadata={
+                                "node_count": len(nodes),
+                                "fact_count": len(facts),
+                            },
+                        ) as neo4j_span:
+                            self.repo.upsert_nodes(project_id, nodes)
+                            self.repo.upsert_facts(
+                                project_id,
+                                paper_id,
+                                event.generation_id,
+                                facts,
+                            )
+                            self.repo.retire_older_generations(
+                                project_id,
+                                paper_id,
+                                event.generation_id,
+                            )
+                            if neo4j_span is not None:
+                                neo4j_span.update(metadata={"outcome": "published"})
 
-                    self.repo.retire_older_generations(
-                        project_id,
-                        paper_id,
-                        event.generation_id,
-                    )
+                    else:
+                        with telemetry.stage(
+                            "graph.neo4j_publication",
+                            metadata={"node_count": 0, "fact_count": 0},
+                        ) as neo4j_span:
+                            self.repo.retire_older_generations(
+                                project_id,
+                                paper_id,
+                                event.generation_id,
+                            )
+                            if neo4j_span is not None:
+                                neo4j_span.update(metadata={"outcome": "published_empty"})
 
                 # Checkpoint in PostgreSQL
                 complete_graph_event(db, event.id, worker_id=worker_id)
+                telemetry.event(
+                    "graph.event.completed",
+                    metadata={
+                        "action": "upsert",
+                        "snapshot_count": len(snapshots),
+                        "outcome": "success",
+                    },
+                )
                 logger.info("Completed UPSERT graph event %s", event.id)
-                return
+                return True
 
             else:
                 fail_graph_event(
@@ -406,14 +527,17 @@ class GraphEventProcessor:
                     error_message=f"Unknown graph event action: {event.action}",
                     is_transient=False,
                 )
-                return
+                return False
 
         except LostGraphLeaseError:
             logger.warning("Worker %s lost lease for graph event %s", worker_id, event_id)
-            return
+            return False
         except Exception as exc:
             db.rollback()
-            logger.error("Error processing graph event %s", event_id, exc_info=exc)
+            logger.error(
+                "Graph event processing failed",
+                extra={"event_id": str(event_id), "error_code": type(exc).__name__},
+            )
             exc_str = str(exc).lower()
             is_transient = True
             error_code = "PROCESSING_ERROR"
@@ -430,6 +554,14 @@ class GraphEventProcessor:
                 error_code = "CONNECTION_ERROR"
                 is_transient = True
 
+            telemetry.event(
+                "graph.event.retry_or_failure",
+                metadata={
+                    "error_code": error_code,
+                    "outcome": "retry_scheduled" if is_transient else "failed",
+                },
+            )
+
             fail_graph_event(
                 db=db,
                 event_id=event.id if "event" in locals() and event else event_id,
@@ -438,3 +570,4 @@ class GraphEventProcessor:
                 error_message=str(exc),
                 is_transient=is_transient,
             )
+            return False
