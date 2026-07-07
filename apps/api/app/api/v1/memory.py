@@ -17,6 +17,7 @@ from app.crud.memory import (
 from app.crud.project import get_project
 from app.db.models import Memory
 from app.db.session import get_db
+from app.observability.telemetry import get_telemetry
 from app.schemas.evidence import AnchorStatus
 from app.schemas.memory import (
     MemoryAuditResponse,
@@ -179,6 +180,33 @@ def update_project_memory(
     memory_update: MemoryUpdate,
     db: Session = Depends(get_db),
 ) -> MemoryResponse:
+    telemetry = get_telemetry()
+    with telemetry.operation(
+        "memory.update",
+        metadata={"project_id": str(project_id), "memory_id": str(memory_id)},
+    ) as observation:
+        try:
+            result = _update_project_memory(db, project_id, memory_id, memory_update)
+        except HTTPException as exc:
+            if observation is not None:
+                observation.update(
+                    metadata={
+                        "outcome": "conflict" if exc.status_code == 409 else "rejected",
+                        "http_status": exc.status_code,
+                    }
+                )
+            raise
+        if observation is not None:
+            observation.update(metadata={"outcome": "success", "memory_version": result.version})
+        return result
+
+
+def _update_project_memory(
+    db: Session,
+    project_id: UUID,
+    memory_id: UUID,
+    memory_update: MemoryUpdate,
+) -> MemoryResponse:
     mem = get_memory(db, memory_id=memory_id, project_id=project_id)
     if not mem:
         raise HTTPException(
@@ -214,6 +242,40 @@ def supersede_project_memory(
         ),
     ),
     db: Session = Depends(get_db),
+) -> MemoryResponse:
+    telemetry = get_telemetry()
+    with telemetry.operation(
+        "memory.supersede",
+        metadata={"project_id": str(project_id), "memory_id": str(memory_id)},
+    ) as observation:
+        try:
+            result = _supersede_project_memory(
+                project_id,
+                memory_id,
+                new_memory_in,
+                expected_version,
+                db,
+            )
+        except HTTPException as exc:
+            if observation is not None:
+                observation.update(
+                    metadata={
+                        "outcome": "conflict" if exc.status_code == 409 else "rejected",
+                        "http_status": exc.status_code,
+                    }
+                )
+            raise
+        if observation is not None:
+            observation.update(metadata={"outcome": "success", "memory_version": result.version})
+        return result
+
+
+def _supersede_project_memory(
+    project_id: UUID,
+    memory_id: UUID,
+    new_memory_in: MemoryCreate,
+    expected_version: int,
+    db: Session,
 ) -> MemoryResponse:
     try:
         validate_memory_candidate(db, project_id=project_id, candidate=new_memory_in)

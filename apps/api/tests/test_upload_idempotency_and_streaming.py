@@ -184,9 +184,12 @@ def test_upload_storage_compensation_on_db_failure():
     project_id = p_res.json()["id"]
 
     pdf_bytes = _make_pdf("Compensate PDF")
-    with patch(
-        "app.api.v1.projects.create_paper_with_job",
-        side_effect=RuntimeError("DB Insert Failed"),
+    with (
+        patch(
+            "app.api.v1.projects.create_paper_with_job",
+            side_effect=RuntimeError("DB Insert Failed"),
+        ),
+        patch("app.api.v1.projects.logger.error") as log_error,
     ):
         res = client.post(
             f"/api/v1/projects/{project_id}/papers",
@@ -194,6 +197,8 @@ def test_upload_storage_compensation_on_db_failure():
         )
         assert res.status_code == 500
         assert "Failed to initialize paper record" in res.json()["detail"]
+    assert "DB Insert Failed" not in repr(log_error.call_args)
+    assert log_error.call_args.kwargs["extra"]["error_code"] == "RuntimeError"
 
 
 def test_upload_records_safe_route_storage_and_queue_telemetry():

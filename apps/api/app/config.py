@@ -31,6 +31,8 @@ class Settings(BaseModel):
     neo4j_database: str = "neo4j"
     neo4j_timeout_seconds: float = 10.0
     graph_batch_limit: int = Field(default=50, ge=1, le=100)
+    cache_enabled: bool = False
+    redis_url: str | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -85,4 +87,8 @@ class Settings(BaseModel):
             values["neo4j_timeout_seconds"] = float(neo4j_timeout)
         if graph_batch_limit := os.getenv("MYRA_GRAPH_BATCH_LIMIT"):
             values["graph_batch_limit"] = int(graph_batch_limit)
+        if cache_enabled := os.getenv("MYRA_CACHE_ENABLED"):
+            values["cache_enabled"] = cache_enabled.lower() in ("true", "1", "yes")
+        if redis_url := os.getenv("MYRA_REDIS_URL"):
+            values["redis_url"] = redis_url
         return cls.model_validate(values)

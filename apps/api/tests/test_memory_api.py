@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from uuid import UUID, uuid4
 
 import pytest
@@ -205,6 +206,89 @@ def test_memory_crud_api_flow(client: TestClient, db: Session) -> None:
     assert resp.status_code == 204
     resp_deleted = client.get(f"/api/v1/projects/{project.id}/memories/{new_id}")
     assert resp_deleted.status_code == 404
+
+
+def test_memory_update_and_supersede_emit_metadata_only_outcomes(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    from app.api.v1 import memory as memory_api
+
+    class Observation:
+        def __init__(self, record):
+            self.record = record
+
+        def update(self, **kwargs):
+            self.record.update(kwargs.get("metadata", {}))
+
+    class Telemetry:
+        def __init__(self):
+            self.records = []
+
+        @contextmanager
+        def operation(self, name, *, metadata=None):
+            record = {"name": name, **(metadata or {})}
+            self.records.append(record)
+            yield Observation(record)
+
+    telemetry = Telemetry()
+    monkeypatch.setattr(memory_api, "get_telemetry", lambda: telemetry)
+
+    project = Project(name="Memory Telemetry Project")
+    db.add(project)
+    db.commit()
+    created = client.post(
+        f"/api/v1/projects/{project.id}/memories",
+        json={
+            "memory_type": MemoryType.DECISION.value,
+            "title": "Initial choice",
+            "content": "Selected initial method for the project.",
+            "sources": [],
+        },
+    )
+    assert created.status_code == 201
+    memory_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}",
+        json={"version": 1, "title": "Updated choice"},
+    )
+    assert updated.status_code == 200
+    conflict = client.patch(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}",
+        json={"version": 1, "title": "Stale update"},
+    )
+    assert conflict.status_code == 409
+
+    supersede_payload = {
+        "memory_type": MemoryType.DECISION.value,
+        "title": "New choice",
+        "content": "Selected a new method for the project.",
+        "sources": [],
+    }
+    supersede_conflict = client.post(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=1",
+        json=supersede_payload,
+    )
+    assert supersede_conflict.status_code == 409
+    superseded = client.post(
+        f"/api/v1/projects/{project.id}/memories/{memory_id}/supersede?expected_version=2",
+        json=supersede_payload,
+    )
+    assert superseded.status_code == 200
+
+    assert [record["name"] for record in telemetry.records] == [
+        "memory.update",
+        "memory.update",
+        "memory.supersede",
+        "memory.supersede",
+    ]
+    assert telemetry.records[0]["outcome"] == "success"
+    assert telemetry.records[0]["memory_version"] == 2
+    assert telemetry.records[1]["outcome"] == "conflict"
+    assert telemetry.records[1]["http_status"] == 409
+    assert telemetry.records[2]["outcome"] == "conflict"
+    assert telemetry.records[3]["outcome"] == "success"
+    assert all("content" not in record and "title" not in record for record in telemetry.records)
 
 
 def test_memory_consolidation_endpoint(client: TestClient, db: Session) -> None:

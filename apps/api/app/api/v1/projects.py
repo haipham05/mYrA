@@ -263,7 +263,10 @@ async def _upload_paper(
         except HTTPException:
             raise
         except Exception as err:
-            logger.warning("Unreadable or corrupt PDF upload", exc_info=err)
+            logger.warning(
+                "Unreadable or corrupt PDF upload",
+                extra={"error_code": type(err).__name__},
+            )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Corrupt or unreadable PDF document",
@@ -312,7 +315,10 @@ async def _upload_paper(
                     "error_code": type(err).__name__,
                 },
             )
-            logger.error("Failed to store PDF", exc_info=err)
+            logger.error(
+                "Failed to store PDF",
+                extra={"project_id": str(project_id), "error_code": type(err).__name__},
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to store PDF document",
@@ -363,7 +369,10 @@ async def _upload_paper(
             await storage.delete(storage_key)
         except Exception:
             pass
-        logger.error("Failed to initialize paper record", exc_info=err)
+        logger.error(
+            "Failed to initialize paper record",
+            extra={"project_id": str(project_id), "error_code": type(err).__name__},
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to initialize paper record",

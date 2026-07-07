@@ -1,0 +1,34 @@
+{
+  "manifest_version": 1,
+  "annotation_method": "Generated synthetic PDFs with manually curated question-to-paper/page/key-phrase labels; labels describe the generated page text, not external papers.",
+  "fixture_hashes": {
+    "arute2019_quantum_supremacy.pdf": "4965945f7bb674de6c549fc0c3eb798ab8aaef488efe7f8a0a45527deea51495",
+    "crane2024_grounding.pdf": "5446bf8c69712633dcd8cd32280cd2e270c2554afa8b01e80605952d30fe9bfd",
+    "devlin2018_bert.pdf": "5a8eafcda39e412f7351b4903368520d0bc0c1bbac2938c4f435251cad4de830",
+    "vaswani2017_attention.pdf": "a0d306f26e3f1295087dcfb5a3744a3dd9332fb46040419ce6cdf2c395dc5a1e"
+  },
+  "gold_papers_sha256": "e233f210080c843f61594d02660edd60503df87ba66675d3979ef5659a111b67",
+  "gold_questions_sha256": "fb8bec20cd0905ded941f1ac092cf77c7d5082cba8076df05bea454c3a61db7e",
+  "gold_inputs_file": "gold_corpus.py",
+  "gold_inputs_revision": "generated-corpus-v1",
+  "expected_sources": "Each retrieval question's target_paper_idx, target_page, and key_phrase in gold_corpus.py; each memory paper fact is anchored to the exact quote on page 4 of its synthetic READY paper.",
+  "memory_expected_facts": [
+    "The active calibration metric is Brier score; the previous AURC decision is superseded.",
+    "AdamW uses learning rate 1e-4 and cosine decay.",
+    "LaTeX tables use booktabs without vertical rules.",
+    "The paper-backed multi-head-attention fact is supported by its page-4 quote and linked element/chunk."
+  ],
+  "annotation_revisions": {
+    "retrieval": "gold_corpus.py:v1",
+    "memory": "evaluate_memory.py:v1"
+  },
+  "evaluation_config": {
+    "database": "temporary SQLite",
+    "storage": "temporary local filesystem",
+    "embedding_provider": "deterministic-fake:v1",
+    "reranker": "simple-lexical:v1",
+    "generation_provider": "fake:v1",
+    "parser": "Docling configured locally; no production/cloud providers",
+    "retrieval": {"top_candidates": 40, "top_evidence": 10, "rrf_k": 60}
+  }
+}

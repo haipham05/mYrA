@@ -21,6 +21,9 @@ from app.ingestion.parser import DocumentParser
 from app.schemas.evidence import AnchorStatus
 from app.schemas.paper import PaperStatus
 from app.schemas.project import ProjectCreate
+from app.services import embedding as embedding_module
+from app.services import llm as llm_module
+from app.services import retrieval as retrieval_module
 from app.services.chat_service import ChatService
 from app.services.embedding import (
     DeterministicEmbeddingProvider,
@@ -35,8 +38,10 @@ from app.services.retrieval import (
     get_reranker,
     set_reranker,
 )
+from app.storage import factory as storage_factory
 from app.storage.factory import set_storage
 from app.storage.local import LocalStorage
+from fixture_manifest import load_and_validate_manifest, write_report
 from gold_corpus import GOLD_PAPERS, GOLD_QUESTIONS
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -79,18 +84,32 @@ async def setup_gold_corpus(db, fixtures_dir: Path, storage):
 
 async def run_evaluation():
     fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    manifest = load_and_validate_manifest(fixtures_dir)
 
     temp_dir = None
     isolated_engine = None
     db = None
     offline_variables = {
         name: os.environ.get(name)
-        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+        for name in (
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "MYRA_EMBEDDING_PROVIDER",
+            "MYRA_RERANKER_PROVIDER",
+            "MYRA_LLM_MODE",
+        )
     }
+    prior_storage = storage_factory._storage_instance
+    prior_embedding = embedding_module._default_embedding_provider
+    prior_reranker = retrieval_module._reranker_instance
+    prior_llm = llm_module._llm_instance
 
     try:
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["MYRA_EMBEDDING_PROVIDER"] = "deterministic"
+        os.environ["MYRA_RERANKER_PROVIDER"] = "simple-lexical"
+        os.environ["MYRA_LLM_MODE"] = "test"
         # This regression runner never consumes the developer's configured cloud
         # resources or production models, regardless of DATABASE_URL/.env.
         temp_dir = tempfile.TemporaryDirectory(prefix="myra-eval-")
@@ -115,6 +134,7 @@ async def run_evaluation():
         dialect = db.get_bind().dialect.name
 
         print("================================================================")
+
         print("      mYrA GENERATED-PDF REGRESSION (NOT RELEASE EVIDENCE)       ")
         print("================================================================")
         print("Runtime Environment:")
@@ -249,6 +269,48 @@ async def run_evaluation():
         print(f"  - LLM:                {llm.provider_name}")
         print("================================================================")
 
+        report_path = write_report(
+            {
+                "manifest_version": manifest["manifest_version"],
+                "evaluation": "generated_pdf_retrieval",
+                "status": "completed",
+                "input_hashes": {
+                    "pdfs": manifest["fixture_hashes"],
+                    "gold_papers_sha256": manifest["gold_papers_sha256"],
+                    "gold_questions_sha256": manifest["gold_questions_sha256"],
+                },
+                "annotation_method": manifest["annotation_method"],
+                "gold_inputs_revision": manifest["gold_inputs_revision"],
+                "questions": [
+                    {
+                        "id": question["id"],
+                        "query": question["query"],
+                        "expected_source": {
+                            "paper": GOLD_PAPERS[question["target_paper_idx"]][
+                                "filename"
+                            ],
+                            "page": question["target_page"],
+                            "expected_fact_phrase": question["key_phrase"],
+                        },
+                    }
+                    for question in GOLD_QUESTIONS
+                ],
+                "configuration": manifest["evaluation_config"],
+                "results": {
+                    "question_count": n,
+                    "recall_at_5": r5,
+                    "recall_at_10": r10,
+                    "mrr": mrr,
+                    "citation_precision": emitted_precision,
+                    "citation_coverage": citation_coverage,
+                    "backend_anchor_offset_rate": offset_rate,
+                    "mean_query_latency_ms": avg_lat,
+                },
+            },
+            prefix="retrieval-eval",
+        )
+        print(f"Machine-readable report: {report_path}")
+
         assert r5 >= 0.80, f"Recall@5 ({r5:.2f}) must be >= 0.80"
         assert r10 >= 0.90, f"Recall@10 ({r10:.2f}) must be >= 0.90"
         assert mrr >= 0.70, f"MRR ({mrr:.4f}) must be >= 0.70"
@@ -267,10 +329,10 @@ async def run_evaluation():
             db.close()
         if isolated_engine:
             isolated_engine.dispose()
-        set_storage(None)
-        set_embedding_provider(None)
-        set_reranker(None)
-        set_llm_provider(None)
+        set_storage(prior_storage)
+        set_embedding_provider(prior_embedding)
+        set_reranker(prior_reranker)
+        set_llm_provider(prior_llm)
         if temp_dir:
             temp_dir.cleanup()
         for name, old_value in offline_variables.items():

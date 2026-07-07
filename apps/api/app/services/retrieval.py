@@ -4,6 +4,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import text
@@ -100,6 +101,8 @@ class RerankerProvider(ABC):
 
 class SimpleLexicalReranker(RerankerProvider):
     """Lightweight lexical reranker for the explicit test/demo profile."""
+
+    model_version = "builtin-v1"
 
     _stop_words = frozenset(
         {
@@ -260,6 +263,7 @@ class HybridRetriever:
         embedding_model: str,
         embedding_version: str,
         telemetry=None,
+        strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
     ) -> list[PaperChunk]:
         """Execute database-native pgvector cosine distance and PostgreSQL full-text search."""
         vec_str = "[" + ",".join(str(float(x)) for x in query_vec) + "]"
@@ -301,6 +305,12 @@ class HybridRetriever:
             if observation is not None:
                 observation.update(metadata={"candidate_count": len(dense_rows)})
         dense_cids = [row[0] for row in dense_rows]
+
+        if strategy == "dense-only":
+            dense_cids = dense_cids[: self.top_candidates]
+            chunks = db.query(PaperChunk).filter(PaperChunk.id.in_(dense_cids)).all()
+            chunk_map = {chunk.id: chunk for chunk in chunks}
+            return [chunk_map[cid] for cid in dense_cids if cid in chunk_map]
 
         # 2. PostgreSQL Full-Text Search with plainto_tsquery and ts_rank
         fts_tokens = SimpleLexicalReranker._tokens(query)
@@ -376,6 +386,7 @@ class HybridRetriever:
         embedding_model: str,
         embedding_version: str,
         telemetry=None,
+        strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
     ) -> list[PaperChunk]:
         """In-memory scoring fallback for SQLite / test environments."""
         chunks = (
@@ -414,6 +425,9 @@ class HybridRetriever:
             dense_scores.sort(key=lambda x: x[1], reverse=True)
             if observation is not None:
                 observation.update(metadata={"candidate_count": len(dense_scores)})
+
+        if strategy == "dense-only":
+            return [chunk for chunk, _ in dense_scores[: self.top_candidates]]
 
         with _retrieval_observation(
             telemetry,
@@ -465,7 +479,16 @@ class HybridRetriever:
         db: Session,
         project_id: UUID,
         query: str,
+        *,
+        strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
     ) -> list[EvidenceItem]:
+        """Retrieve evidence; ``strategy`` is an opt-in evaluation ablation seam.
+
+        Production callers keep the historical hybrid + reranker behavior by
+        default. The other strategies are intended for controlled evaluation.
+        """
+        if strategy not in {"dense-only", "hybrid-unreranked", "hybrid-reranked"}:
+            raise ValueError(f"Unknown retrieval strategy: {strategy}")
         try:
             telemetry = get_telemetry()
         except Exception:
@@ -478,12 +501,18 @@ class HybridRetriever:
                 "candidate_limit": self.top_candidates,
                 "evidence_limit": self.top_evidence,
                 "rrf_k": self.rrf_k,
+                "strategy": strategy,
             },
         ):
-            return self._retrieve_impl(db, project_id, query, telemetry)
+            return self._retrieve_impl(db, project_id, query, telemetry, strategy)
 
     def _retrieve_impl(
-        self, db: Session, project_id: UUID, query: str, telemetry
+        self,
+        db: Session,
+        project_id: UUID,
+        query: str,
+        telemetry,
+        strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
     ) -> list[EvidenceItem]:
         embed_provider = get_embedding_provider()
         with _retrieval_observation(
@@ -515,6 +544,7 @@ class HybridRetriever:
                 embedding_model=embed_provider.model_name,
                 embedding_version=embed_provider.model_version,
                 telemetry=telemetry,
+                strategy=strategy,
             )
         else:
             candidate_chunks = self._retrieve_fallback(
@@ -525,30 +555,39 @@ class HybridRetriever:
                 embedding_model=embed_provider.model_name,
                 embedding_version=embed_provider.model_version,
                 telemetry=telemetry,
+                strategy=strategy,
             )
 
         if not candidate_chunks:
             return []
 
-        # Rerank candidates
-        reranker = get_reranker()
-        docs = [c.text for c in candidate_chunks]
-        with _retrieval_observation(
-            telemetry,
-            "retrieval.reranking",
-            {
-                "reranker_model": reranker.model_name,
-                "reranker_revision": getattr(reranker, "model_version", "unversioned"),
-                "policy_revision": "top-evidence-v1",
-                "input_candidate_count": len(candidate_chunks),
-                "evidence_limit": self.top_evidence,
-            },
-        ) as observation:
-            reranked_order = reranker.rerank(query, docs)
-            if observation is not None:
-                observation.update(metadata={"ranked_candidate_count": len(reranked_order)})
+        # Ablations skip reranking unless the strategy explicitly includes it;
+        # candidate retrieval and evidence/provenance construction stay shared.
+        if strategy != "hybrid-reranked":
+            top_chunks = candidate_chunks[: self.top_evidence]
+        else:
+            top_chunks = None
 
-        top_chunks = [candidate_chunks[idx] for idx, _ in reranked_order[: self.top_evidence]]
+        # Rerank candidates for the production strategy.
+        if top_chunks is None:
+            reranker = get_reranker()
+            docs = [c.text for c in candidate_chunks]
+            with _retrieval_observation(
+                telemetry,
+                "retrieval.reranking",
+                {
+                    "reranker_model": reranker.model_name,
+                    "reranker_revision": getattr(reranker, "model_version", "unversioned"),
+                    "policy_revision": "top-evidence-v1",
+                    "input_candidate_count": len(candidate_chunks),
+                    "evidence_limit": self.top_evidence,
+                },
+            ) as observation:
+                reranked_order = reranker.rerank(query, docs)
+                if observation is not None:
+                    observation.update(metadata={"ranked_candidate_count": len(reranked_order)})
+
+            top_chunks = [candidate_chunks[idx] for idx, _ in reranked_order[: self.top_evidence]]
 
         # Build EvidenceItems with exact provenance mapping and parent expansion
         evidence_items: list[EvidenceItem] = []

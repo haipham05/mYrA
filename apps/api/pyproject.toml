@@ -15,6 +15,7 @@ dependencies = [
     "psycopg2-binary>=2.9.9",
     "pypdf>=4.0,<6.0",
     "python-multipart>=0.0.9",
+    "redis>=5.2,<7.0",
     "sentence-transformers>=3.0,<7.0",
     "sqlalchemy>=2.0,<3.0",
     "torch>=2.14,<2.15",

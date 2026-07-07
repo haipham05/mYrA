@@ -46,10 +46,12 @@ def _persisted_job_outcome(job, worker_id: str, claimed_retry_count: int) -> str
     return "incomplete"
 
 
-def _persisted_graph_outcome(event, worker_id: str, claimed_attempts: int) -> str:
+def _persisted_graph_outcome(
+    event, worker_id: str, claimed_attempts: int, completed_by_attempt: bool
+) -> str:
     """Map durable graph-event state to an honest attempt outcome."""
     if event.status == "COMPLETED":
-        if event.attempts != claimed_attempts:
+        if not completed_by_attempt or event.attempts != claimed_attempts:
             return "abandoned"
         return "success"
     if event.status == "PENDING":
@@ -179,9 +181,9 @@ async def run_worker(
                 )
                 try:
                     db.refresh(event)
-                    outcome = _persisted_graph_outcome(event, worker_id, claimed_attempts)
-                    if outcome == "success" and not completed_by_attempt:
-                        outcome = "abandoned"
+                    outcome = _persisted_graph_outcome(
+                        event, worker_id, claimed_attempts, completed_by_attempt
+                    )
                 except Exception:
                     outcome = "unknown"
                 if observation is not None:

@@ -286,7 +286,14 @@ def test_retriever_project_isolation(monkeypatch):
 
     # Query Project 1 for "quantum"
     ev1 = retriever.retrieve(db, project_id=p1.id, query="quantum computing")
+    ev1_explicit_default = retriever.retrieve(
+        db, project_id=p1.id, query="quantum computing", strategy="hybrid-reranked"
+    )
     assert len(ev1) > 0
+    assert [(item.paper_id, item.chunk_id, item.page_number, item.quote) for item in ev1] == [
+        (item.paper_id, item.chunk_id, item.page_number, item.quote)
+        for item in ev1_explicit_default
+    ]
     assert all(e.paper_id == paper1.id for e in ev1)
     # Ensure no leaked data from Project 2
     assert not any(e.paper_id == paper2.id for e in ev1)
@@ -396,6 +403,59 @@ def test_sqlite_dense_search_ignores_incompatible_vectors(monkeypatch):
     )
     assert len(result) == 2  # Both remain eligible for lexical retrieval.
     assert len(calls) == 1  # Only a compatible embedding enters cosine ranking.
+    db.close()
+
+
+def test_dense_only_ablation_skips_lexical_candidates_and_reranking(monkeypatch):
+    create_tables()
+    db = SessionLocal()
+    project = create_project(db, ProjectCreate(name="Retrieval Ablation"))
+    paper = create_paper(db, project.id, "ablation.pdf", "ablation.pdf")
+    paper.status = PaperStatus.READY
+    embedder = DeterministicEmbeddingProvider(dimension=1024)
+    matching = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="attention vector source",
+        embedding_vec=embedder.embed_query("attention vector source"),
+        embedding_model="deterministic-fake",
+        embedding_version="v1",
+    )
+    lexical_only = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=1,
+        text="attention lexical-only source",
+        embedding_vec=[0.0] * 1024,
+        embedding_model="other-model",
+        embedding_version="v2",
+    )
+    db.add_all([matching, lexical_only])
+    db.commit()
+
+    retriever = HybridRetriever(top_candidates=10)
+    dense = retriever._retrieve_fallback(
+        db,
+        project.id,
+        "attention vector",
+        embedder.embed_query("attention vector"),
+        "deterministic-fake",
+        "v1",
+        strategy="dense-only",
+    )
+    hybrid = retriever._retrieve_fallback(
+        db,
+        project.id,
+        "attention vector",
+        embedder.embed_query("attention vector"),
+        "deterministic-fake",
+        "v1",
+        strategy="hybrid-unreranked",
+    )
+    assert [chunk.id for chunk in dense] == [matching.id]
+    assert lexical_only.id not in {chunk.id for chunk in dense}
+    assert lexical_only.id in {chunk.id for chunk in hybrid}
     db.close()
 
 

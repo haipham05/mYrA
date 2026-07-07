@@ -33,23 +33,34 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 @pytest.mark.parametrize(
-    ("status", "owner", "current_attempts", "claimed_attempts", "expected"),
+    (
+        "status",
+        "owner",
+        "current_attempts",
+        "claimed_attempts",
+        "completed_by_attempt",
+        "expected",
+    ),
     [
-        ("COMPLETED", None, 0, 0, "success"),
-        ("COMPLETED", None, 1, 0, "abandoned"),
-        ("PENDING", None, 1, 1, "retry_scheduled"),
-        ("FAILED", None, 1, 1, "failed"),
-        ("PROCESSING", "worker-2", 1, 0, "abandoned"),
-        ("PROCESSING", "worker-1", 1, 1, "incomplete"),
+        ("COMPLETED", None, 0, 0, True, "success"),
+        ("COMPLETED", None, 0, 0, False, "abandoned"),
+        ("COMPLETED", None, 1, 0, True, "abandoned"),
+        ("PENDING", None, 1, 1, False, "retry_scheduled"),
+        ("FAILED", None, 1, 1, False, "failed"),
+        ("PROCESSING", "worker-2", 1, 0, False, "abandoned"),
+        ("PROCESSING", "worker-1", 1, 1, False, "incomplete"),
     ],
 )
 def test_persisted_graph_attempt_outcome(
-    status, owner, current_attempts, claimed_attempts, expected
+    status, owner, current_attempts, claimed_attempts, completed_by_attempt, expected
 ):
     from types import SimpleNamespace
 
     event = SimpleNamespace(status=status, lease_owner=owner, attempts=current_attempts)
-    assert _persisted_graph_outcome(event, "worker-1", claimed_attempts) == expected
+    assert (
+        _persisted_graph_outcome(event, "worker-1", claimed_attempts, completed_by_attempt)
+        == expected
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -378,6 +389,27 @@ async def test_event_completion_and_delete_action():
         mock_repo.delete_paper_facts.assert_called_once_with(
             project_id=project_id, paper_id=paper_id
         )
+
+
+@pytest.mark.anyio
+async def test_delete_error_logs_only_safe_classification():
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Delete Log Safety Project"))
+        paper = create_paper(db, project.id, "delete-safe.pdf", "delete-safe.pdf")
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="DELETE")
+        db.commit()
+        event_id = event.id
+
+    mock_repo = MagicMock()
+    mock_repo.delete_paper_facts.side_effect = RuntimeError("secret=do-not-log")
+    processor = GraphEventProcessor(repo=mock_repo)
+    with patch("app.services.graphrag.processor.logger.error") as log_error:
+        with SessionLocal() as db:
+            assert claim_next_graph_event(db, worker_id="worker-safe-log") is not None
+            await processor.process_graph_event(db, event_id, worker_id="worker-safe-log")
+
+    assert "secret=do-not-log" not in repr(log_error.call_args)
+    assert log_error.call_args.kwargs["extra"]["error_code"] == "RuntimeError"
 
 
 def test_lease_renewal_discipline():

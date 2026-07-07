@@ -55,7 +55,10 @@ class GraphEventProcessor:
             try:
                 self.repo = Neo4jRepository.from_settings(self.settings)
             except Exception as exc:
-                logger.warning("Could not initialize Neo4jRepository: %s", exc)
+                logger.warning(
+                    "Could not initialize Neo4jRepository",
+                    extra={"error_code": type(exc).__name__},
+                )
                 self.repo = None
 
         self.extractor = extractor
@@ -66,7 +69,10 @@ class GraphEventProcessor:
                 llm = get_llm_provider(self.settings)
                 self.extractor = GraphExtractionAdapter(llm_provider=llm)
             except Exception as exc:
-                logger.warning("Could not initialize GraphExtractionAdapter: %s", exc)
+                logger.warning(
+                    "Could not initialize GraphExtractionAdapter",
+                    extra={"error_code": type(exc).__name__},
+                )
                 self.extractor = None
 
     async def process_graph_event(
@@ -155,9 +161,11 @@ class GraphEventProcessor:
                         )
                     except Exception as repo_err:
                         logger.error(
-                            "Failed to delete paper facts in Neo4j for event %s",
-                            event_id,
-                            exc_info=repo_err,
+                            "Failed to delete paper facts in Neo4j",
+                            extra={
+                                "event_id": str(event_id),
+                                "error_code": type(repo_err).__name__,
+                            },
                         )
                         fail_graph_event(
                             db=db,
