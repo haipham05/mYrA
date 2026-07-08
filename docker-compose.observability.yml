@@ -9,6 +9,7 @@ services:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
       MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
       MYRA_OBSERVABILITY_ENABLED: "true"
+      MYRA_CACHE_ENABLED: "true"
     volumes:
       - type: bind
         source: ./.local/observability/retention
@@ -28,6 +29,7 @@ services:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
       MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
       MYRA_OBSERVABILITY_ENABLED: "true"
+      MYRA_CACHE_ENABLED: "true"
     volumes:
       - type: bind
         source: ./.local/observability/retention

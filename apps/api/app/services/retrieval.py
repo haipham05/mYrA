@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import os
 import re
@@ -10,6 +12,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.crud.corpus import has_pending_corpus_revision, read_corpus_revision
 from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
 from app.ingestion.parser import find_verbatim_span
 from app.observability.telemetry import get_telemetry
@@ -20,6 +23,7 @@ from app.schemas.evidence import (
     CoordinateOrigin,
     EvidenceItem,
 )
+from app.services.cache import get_cache
 from app.services.embedding import get_embedding_provider
 
 
@@ -85,6 +89,100 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
     if norm1 == 0 or norm2 == 0:
         return 0.0
     return dot / (norm1 * norm2)
+
+
+def _rerank_with_cache(query: str, documents: list[str], reranker) -> list[tuple[int, float]]:
+    """Cache ordered reranker scores without persisting query/document text."""
+    content_hashes = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in documents]
+    cache_key = "rerank:" + json.dumps(
+        {
+            "query": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "documents": content_hashes,
+            "model": reranker.model_name,
+            "revision": getattr(reranker, "model_version", "unversioned"),
+            "policy": "top-evidence-v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    def validate(value: object) -> list[tuple[int, float]]:
+        if not isinstance(value, list):
+            raise ValueError("invalid reranker cache value")
+        results: list[tuple[int, float]] = []
+        seen: set[int] = set()
+        for item in value:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or isinstance(item[0], bool)
+                or not isinstance(item[0], int)
+                or item[0] < 0
+                or item[0] >= len(documents)
+                or item[0] in seen
+                or isinstance(item[1], bool)
+                or not isinstance(item[1], (int, float))
+                or not math.isfinite(item[1])
+            ):
+                raise ValueError("invalid reranker cache value")
+            seen.add(item[0])
+            results.append((item[0], float(item[1])))
+        return results
+
+    cache = get_cache()
+    cached = cache.get(cache_key, validate)
+    if cached is not None:
+        return cached
+    result = reranker.rerank(query, documents)
+    cache.set(cache_key, [[index, score] for index, score in result], ttl_seconds=3600)
+    return result
+
+
+def _candidate_cache_key(
+    *,
+    project_id: UUID,
+    corpus_revision: int,
+    query: str,
+    backend: str,
+    embedding_model: str,
+    embedding_version: str,
+    strategy: str,
+    candidate_limit: int,
+    rrf_k: int,
+) -> str:
+    """Build a content-free key for the ordered pre-rerank candidate IDs."""
+    return "retrieval-candidates:v1:" + json.dumps(
+        {
+            "project_id": str(project_id),
+            "corpus_revision": corpus_revision,
+            "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "backend": backend,
+            "embedding_model": embedding_model,
+            "embedding_revision": embedding_version,
+            "policy_revision": "hybrid-rrf-v1",
+            "strategy": strategy,
+            "candidate_limit": candidate_limit,
+            "fusion": {"method": "reciprocal_rank_fusion", "rrf_k": rrf_k},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _validate_candidate_ids(value: object, *, limit: int) -> list[UUID]:
+    if not isinstance(value, list) or len(value) > limit:
+        raise ValueError("invalid retrieval candidate cache value")
+    result: list[UUID] = []
+    seen: set[UUID] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("invalid retrieval candidate cache value")
+        parsed = UUID(item)
+        if parsed in seen:
+            raise ValueError("invalid retrieval candidate cache value")
+        seen.add(parsed)
+        result.append(parsed)
+    return result
 
 
 class RerankerProvider(ABC):
@@ -253,6 +351,32 @@ class HybridRetriever:
         self.top_candidates = top_candidates
         self.top_evidence = top_evidence
         self.rrf_k = rrf_k
+
+    @staticmethod
+    def _hydrate_candidate_ids(
+        db: Session,
+        project_id: UUID,
+        candidate_ids: list[UUID],
+    ) -> list[PaperChunk] | None:
+        """Hydrate only still-eligible IDs; ``None`` means invalidate the whole hit."""
+        if not candidate_ids:
+            return []
+        chunks = (
+            db.query(PaperChunk)
+            .join(Paper, PaperChunk.paper_id == Paper.id)
+            .filter(
+                PaperChunk.id.in_(candidate_ids),
+                PaperChunk.chunk_type == "child",
+                Paper.project_id == project_id,
+                Paper.status == "READY",
+            )
+            .populate_existing()
+            .all()
+        )
+        chunk_map = {chunk.id: chunk for chunk in chunks}
+        if len(chunk_map) != len(candidate_ids):
+            return None
+        return [chunk_map[chunk_id] for chunk_id in candidate_ids]
 
     def _retrieve_postgres(
         self,
@@ -535,8 +659,21 @@ class HybridRetriever:
         except Exception:
             pass
 
-        if is_postgres:
-            candidate_chunks = self._retrieve_postgres(
+        backend = "postgres" if is_postgres else "fallback"
+
+        def retrieve_candidates() -> list[PaperChunk]:
+            if is_postgres:
+                return self._retrieve_postgres(
+                    db=db,
+                    project_id=project_id,
+                    query=query,
+                    query_vec=query_vec,
+                    embedding_model=embed_provider.model_name,
+                    embedding_version=embed_provider.model_version,
+                    telemetry=telemetry,
+                    strategy=strategy,
+                )
+            return self._retrieve_fallback(
                 db=db,
                 project_id=project_id,
                 query=query,
@@ -546,17 +683,100 @@ class HybridRetriever:
                 telemetry=telemetry,
                 strategy=strategy,
             )
+
+        cache = get_cache()
+        caching_enabled = bool(getattr(cache, "enabled", True))
+        pending_mutation = has_pending_corpus_revision(db)
+        if not caching_enabled or pending_mutation:
+            candidate_chunks = retrieve_candidates()
         else:
-            candidate_chunks = self._retrieve_fallback(
-                db=db,
-                project_id=project_id,
-                query=query,
-                query_vec=query_vec,
-                embedding_model=embed_provider.model_name,
-                embedding_version=embed_provider.model_version,
-                telemetry=telemetry,
-                strategy=strategy,
-            )
+            # If revision metadata is unavailable, preserve retrieval behavior
+            # and simply bypass this disposable cache for the request.
+            try:
+                starting_revision = read_corpus_revision(db, project_id)
+            except Exception:
+                candidate_chunks = retrieve_candidates()
+            else:
+                cache_key = _candidate_cache_key(
+                    project_id=project_id,
+                    corpus_revision=starting_revision,
+                    query=query,
+                    backend=backend,
+                    embedding_model=embed_provider.model_name,
+                    embedding_version=embed_provider.model_version,
+                    strategy=strategy,
+                    candidate_limit=self.top_candidates,
+                    rrf_k=self.rrf_k,
+                )
+                candidate_chunks = []
+                stable_revision = False
+                for attempt in range(2):
+                    if attempt:
+                        try:
+                            starting_revision = read_corpus_revision(db, project_id)
+                        except Exception:
+                            candidate_chunks = retrieve_candidates()
+                            stable_revision = True
+                            break
+                        cache_key = _candidate_cache_key(
+                            project_id=project_id,
+                            corpus_revision=starting_revision,
+                            query=query,
+                            backend=backend,
+                            embedding_model=embed_provider.model_name,
+                            embedding_version=embed_provider.model_version,
+                            strategy=strategy,
+                            candidate_limit=self.top_candidates,
+                            rrf_k=self.rrf_k,
+                        )
+
+                    cached_ids = cache.get(
+                        cache_key,
+                        lambda value: _validate_candidate_ids(value, limit=self.top_candidates),
+                    )
+                    hydrated = (
+                        self._hydrate_candidate_ids(db, project_id, cached_ids)
+                        if cached_ids is not None
+                        else None
+                    )
+                    from_cache = cached_ids is not None and hydrated is not None
+                    candidate_chunks = hydrated if from_cache else retrieve_candidates()
+
+                    # The caller owns the transaction. An in-flight corpus
+                    # mutation must never publish or consume revision-keyed IDs.
+                    if has_pending_corpus_revision(db):
+                        stable_revision = True
+                        break
+
+                    try:
+                        ending_revision = read_corpus_revision(db, project_id)
+                    except Exception:
+                        stable_revision = True
+                        break
+                    if ending_revision == starting_revision:
+                        stable_revision = True
+                        if not from_cache and not has_pending_corpus_revision(db):
+                            cache.set(
+                                cache_key,
+                                [str(chunk.id) for chunk in candidate_chunks],
+                                ttl_seconds=300,
+                            )
+                        break
+                    if attempt == 1:
+                        candidate_chunks = []
+                        try:
+                            telemetry.event(
+                                "retrieval.candidates",
+                                metadata={
+                                    "outcome": "CORPUS_CHANGED",
+                                    "backend": backend,
+                                    "retry_count": 1,
+                                },
+                            )
+                        except Exception:
+                            pass
+                if not stable_revision:
+                    candidate_chunks = []
 
         if not candidate_chunks:
             return []
@@ -583,7 +803,7 @@ class HybridRetriever:
                     "evidence_limit": self.top_evidence,
                 },
             ) as observation:
-                reranked_order = reranker.rerank(query, docs)
+                reranked_order = _rerank_with_cache(query, docs, reranker)
                 if observation is not None:
                     observation.update(metadata={"ranked_candidate_count": len(reranked_order)})
 

@@ -1,12 +1,13 @@
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
 
 import app.services.retrieval as retrieval_module
+from app.crud.corpus import bump_corpus_revision, has_pending_corpus_revision
 from app.crud.paper import create_paper
 from app.crud.project import create_project
 from app.db.models import ChunkElement, PaperChunk, PaperElement
@@ -79,6 +80,277 @@ def test_retrieval_observation_failure_does_not_change_product_exception():
         with retrieval_module._retrieval_observation(BrokenTelemetry(), "retrieval", {}):
             raise expected
     assert raised.value is expected
+
+
+def test_reranking_cache_uses_model_and_ordered_content_hashes(monkeypatch):
+    class Cache:
+        values = {}
+        keys = []
+
+        def get(self, key, validator):
+            self.keys.append(key)
+            value = self.values.get(key)
+            return validator(value) if value is not None else None
+
+        def set(self, key, value, *, ttl_seconds):
+            self.keys.append(key)
+            assert ttl_seconds == 3600
+            self.values[key] = value
+            return True
+
+    class Reranker:
+        model_name = "test-reranker"
+        model_version = "rev-1"
+        calls = 0
+
+        def rerank(self, query, documents):
+            self.calls += 1
+            return [(1, 0.9), (0, 0.2)]
+
+    cache = Cache()
+    reranker = Reranker()
+    monkeypatch.setattr(retrieval_module, "get_cache", lambda: cache)
+
+    expected = [(1, 0.9), (0, 0.2)]
+    docs = ["secret-document-A", "secret-document-B"]
+    assert retrieval_module._rerank_with_cache("private query", docs, reranker) == expected
+    assert retrieval_module._rerank_with_cache("private query", docs, reranker) == expected
+    assert reranker.calls == 1
+
+    retrieval_module._rerank_with_cache("private query", list(reversed(docs)), reranker)
+    reranker.model_version = "rev-2"
+    retrieval_module._rerank_with_cache("private query", docs, reranker)
+    assert reranker.calls == 3
+    assert all("private query" not in key and "secret-document" not in key for key in cache.keys)
+
+
+def test_reranking_cache_rejects_invalid_cached_indexes_and_recomputes(monkeypatch):
+    class Cache:
+        def get(self, _key, validator):
+            try:
+                return validator([[3, 0.5]])
+            except ValueError:
+                return None
+
+        def set(self, *_args, **_kwargs):
+            return True
+
+    class Reranker:
+        model_name = "test-reranker"
+        model_version = "rev-1"
+
+        def rerank(self, _query, _documents):
+            return [(0, 0.5)]
+
+    monkeypatch.setattr(retrieval_module, "get_cache", lambda: Cache())
+    assert retrieval_module._rerank_with_cache("question", ["only"], Reranker()) == [(0, 0.5)]
+
+
+def test_candidate_cache_key_scopes_query_project_revision_model_and_policy():
+    common = {
+        "project_id": uuid4(),
+        "corpus_revision": 4,
+        "query": "exact query",
+        "backend": "fallback",
+        "embedding_model": "embedder",
+        "embedding_version": "rev-1",
+        "strategy": "hybrid-reranked",
+        "candidate_limit": 40,
+        "rrf_k": 60,
+    }
+    key = retrieval_module._candidate_cache_key(**common)
+    assert "exact query" not in key
+    for field, changed in (
+        ("project_id", uuid4()),
+        ("corpus_revision", 5),
+        ("query", "different query"),
+        ("embedding_version", "rev-2"),
+        ("embedding_model", "other-model"),
+    ):
+        variant = {**common, field: changed}
+        assert retrieval_module._candidate_cache_key(**variant) != key
+
+
+def test_candidate_cache_id_validation_rejects_duplicates_and_overflow():
+    item = str(uuid4())
+    assert retrieval_module._validate_candidate_ids([item], limit=2) == [UUID(item)]
+    with pytest.raises(ValueError):
+        retrieval_module._validate_candidate_ids([item, item], limit=2)
+    with pytest.raises(ValueError):
+        retrieval_module._validate_candidate_ids([item, str(uuid4())], limit=1)
+
+
+def test_candidate_cache_hit_hydrates_current_rows_and_misses_ineligible_ids():
+    create_tables()
+    db = SessionLocal()
+    project = create_project(db, ProjectCreate(name="Candidate Cache"))
+    paper = create_paper(db, project.id, "candidate.pdf", "candidate.pdf")
+    paper.status = PaperStatus.READY
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="cached candidate evidence",
+        embedding_model="embedder",
+        embedding_version="rev-1",
+    )
+    db.add(chunk)
+    db.commit()
+
+    hydrated = HybridRetriever._hydrate_candidate_ids(db, project.id, [chunk.id])
+    assert hydrated is not None and [item.id for item in hydrated] == [chunk.id]
+
+    paper.status = "PROCESSING"
+    db.commit()
+    assert HybridRetriever._hydrate_candidate_ids(db, project.id, [chunk.id]) is None
+    assert HybridRetriever._hydrate_candidate_ids(db, project.id, [uuid4()]) is None
+    db.close()
+
+
+def test_corpus_revision_bump_marks_session_until_commit_or_rollback():
+    create_tables()
+    db = SessionLocal()
+    project = create_project(db, ProjectCreate(name="Corpus Revision"))
+    db.commit()
+    bump_corpus_revision(db, project.id)
+    assert has_pending_corpus_revision(db)
+    db.commit()
+    assert not has_pending_corpus_revision(db)
+
+    bump_corpus_revision(db, project.id)
+    db.rollback()
+    assert not has_pending_corpus_revision(db)
+    db.close()
+
+
+def test_retrieval_reuses_candidate_ids_without_caching_text(monkeypatch):
+    create_tables()
+    db = SessionLocal()
+    project = create_project(db, ProjectCreate(name="Candidate Hit"))
+    paper = create_paper(db, project.id, "candidate-hit.pdf", "candidate-hit.pdf")
+    paper.status = PaperStatus.READY
+    embedder = DeterministicEmbeddingProvider(dimension=1024)
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="attention evidence text",
+        embedding_vec=embedder.embed_query("attention question"),
+        embedding_model=embedder.model_name,
+        embedding_version=embedder.model_version,
+    )
+    db.add(chunk)
+    db.commit()
+
+    class Cache:
+        enabled = True
+
+        def __init__(self):
+            self.values = {}
+            self.read_keys = []
+            self.written = []
+
+        def get(self, key, validator):
+            self.read_keys.append(key)
+            value = self.values.get(key)
+            return validator(value) if value is not None else None
+
+        def set(self, key, value, *, ttl_seconds):
+            self.written.append((key, value, ttl_seconds))
+            self.values[key] = value
+            return True
+
+    cache = Cache()
+    monkeypatch.setattr(retrieval_module, "get_cache", lambda: cache)
+    set_embedding_provider(embedder)
+    set_reranker(SimpleLexicalReranker())
+    retriever = HybridRetriever(top_candidates=10)
+    retrieval_calls = 0
+    original_retrieve = retriever._retrieve_fallback
+
+    def count_retrieval(*args, **kwargs):
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        return original_retrieve(*args, **kwargs)
+
+    monkeypatch.setattr(retriever, "_retrieve_fallback", count_retrieval)
+    first = retriever.retrieve(db, project.id, "attention question", strategy="hybrid-unreranked")
+    second = retriever.retrieve(db, project.id, "attention question", strategy="hybrid-unreranked")
+
+    assert first and second
+    assert retrieval_calls == 1
+    assert len(cache.written) == 1
+    _, value, ttl = cache.written[0]
+    assert value == [str(chunk.id)]
+    assert ttl == 300
+    assert "attention question" not in cache.written[0][0]
+    assert "attention evidence text" not in repr(value)
+    db.close()
+    set_embedding_provider(None)
+    set_reranker(None)
+
+
+@pytest.mark.parametrize(
+    ("revisions", "expected_calls", "expected_evidence"),
+    [([5, 6, 6, 6], 2, True), ([5, 6, 6, 7], 2, False)],
+)
+def test_retrieval_retries_corpus_revision_race_once(
+    monkeypatch, revisions, expected_calls, expected_evidence
+):
+    create_tables()
+    db = SessionLocal()
+    project = create_project(db, ProjectCreate(name="Revision Race"))
+    paper = create_paper(db, project.id, "revision-race.pdf", "revision-race.pdf")
+    paper.status = PaperStatus.READY
+    embedder = DeterministicEmbeddingProvider(dimension=1024)
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="revision race evidence",
+        embedding_vec=embedder.embed_query("question"),
+        embedding_model=embedder.model_name,
+        embedding_version=embedder.model_version,
+    )
+    db.add(chunk)
+    db.commit()
+
+    class Cache:
+        enabled = True
+
+        def __init__(self):
+            self.values = {}
+            self.writes = []
+
+        def get(self, key, validator):
+            return None
+
+        def set(self, key, value, *, ttl_seconds):
+            self.writes.append((key, value, ttl_seconds))
+
+    cache = Cache()
+    revision_iter = iter(revisions)
+    monkeypatch.setattr(retrieval_module, "get_cache", lambda: cache)
+    monkeypatch.setattr(retrieval_module, "read_corpus_revision", lambda *_: next(revision_iter))
+    set_embedding_provider(embedder)
+    retriever = HybridRetriever(top_candidates=10)
+    calls = 0
+
+    def candidates(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return [chunk]
+
+    monkeypatch.setattr(retriever, "_retrieve_fallback", candidates)
+    result = retriever.retrieve(db, project.id, "question", strategy="hybrid-unreranked")
+
+    assert calls == expected_calls
+    assert bool(result) is expected_evidence
+    assert len(cache.writes) == int(expected_evidence)
+    if expected_evidence:
+        assert '"corpus_revision":6' in cache.writes[0][0]
+    db.close()
+    set_embedding_provider(None)
 
 
 def test_vector_type_processor():

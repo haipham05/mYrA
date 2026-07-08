@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,16 @@ def _evidence(paper_id, page, quote):
     return SimpleNamespace(paper_id=paper_id, page_number=page, quote=quote)
 
 
+def _providers():
+    return {
+        "embedding_provider": "deterministic",
+        "embedding_revision": "v1",
+        "reranker_provider": "simple-lexical",
+        "reranker_revision": "builtin-v1",
+        "parser": "Docling offline",
+    }
+
+
 def test_report_contains_paired_metrics_hashes_and_unavailable_comparisons():
     manifest, papers = _fixture_inputs()
     results = {}
@@ -45,13 +56,7 @@ def test_report_contains_paired_metrics_hashes_and_unavailable_comparisons():
         papers=papers,
         question_results=results,
         latencies_ms=times,
-        providers={
-            "embedding_provider": "deterministic",
-            "embedding_revision": "v1",
-            "reranker_provider": "simple-lexical",
-            "reranker_revision": "v1",
-            "parser": "Docling offline",
-        },
+        providers=_providers(),
     )
 
     assert report["sample_count"] == 24
@@ -92,6 +97,65 @@ def test_report_rejects_incomplete_question_set():
             latencies_ms={strategy: [] for strategy in STRATEGIES},
             providers={},
         )
+
+
+def test_unrelated_only_results_keep_independent_gold_in_denominator():
+    manifest, papers = _fixture_inputs()
+    results = {
+        question["id"]: {
+            strategy: [_evidence("unrelated-paper", 99, f"unrelated {question['id']}")]
+            for strategy in STRATEGIES
+        }
+        for question in GOLD_QUESTIONS
+    }
+    report = build_report(
+        manifest=manifest,
+        papers=papers,
+        question_results=results,
+        latencies_ms={strategy: [1.0] * 24 for strategy in STRATEGIES},
+        providers=_providers(),
+    )
+
+    for strategy in STRATEGIES:
+        scores = report["results"][strategy]["ranking"]
+        assert scores["recall_at_5"] == 0.0
+        assert scores["recall_at_10"] == 0.0
+        assert scores["mrr"] == 0.0
+        assert scores["ndcg_at_10"] == 0.0
+        assert (
+            report["results"][strategy]["answer_source_checks"]["source_match_count"]
+            == 0
+        )
+
+
+def test_target_source_at_rank_six_scores_against_independent_gold():
+    manifest, papers = _fixture_inputs()
+    results = {}
+    for question in GOLD_QUESTIONS:
+        target_id = str(papers[question["target_paper_idx"]].id)
+        target = _evidence(target_id, question["target_page"], question["key_phrase"])
+        preceding = [
+            _evidence("unrelated-paper", 99, f"unrelated {question['id']} {rank}")
+            for rank in range(5)
+        ]
+        results[question["id"]] = {
+            strategy: [*preceding, target] for strategy in STRATEGIES
+        }
+
+    report = build_report(
+        manifest=manifest,
+        papers=papers,
+        question_results=results,
+        latencies_ms={strategy: [1.0] * 24 for strategy in STRATEGIES},
+        providers=_providers(),
+    )
+
+    scores = report["results"]["hybrid-unreranked"]["ranking"]
+    assert scores["recall_at_5"] == 0.0
+    assert scores["recall_at_10"] == 1.0
+    assert scores["mrr"] == pytest.approx(1 / 6)
+    assert scores["ndcg_at_10"] == pytest.approx(1 / math.log2(7))
+    assert scores["ndcg_at_10"] < 1.0
 
 
 def test_memory_and_graph_ablation_are_not_claimed_as_simulated_wins():

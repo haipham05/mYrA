@@ -113,24 +113,30 @@ def build_report(
         for question_id, question in question_by_id.items():
             target_paper_id = str(papers[question["target_paper_idx"]].id)
             results = question_results[question_id][strategy]
-            ranked_keys = [_evidence_key(item) for item in results]
-            relevant = {
-                _evidence_key(item): 3
-                for item in results
+            # The gold target is independent of the retrieved rows. Encode a
+            # matching result as that target ID and always keep it in the ideal
+            # relevance set, even when it was completely missed.
+            gold_source_id = f"gold:{question_id}"
+            ranked_keys = [
+                gold_source_id
                 if _matches_gold(item, question, target_paper_id)
-            }
+                else _evidence_key(item)
+                for item in results
+            ]
+            relevance = {gold_source_id: 3}
             rankings.append(ranked_keys)
-            relevance_by_query.append(relevant)
-            source_correct += bool(relevant)
+            relevance_by_query.append(relevance)
             matching_ranks = [
                 rank
                 for rank, item in enumerate(results, start=1)
                 if _matches_gold(item, question, target_paper_id)
             ]
+            source_correct += bool(matching_ranks)
             per_question.setdefault(question_id, {})[strategy] = {
                 "result_count": len(results),
                 "relevant_source_rank": matching_ranks[0] if matching_ranks else None,
                 "source_match": bool(matching_ranks),
+                "expected_source_id": gold_source_id,
             }
 
         scores = evaluate_ranking(rankings, relevance_by_query)
