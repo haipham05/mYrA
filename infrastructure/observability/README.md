@@ -43,8 +43,10 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml ps --al
 
 The explicit service list avoids starting or rebuilding the existing mYrA app,
 web, worker, and Neo4j. The retention service runs a bounded cleanup pass hourly
-and persists only progress metadata in `.local/observability/retention/`; it needs the
-synthetic project keys before both-project cleanup can succeed. API and worker
+and persists only progress metadata in `.local/observability/retention/`; it uses
+only the personal project credentials. A successful personal-project cleanup
+within the previous two hours is required before approved text content is
+exported; metadata-only traces continue when that gate is stale or failing. API and worker
 mount only that state directory read-only so text export can fail closed when
 cleanup is stale; the scheduler reads credentials from the private state mount
 and writes status to the separate directory. Use `docker compose ... logs --tail=100 langfuse-web
@@ -55,13 +57,11 @@ and the mYrA cache network are internal-only. No app cache data is persistent
 or a source of truth.
 
 The generated `LANGFUSE_INIT_*` variables create one personal Langfuse project
-on first startup. Langfuse's free headless initialization accepts one project
-configuration; its programmatic instance-management API is Enterprise-only.
-Therefore, create the separate `mYrA Synthetic Tests` project once in the local
-console, then copy only that project's public and secret API keys into
-`.local/observability/synthetic-project.env`. This is a Langfuse project, not a
-project or user in the mYrA application database. Keep test traces synthetic;
-do not place captured research material in a persistent evaluation dataset.
+on first startup. Normal use and explicitly enabled live tests both send traces
+to that project; mark validation traces with `test_run=true` so they can be
+filtered in the console. Do not create or configure a synthetic Langfuse
+project, and do not put captured research material in a persistent evaluation
+dataset.
 
 This Compose deployment is for local development, not high availability. Keep
 the host-bound URL private and do not expose port 3001 or the unauthenticated

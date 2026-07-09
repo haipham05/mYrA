@@ -94,13 +94,9 @@ def _require_state_shape(state: dict[str, Any]) -> None:
     for section, keys in required.items():
         value = state.get(section)
         if not isinstance(value, dict) or not keys.issubset(value):
-            raise ValueError(
-                f"Invalid observability credential state section: {section}"
-            )
+            raise ValueError(f"Invalid observability credential state section: {section}")
         if any(not isinstance(value[key], str) or not value[key] for key in keys):
-            raise ValueError(
-                f"Empty or invalid value in credential state section: {section}"
-            )
+            raise ValueError(f"Empty or invalid value in credential state section: {section}")
 
 
 def _write_private_file(path: Path, contents: str) -> None:
@@ -134,8 +130,7 @@ def _render_env_files(state: dict[str, Any]) -> dict[str, str]:
     common = {
         "NEXTAUTH_URL": "http://127.0.0.1:3001",
         "DATABASE_URL": (
-            "postgresql://postgres:"
-            f"{storage['postgres_password']}@langfuse-postgres:5432/langfuse"
+            f"postgresql://postgres:{storage['postgres_password']}@langfuse-postgres:5432/langfuse"
         ),
         "SALT": storage["salt"],
         "ENCRYPTION_KEY": storage["encryption_key"],
@@ -208,9 +203,7 @@ def _render_env_files(state: dict[str, Any]) -> dict[str, str]:
             {"MINIO_ROOT_USER": minio_user, "MINIO_ROOT_PASSWORD": minio_password}
         ),
         "langfuse-redis.env": _env_file({"LANGFUSE_REDIS_PASSWORD": redis_password}),
-        "myra-cache.env": _env_file(
-            {"MYRA_CACHE_PASSWORD": storage["myra_cache_password"]}
-        ),
+        "myra-cache.env": _env_file({"MYRA_CACHE_PASSWORD": storage["myra_cache_password"]}),
         "app.env": _env_file(app_values),
     }
 
@@ -228,18 +221,6 @@ def setup(state_dir: Path = DEFAULT_STATE_DIR) -> None:
     for name, contents in _render_env_files(state).items():
         _write_private_file(state_dir / name, contents)
 
-    synthetic_path = state_dir / "synthetic-project.env"
-    if synthetic_path.is_symlink():
-        raise ValueError(f"Refusing symlink output file: {synthetic_path}")
-    if not synthetic_path.exists():
-        _write_private_file(
-            synthetic_path,
-            "# After creating a synthetic-test project in the local Langfuse UI,\n"
-            "# put that project's API keys here. Do not use the personal project keys.\n"
-            "LANGFUSE_PUBLIC_KEY=\n"
-            "LANGFUSE_SECRET_KEY=\n",
-        )
-
     retention_directory = state_dir / "retention"
     if retention_directory.is_symlink():
         raise ValueError(f"Refusing symlink output directory: {retention_directory}")
@@ -255,9 +236,7 @@ def setup(state_dir: Path = DEFAULT_STATE_DIR) -> None:
         initial_state: dict[str, Any] = {"format_version": 1, "projects": {}}
         if legacy_retention_path.is_file():
             try:
-                legacy_state = json.loads(
-                    legacy_retention_path.read_text(encoding="utf-8")
-                )
+                legacy_state = json.loads(legacy_retention_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 raise ValueError("Existing retention state is invalid") from None
             if (

@@ -105,22 +105,32 @@ def reset_default_telemetry(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def write_retention_state(path, *, failure: str | None = None, stale: str | None = None) -> None:
+def write_retention_state(
+    path,
+    *,
+    failure: str | None = None,
+    stale: str | None = None,
+    personal_failure: bool = False,
+) -> None:
+    personal_success = (
+        (datetime.now(UTC) - (timedelta(hours=3) if stale == "personal" else timedelta(minutes=5)))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
     path.write_text(
         json.dumps(
             {
                 "format_version": 1,
                 "projects": {
-                    label: {
-                        "last_success_at": (
-                            datetime.now(UTC)
-                            - (timedelta(hours=3) if stale == label else timedelta(minutes=5))
-                        )
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                        "last_failure_at": failure if label == "synthetic" else None,
-                    }
-                    for label in ("personal", "synthetic")
+                    "personal": {
+                        "last_success_at": personal_success,
+                        "last_failure_at": failure if personal_failure else None,
+                    },
+                    # Legacy synthetic state must be ignored by the new gate.
+                    "synthetic": {
+                        "last_success_at": (datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+                        "last_failure_at": failure,
+                    },
                 },
             }
         ),
@@ -268,20 +278,19 @@ def test_missing_or_invalid_retention_state_drops_text_but_keeps_metadata(
     assert client.events[0]["metadata"] == {"outcome": "success"}
 
 
-@pytest.mark.parametrize("problem", ["personal_failure", "synthetic_failure", "stale"])
-def test_retention_gate_requires_both_recent_failure_free_projects(
+@pytest.mark.parametrize("problem", ["personal_failure", "personal_stale"])
+def test_retention_gate_requires_recent_failure_free_personal_project(
     monkeypatch, tmp_path, problem
 ) -> None:
     state_path = tmp_path / "retention-state.json"
-    if problem == "stale":
-        write_retention_state(state_path, stale="synthetic")
-    elif problem == "personal_failure":
-        write_retention_state(state_path, failure=None)
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["projects"]["personal"]["last_failure_at"] = datetime.now(UTC).isoformat()
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+    if problem == "personal_stale":
+        write_retention_state(state_path, stale="personal")
     else:
-        write_retention_state(state_path, failure=datetime.now(UTC).isoformat())
+        write_retention_state(
+            state_path,
+            failure=datetime.now(UTC).isoformat(),
+            personal_failure=True,
+        )
     monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
     client = FakeClient()
     adapter = TelemetryAdapter(client, config=configured())
@@ -289,6 +298,17 @@ def test_retention_gate_requires_both_recent_failure_free_projects(
         pass
     assert "input" not in client.calls[0]
     assert client.calls[0]["metadata"] == {"count": 2}
+
+
+def test_legacy_synthetic_failure_does_not_block_personal_text(monkeypatch, tmp_path) -> None:
+    state_path = tmp_path / "retention-state.json"
+    write_retention_state(state_path, failure="legacy-synthetic-failure")
+    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
+    client = FakeClient()
+    adapter = TelemetryAdapter(client, config=configured())
+    with adapter.stage("personal-only-gate", input={"question": "visible"}):
+        pass
+    assert client.calls[0]["input"] == {"question": "visible"}
 
 
 def test_stage_sanitizes_explicit_payload_and_propagates_valid_context() -> None:

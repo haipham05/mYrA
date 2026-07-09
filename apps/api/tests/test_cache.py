@@ -9,6 +9,7 @@ class FakeRedis:
         self.values: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
         self.error: Exception | None = None
+        self.evicted_keys = 0
 
     def get(self, name: str) -> str | None:
         if self.error:
@@ -21,6 +22,11 @@ class FakeRedis:
         self.values[name] = value
         self.ttls[name] = ex
         return True
+
+    def info(self, section: str = "default") -> dict[str, int]:
+        if self.error:
+            raise self.error
+        return {"evicted_keys": self.evicted_keys}
 
 
 def int_value(value: object) -> int:
@@ -80,6 +86,41 @@ def test_invalid_ttl_is_not_written() -> None:
     assert client.values == {}
 
 
+def test_namespace_is_hashed_and_isolates_entries_without_deleting_shared_data() -> None:
+    client = FakeRedis()
+    production = JsonCache(client)
+    benchmark = JsonCache(client, namespace="benchmark-private-run")
+    assert production.set("same-key", 1, ttl_seconds=60)
+    assert benchmark.get("same-key", int_value) is None
+    assert benchmark.set("same-key", 2, ttl_seconds=60)
+    assert production.get("same-key", int_value) == 1
+    assert benchmark.get("same-key", int_value) == 2
+    assert len(client.values) == 2
+    assert all("benchmark-private-run" not in key for key in client.values)
+
+
+def test_stats_snapshot_tracks_counters_and_best_effort_redis_evictions() -> None:
+    client = FakeRedis()
+    cache = JsonCache(client)
+    before = cache.stats_snapshot()
+    cache.get("missing", int_value)
+    client.evicted_keys += 3
+    after = cache.stats_snapshot()
+    assert after == {"hits": 0, "misses": 1, "errors": 0, "evicted_keys_delta": 3}
+    assert before["evicted_keys_delta"] == 0
+
+
+def test_stats_failure_does_not_change_cache_product_behavior() -> None:
+    client = FakeRedis()
+    cache = JsonCache(client)
+    assert cache.set("key", 7, ttl_seconds=60)
+    client.error = RuntimeError("private redis endpoint")
+    assert cache.get("key", int_value) is None
+    snapshot = cache.stats_snapshot()
+    assert snapshot["errors"] == 1
+    assert snapshot["evicted_keys_delta"] is None
+
+
 def test_reset_cache_for_tests_is_safe() -> None:
     reset_cache_for_tests()
 
@@ -91,3 +132,8 @@ def test_factory_is_disabled_by_default_and_explicitly_configured() -> None:
     configured = get_cache(Settings(cache_enabled=True, redis_url="redis://localhost:6379/0"))
     assert configured.enabled
     reset_cache_for_tests()
+
+
+def test_cache_namespace_is_read_only_from_explicit_environment(monkeypatch) -> None:
+    monkeypatch.setenv("MYRA_CACHE_NAMESPACE", "benchmark-test")
+    assert Settings.from_environment().cache_namespace == "benchmark-test"

@@ -33,6 +33,7 @@ class Settings(BaseModel):
     graph_batch_limit: int = Field(default=50, ge=1, le=100)
     cache_enabled: bool = False
     redis_url: str | None = None
+    cache_namespace: str = "production"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -91,4 +92,6 @@ class Settings(BaseModel):
             values["cache_enabled"] = cache_enabled.lower() in ("true", "1", "yes")
         if redis_url := os.getenv("MYRA_REDIS_URL"):
             values["redis_url"] = redis_url
+        if cache_namespace := os.getenv("MYRA_CACHE_NAMESPACE"):
+            values["cache_namespace"] = cache_namespace
         return cls.model_validate(values)

@@ -74,9 +74,7 @@ class UrllibClient:
     MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(
-            self, request, file_pointer, code, message, headers, new_url
-        ):
+        def redirect_request(self, request, file_pointer, code, message, headers, new_url):
             return None
 
     @staticmethod
@@ -131,9 +129,7 @@ class UrllibClient:
         auth: tuple[str, str],
         timeout: float,
     ) -> _UrllibResponse:
-        return self._request(
-            "DELETE", url, auth=auth, timeout=timeout, payload=json_body
-        )
+        return self._request("DELETE", url, auth=auth, timeout=timeout, payload=json_body)
 
 
 @dataclass(frozen=True)
@@ -179,35 +175,8 @@ def _private_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _read_synthetic_env(path: Path) -> tuple[str, str]:
-    if path.is_symlink() or not path.is_file():
-        raise RetentionError("synthetic_credentials_missing_or_unsafe")
-    values: dict[str, str] = {}
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        raise RetentionError("synthetic_credentials_unreadable") from None
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        key, separator, value = stripped.partition("=")
-        if not separator or key not in {"LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"}:
-            raise RetentionError("synthetic_credentials_invalid")
-        if key in values:
-            raise RetentionError("synthetic_credentials_invalid")
-        values[key] = value.strip()
-    public, secret = (
-        values.get("LANGFUSE_PUBLIC_KEY", ""),
-        values.get("LANGFUSE_SECRET_KEY", ""),
-    )
-    if not public or not secret:
-        raise RetentionError("synthetic_credentials_not_configured")
-    return public, secret
-
-
-def load_projects(state_dir: Path) -> tuple[ProjectCredentials, ProjectCredentials]:
-    """Read exactly the personal and synthetic-test project credentials."""
+def load_project(state_dir: Path) -> ProjectCredentials:
+    """Read the personal Langfuse project credentials."""
     if state_dir.is_symlink() or not state_dir.is_dir():
         raise RetentionError("credential_directory_missing_or_unsafe")
     credentials = _private_json(state_dir / "credentials.json")
@@ -216,17 +185,9 @@ def load_projects(state_dir: Path) -> tuple[ProjectCredentials, ProjectCredentia
         raise RetentionError("personal_credentials_invalid")
     personal_public = personal.get("public_key")
     personal_secret = personal.get("secret_key")
-    if not all(
-        isinstance(item, str) and item for item in (personal_public, personal_secret)
-    ):
+    if not all(isinstance(item, str) and item for item in (personal_public, personal_secret)):
         raise RetentionError("personal_credentials_invalid")
-    synthetic_public, synthetic_secret = _read_synthetic_env(
-        state_dir / "synthetic-project.env"
-    )
-    return (
-        ProjectCredentials("personal", personal_public, personal_secret),
-        ProjectCredentials("synthetic", synthetic_public, synthetic_secret),
-    )
+    return ProjectCredentials("personal", personal_public, personal_secret)
 
 
 def _read_state(path: Path) -> dict[str, Any]:
@@ -270,29 +231,25 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def text_export_permitted(state: dict[str, Any], now: datetime) -> bool:
-    """Return true only when both projects have a recent verified cleanup."""
+    """Return true only when the personal project has a recent verified cleanup."""
     now = _utc(now)
     projects = state.get("projects")
     if not isinstance(projects, dict):
         return False
-    for label in ("personal", "synthetic"):
-        item = projects.get(label)
-        if not isinstance(item, dict):
-            return False
-        # A failed run invalidates a previous success even if that success is
-        # still inside the two-hour freshness window.
-        if item.get("last_failure_at") is not None:
-            return False
-        raw_success = item.get("last_success_at")
-        if not isinstance(raw_success, str):
-            return False
-        try:
-            success = _utc(datetime.fromisoformat(raw_success.replace("Z", "+00:00")))
-        except (ValueError, TypeError):
-            return False
-        if success > now or now - success > EXPORT_GRACE:
-            return False
-    return True
+    item = projects.get("personal")
+    if not isinstance(item, dict):
+        return False
+    # A failed run invalidates a previous success even if it is still fresh.
+    if item.get("last_failure_at") is not None:
+        return False
+    raw_success = item.get("last_success_at")
+    if not isinstance(raw_success, str):
+        return False
+    try:
+        success = _utc(datetime.fromisoformat(raw_success.replace("Z", "+00:00")))
+    except (ValueError, TypeError):
+        return False
+    return success <= now and now - success <= EXPORT_GRACE
 
 
 def _fetch_page(
@@ -330,9 +287,7 @@ def _fetch_page(
     if not isinstance(meta, dict):
         raise RetentionError("observations_missing_pagination")
     next_cursor = meta.get("cursor")
-    if next_cursor is not None and (
-        not isinstance(next_cursor, str) or not next_cursor
-    ):
+    if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor):
         raise RetentionError("observations_invalid_cursor")
     trace_ids: list[str] = []
     for row in page["data"]:
@@ -340,11 +295,7 @@ def _fetch_page(
             raise RetentionError("observations_invalid_item")
         trace_id = row.get("traceId")
         raw_time = row.get("startTime")
-        if (
-            not isinstance(trace_id, str)
-            or not trace_id
-            or not isinstance(raw_time, str)
-        ):
+        if not isinstance(trace_id, str) or not trace_id or not isinstance(raw_time, str):
             raise RetentionError("observation_missing_trace_or_time")
         try:
             observed_at = _utc(datetime.fromisoformat(raw_time.replace("Z", "+00:00")))
@@ -396,9 +347,7 @@ def _run_project(
             scan_start = EPOCH
         else:
             try:
-                scan_start = _utc(
-                    datetime.fromisoformat(raw_previous.replace("Z", "+00:00"))
-                )
+                scan_start = _utc(datetime.fromisoformat(raw_previous.replace("Z", "+00:00")))
             except (ValueError, AttributeError):
                 raise RetentionError("retention_state_invalid_cutoff") from None
         cutoff = now - RETENTION_AGE
@@ -419,9 +368,7 @@ def _run_project(
         if cursor is not None and (not isinstance(cursor, str) or not cursor):
             raise RetentionError("retention_state_invalid_cursor")
         pending = active.get("pending_trace_ids")
-        if not isinstance(pending, list) or any(
-            not isinstance(item, str) for item in pending
-        ):
+        if not isinstance(pending, list) or any(not isinstance(item, str) for item in pending):
             raise RetentionError("retention_state_invalid_pending")
         pending = list(dict.fromkeys(pending))
         # A null verify cursor starts a fresh read. Prior-pass IDs are only hints
@@ -470,16 +417,12 @@ def _run_project(
                             }
                         )
                         raise RetentionError("delete_batch_limit_reached")
-                    active.update(
-                        {"phase": "verify", "cursor": None, "pending_trace_ids": []}
-                    )
+                    active.update({"phase": "verify", "cursor": None, "pending_trace_ids": []})
                     cursor = None
                     continue
                 if pending:
                     # Re-submit what remains, then verify from the beginning next run.
-                    retry_limit = DELETE_BATCH_SIZE * max(
-                        0, MAX_DELETE_BATCHES_PER_RUN - batches
-                    )
+                    retry_limit = DELETE_BATCH_SIZE * max(0, MAX_DELETE_BATCHES_PER_RUN - batches)
                     retry_ids = pending[:retry_limit]
                     for index in range(0, len(retry_ids), DELETE_BATCH_SIZE):
                         _delete_batch(
@@ -532,43 +475,44 @@ def _run_project(
 def cleanup(
     *,
     base_url: str,
-    projects: tuple[ProjectCredentials, ProjectCredentials],
+    project: ProjectCredentials,
     state_dir: Path = DEFAULT_STATE_DIR,
     client: HttpClient | None = None,
     clock: Any = lambda: datetime.now(timezone.utc),
 ) -> tuple[dict[str, Any], bool]:
-    """Run a safe cleanup pass for the configured two projects and persist status."""
+    """Run a safe cleanup pass for the personal project and persist status."""
     base_url = _safe_base_url(base_url)
-    if tuple(project.label for project in projects) != ("personal", "synthetic"):
-        raise RetentionError("exactly_personal_and_synthetic_projects_required")
-    if any(not project.public_key or not project.secret_key for project in projects):
+    if project.label != "personal":
+        raise RetentionError("personal_project_required")
+    if not project.public_key or not project.secret_key:
         raise RetentionError("project_credentials_not_configured")
     client = client or UrllibClient()
     now = _utc(clock())
     state_path = state_dir / STATE_NAME
     state = _read_state(state_path)
-    for project in projects:
-        entry = state["projects"].setdefault(project.label, {})
-        entry["last_attempt_at"] = _iso(now)
-        try:
-            _run_project(client, base_url, project, entry, now)
-        except RetentionError as error:
-            cycle = entry.get("cycle", {})
-            entry.update(
-                {
-                    "last_failure_at": _iso(now),
-                    "last_error": str(error),
-                    "last_pending_count": len(cycle.get("pending_trace_ids", []))
-                    if isinstance(cycle, dict)
-                    else 0,
-                }
-            )
+    # Preserve the personal cursor and pending IDs, while discarding legacy
+    # synthetic-project state on the next authoritative write.
+    personal_state = state["projects"].get("personal", {})
+    if not isinstance(personal_state, dict):
+        raise RetentionError("retention_state_invalid")
+    state["projects"] = {"personal": personal_state}
+    entry = personal_state
+    entry["last_attempt_at"] = _iso(now)
+    try:
+        _run_project(client, base_url, project, entry, now)
+    except RetentionError as error:
+        cycle = entry.get("cycle", {})
+        entry.update(
+            {
+                "last_failure_at": _iso(now),
+                "last_error": str(error),
+                "last_pending_count": len(cycle.get("pending_trace_ids", []))
+                if isinstance(cycle, dict)
+                else 0,
+            }
+        )
     _write_state(state_path, state)
-    return state, all(
-        state["projects"].get(label, {}).get("last_success_at")
-        and state["projects"].get(label, {}).get("last_failure_at") is None
-        for label in ("personal", "synthetic")
-    )
+    return state, bool(entry.get("last_success_at") and entry.get("last_failure_at") is None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -580,25 +524,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.base_url:
             raise RetentionError("base_url_not_configured")
-        projects = load_projects(args.credentials_dir)
+        project = load_project(args.credentials_dir)
         state, success = cleanup(
             base_url=args.base_url,
-            projects=projects,
+            project=project,
             state_dir=args.state_dir,
         )
     except RetentionError as error:
         print(f"retention cleanup failed: {error}", file=sys.stderr)
         return 1
-    for label in ("personal", "synthetic"):
-        item = state["projects"].get(label, {})
-        print(
-            f"{label}: success={bool(item.get('last_success_at') and item.get('last_failure_at') is None)} "
-            f"pending={item.get('last_pending_count', 0)} pages={item.get('last_pages', 0)} "
-            f"batches={item.get('last_delete_batches', 0)}"
-        )
+    item = state["projects"].get("personal", {})
     print(
-        f"text_export_permitted={text_export_permitted(state, datetime.now(timezone.utc))}"
+        f"personal: success={bool(item.get('last_success_at') and item.get('last_failure_at') is None)} "
+        f"pending={item.get('last_pending_count', 0)} pages={item.get('last_pages', 0)} "
+        f"batches={item.get('last_delete_batches', 0)}"
     )
+    print(f"text_export_permitted={text_export_permitted(state, datetime.now(timezone.utc))}")
     return 0 if success else 1
 
 

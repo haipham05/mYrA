@@ -43,11 +43,198 @@ from app.schemas.graph import (
     RelationshipPredicate,
 )
 from app.schemas.project import ProjectCreate
-from app.services.graphrag.extractor import ExtractionResult
+from app.services.graphrag.extractor import ExtractionResult, GraphExtractionAdapter
+from app.services.graphrag.input_selector import ExtractionEvidenceItem
 from app.services.graphrag.neo4j_repository import Neo4jRepository
-from app.services.graphrag.processor import GraphEventProcessor
+from app.services.graphrag.processor import GraphEventProcessor, _extraction_cache_key
 
 QUOTE_77 = "The Transformer achieves 28.4 BLEU on the WMT 2014 English-to-German dataset."
+
+
+def _cache_evidence(text: str = "evidence") -> ExtractionEvidenceItem:
+    from uuid import uuid4
+
+    return ExtractionEvidenceItem(
+        evidence_id="ev_1",
+        chunk_id=uuid4(),
+        text=text,
+        page_number=1,
+        parser_version="p1",
+        document_sha256="paper-hash",
+        chunk_index=0,
+    )
+
+
+def test_graph_extraction_cache_key_tracks_evidence_and_configuration():
+    from types import SimpleNamespace
+
+    extractor = SimpleNamespace(cache_version="extractor-v1")
+    evidence = _cache_evidence()
+
+    def key(*, items=None, limit=4, ontology="ont-v1", model=extractor):
+        return _extraction_cache_key(
+            project_id=UUID("00000000-0000-0000-0000-000000000001"),
+            paper_id=UUID("00000000-0000-0000-0000-000000000002"),
+            paper_sha256="paper-hash",
+            evidence_items=items or [evidence],
+            chunk_limit=limit,
+            ontology_version=ontology,
+            extractor_version="extract-v1",
+            extractor=model,
+        )
+
+    baseline = key()
+    assert baseline
+    assert key(items=[_cache_evidence("changed")]) != baseline
+    assert key(limit=5) != baseline
+    assert key(ontology="ont-v2") != baseline
+    assert key(model=SimpleNamespace(cache_version="extractor-v2")) != baseline
+    assert key(model=SimpleNamespace()) is None
+
+    provider_v1 = SimpleNamespace(provider_name="provider", model_name="model-v1")
+    provider_v2 = SimpleNamespace(provider_name="provider", model_name="model-v2")
+    adapter_v1 = GraphExtractionAdapter(provider_v1)
+    adapter_v2 = GraphExtractionAdapter(provider_v2)
+
+    def provider_key(adapter):
+        return _extraction_cache_key(
+            project_id=UUID("00000000-0000-0000-0000-000000000001"),
+            paper_id=UUID("00000000-0000-0000-0000-000000000002"),
+            paper_sha256="paper-hash",
+            evidence_items=[evidence],
+            chunk_limit=4,
+            ontology_version="ont-v1",
+            extractor_version="extract-v1",
+            extractor=adapter,
+        )
+
+    assert provider_key(adapter_v1) != provider_key(adapter_v2)
+    assert provider_key(GraphExtractionAdapter(SimpleNamespace())) is None
+
+
+@pytest.mark.anyio
+async def test_graph_extraction_cache_hit_skips_extractor_but_reverifies_candidate(monkeypatch):
+    class MemoryCache:
+        def __init__(self):
+            self.values = {}
+            self.writes = 0
+
+        def get(self, key, validator):
+            value = self.values.get(key)
+            return validator(value) if value is not None else None
+
+        def set(self, key, value, *, ttl_seconds):
+            assert ttl_seconds == 24 * 60 * 60
+            self.values[key] = value
+            self.writes += 1
+            return True
+
+    class StableExtractor:
+        cache_version = "fixture-model-v1"
+
+        def __init__(self, result):
+            self.result = result
+            self.calls = 0
+
+        async def extract(self, project_id, paper_id, evidence_items):
+            self.calls += 1
+            return self.result
+
+    cache = MemoryCache()
+    monkeypatch.setattr("app.services.graphrag.processor.get_cache", lambda: cache)
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Graph Cache Project"))
+        paper = _setup_ready_paper(db, project.id)
+        first = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        first_id, project_id, paper_id = first.id, project.id, paper.id
+        chunk_id = db.query(PaperChunk).filter(PaperChunk.paper_id == paper_id).first().id
+
+    candidate = GraphFactCandidate(
+        subject=GraphEntitySchema(id="cache-subject", name="Transformer", type=EntityType.METHOD),
+        predicate=RelationshipPredicate.EVALUATED_ON,
+        object=GraphEntitySchema(id="cache-object", name="WMT 2014", type=EntityType.DATASET),
+        provenance=GraphProvenanceSchema(
+            paper_id=paper_id,
+            chunk_id=chunk_id,
+            page_number=1,
+            exact_quote=QUOTE_77,
+            char_start=0,
+            char_end=len(QUOTE_77),
+            document_sha256="d0c0" * 16,
+        ),
+    )
+    extractor = StableExtractor(
+        ExtractionResult(accepted_facts=[candidate], rejected_count=0, rejection_reasons={})
+    )
+    repo = MagicMock(spec=Neo4jRepository)
+    processor = GraphEventProcessor(
+        settings=Settings(graphrag_enabled=True), repo=repo, extractor=extractor
+    )
+    verification = iter([(True, None), (False, "UNRESOLVED_ANCHOR")])
+    monkeypatch.setattr(
+        "app.services.graphrag.processor.verify_candidate_fact",
+        lambda *args: next(verification),
+    )
+
+    with SessionLocal() as db:
+        assert claim_next_graph_event(db, worker_id="cache-first") is not None
+        assert await processor.process_graph_event(db, first_id, "cache-first")
+    assert extractor.calls == 1
+    assert cache.writes == 1
+
+    with SessionLocal() as db:
+        second = create_or_enqueue_graph_event(db, project_id, paper_id, action="UPSERT")
+        db.commit()
+        second_id = second.id
+    with SessionLocal() as db:
+        assert claim_next_graph_event(db, worker_id="cache-second") is not None
+        assert not await processor.process_graph_event(db, second_id, "cache-second")
+
+    # The cached candidate was rechecked against the current verifier and rejected;
+    # only the first attempt called the extractor.
+    assert extractor.calls == 1
+    with SessionLocal() as db:
+        assert get_graph_event(db, second_id).error_code == "NO_VERIFIED_FACTS"
+
+
+@pytest.mark.anyio
+async def test_invalid_graph_extraction_result_is_not_cached(monkeypatch):
+    class MemoryCache:
+        writes = 0
+
+        def get(self, key, validator):
+            return None
+
+        def set(self, key, value, *, ttl_seconds):
+            self.writes += 1
+            return True
+
+    class StableExtractor:
+        cache_version = "fixture-model-v1"
+
+        async def extract(self, project_id, paper_id, evidence_items):
+            return ExtractionResult(
+                accepted_facts=[], rejected_count=1, rejection_reasons={"MALFORMED_JSON": 1}
+            )
+
+    cache = MemoryCache()
+    monkeypatch.setattr("app.services.graphrag.processor.get_cache", lambda: cache)
+    with SessionLocal() as db:
+        project = create_project(db, ProjectCreate(name="Invalid Graph Cache Project"))
+        paper = _setup_ready_paper(db, project.id)
+        event = create_or_enqueue_graph_event(db, project.id, paper.id, action="UPSERT")
+        db.commit()
+        event_id = event.id
+
+    repo = MagicMock(spec=Neo4jRepository)
+    processor = GraphEventProcessor(
+        settings=Settings(graphrag_enabled=True), repo=repo, extractor=StableExtractor()
+    )
+    with SessionLocal() as db:
+        assert claim_next_graph_event(db, worker_id="invalid-cache") is not None
+        assert not await processor.process_graph_event(db, event_id, "invalid-cache")
+    assert cache.writes == 0
 
 
 @pytest.fixture(autouse=True)

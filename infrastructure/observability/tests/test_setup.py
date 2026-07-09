@@ -37,26 +37,14 @@ def test_setup_creates_private_files_and_preserves_credentials_on_rerun(
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(retention_path.parent.stat().st_mode) == 0o700
     assert all(
-        stat.S_IMODE(path.stat().st_mode) == 0o600
-        for path in state_dir.iterdir()
-        if path.is_file()
+        stat.S_IMODE(path.stat().st_mode) == 0o600 for path in state_dir.iterdir() if path.is_file()
     )
 
 
-def test_setup_preserves_manual_synthetic_project_keys(tmp_path: Path) -> None:
+def test_setup_does_not_create_synthetic_project_credentials(tmp_path: Path) -> None:
     state_dir = tmp_path / "private-state"
     setup(state_dir)
-    synthetic_env = state_dir / "synthetic-project.env"
-    synthetic_env.write_text(
-        "LANGFUSE_PUBLIC_KEY=pk-lf-user-created\n"
-        "LANGFUSE_SECRET_KEY=sk-lf-user-created\n",
-        encoding="utf-8",
-    )
-
-    setup(state_dir)
-
-    assert "pk-lf-user-created" in synthetic_env.read_text(encoding="utf-8")
-    assert stat.S_IMODE(synthetic_env.stat().st_mode) == 0o600
+    assert not (state_dir / "synthetic-project.env").exists()
 
 
 def test_setup_migrates_legacy_retention_state_into_separate_mount_directory(
@@ -115,16 +103,13 @@ def test_rendered_runtime_configuration_uses_separate_redis_and_disables_telemet
     assert "MYRA_CACHE_PASSWORD=" not in langfuse_redis_env
 
 
-def test_setup_refuses_symlinked_synthetic_template(tmp_path: Path) -> None:
+def test_setup_leaves_existing_synthetic_credentials_untouched(tmp_path: Path) -> None:
     state_dir = tmp_path / "private-state"
-    state_dir.mkdir()
-    outside = tmp_path / "outside"
-    outside.write_text("keep", encoding="utf-8")
-    (state_dir / "synthetic-project.env").symlink_to(outside)
-
-    with pytest.raises(ValueError, match="symlink output file"):
-        setup(state_dir)
-    assert outside.read_text(encoding="utf-8") == "keep"
+    setup(state_dir)
+    synthetic_env = state_dir / "synthetic-project.env"
+    synthetic_env.write_text("owner-managed", encoding="utf-8")
+    setup(state_dir)
+    assert synthetic_env.read_text(encoding="utf-8") == "owner-managed"
 
 
 def test_cli_does_not_print_generated_secrets(tmp_path: Path) -> None:

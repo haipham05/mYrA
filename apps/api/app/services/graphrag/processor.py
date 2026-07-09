@@ -4,6 +4,7 @@ Decoupled from paper ingestion; maintains strict failure isolation where
 graph failures NEVER modify or fail the authoritative Paper record.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -24,7 +25,9 @@ from app.crud.graph import (
 )
 from app.db.models import Paper
 from app.observability.telemetry import get_telemetry
+from app.services.cache import get_cache
 from app.services.graphrag.extractor import (
+    SYSTEM_PROMPT,
     ExtractionResult,
     GraphExtractionAdapter,
     parse_and_validate_extraction,
@@ -38,6 +41,119 @@ from app.services.graphrag.snapshots import (
 from app.services.graphrag.verifier import verify_candidate_fact
 
 logger = logging.getLogger("myra.graphrag.processor")
+GRAPH_EXTRACTION_CACHE_TTL_SECONDS = 24 * 60 * 60
+GRAPH_EXTRACTION_SELECTOR_VERSION = "bounded-child-selector-v1"
+GRAPH_EXTRACTION_PROMPT_FORMAT_VERSION = "evidence-prompt-v1"
+
+
+def _content_hash(value: str | None) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+def _extractor_cache_identity(extractor: Any) -> dict[str, str] | None:
+    """Return a stable configured identity, or disable caching for unknown providers."""
+    if extractor is None:
+        return None
+
+    extractor_type = type(extractor)
+    identity = {"extractor_class": f"{extractor_type.__module__}.{extractor_type.__qualname__}"}
+    if isinstance(extractor, GraphExtractionAdapter):
+        provider = extractor.llm_provider
+        provider_type = type(provider)
+        provider_name = getattr(provider, "provider_name", None)
+        model_name = getattr(provider, "model_name", None)
+        explicit_revision = getattr(provider, "model_revision", None) or getattr(
+            provider, "cache_version", None
+        )
+        if not isinstance(provider_name, str) or not isinstance(model_name, str):
+            if not isinstance(explicit_revision, str) or not explicit_revision:
+                return None
+            model_name = explicit_revision
+            provider_name = f"{provider_type.__module__}.{provider_type.__qualname__}"
+        identity.update(
+            provider=provider_name,
+            provider_class=f"{provider_type.__module__}.{provider_type.__qualname__}",
+            model=model_name,
+        )
+        if isinstance(explicit_revision, str) and explicit_revision:
+            identity["model_revision"] = explicit_revision
+        return identity
+
+    configured_version = getattr(extractor, "cache_version", None) or getattr(
+        extractor, "version", None
+    )
+    if not isinstance(configured_version, str) or not configured_version.strip():
+        return None
+    identity["configured_version"] = configured_version.strip()
+    return identity
+
+
+def _extraction_cache_key(
+    *,
+    project_id: UUID,
+    paper_id: UUID,
+    paper_sha256: str,
+    evidence_items: list[Any],
+    chunk_limit: int,
+    ontology_version: str,
+    extractor_version: str,
+    extractor: Any,
+) -> str | None:
+    """Build a content-addressed key; never include source text or credentials."""
+    model_identity = _extractor_cache_identity(extractor)
+    if model_identity is None:
+        return None
+    evidence_identity = []
+    for item in evidence_items:
+        evidence_identity.append(
+            {
+                "evidence_id": item.evidence_id,
+                "chunk_id": str(item.chunk_id),
+                "chunk_index": item.chunk_index,
+                "page_number": item.page_number,
+                "element_id": str(item.element_id) if item.element_id else None,
+                "document_sha256": item.document_sha256,
+                "text_sha256": _content_hash(item.text),
+                "source_pages": [
+                    {
+                        "page_number": page.page_number,
+                        "text_sha256": _content_hash(page.raw_text),
+                    }
+                    for page in item.source_pages
+                ],
+                "source_elements": [
+                    {
+                        "element_id": str(element.element_id),
+                        "page_number": element.page_number,
+                        "parser_version": element.parser_version,
+                        "text_sha256": _content_hash(element.text),
+                    }
+                    for element in item.source_elements
+                ],
+            }
+        )
+    payload = {
+        "version": 1,
+        "project_id": str(project_id),
+        "paper_id": str(paper_id),
+        "paper_sha256": paper_sha256,
+        "evidence": evidence_identity,
+        "selector_version": GRAPH_EXTRACTION_SELECTOR_VERSION,
+        "chunk_limit": chunk_limit,
+        "ontology_version": ontology_version,
+        "extractor_version": extractor_version,
+        "prompt_format_version": GRAPH_EXTRACTION_PROMPT_FORMAT_VERSION,
+        "system_prompt_sha256": _content_hash(SYSTEM_PROMPT),
+        "model": model_identity,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"graph-extraction:v1:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _validate_cached_extraction(value: object) -> ExtractionResult:
+    if not isinstance(value, dict):
+        raise ValueError("cached graph extraction must be an object")
+    return ExtractionResult.model_validate(value)
 
 
 class GraphEventProcessor:
@@ -266,38 +382,79 @@ class GraphEventProcessor:
                     if self.extractor is None:
                         raise RuntimeError("Graph extractor is not configured")
 
+                    cache_key = _extraction_cache_key(
+                        project_id=project_id,
+                        paper_id=paper_id,
+                        paper_sha256=paper.document_sha256 or "",
+                        evidence_items=evidence_items,
+                        chunk_limit=self.settings.graph_batch_limit,
+                        ontology_version=event.ontology_version or "1.0.0",
+                        extractor_version=event.extractor_version or "1.0.0",
+                        extractor=self.extractor,
+                    )
+                    cache = get_cache()
+                    extraction_result = None
+                    if cache_key is not None:
+                        try:
+                            extraction_result = cache.get(cache_key, _validate_cached_extraction)
+                        except Exception as exc:
+                            logger.info(
+                                "Graph extraction cache read failed; recomputing",
+                                extra={"error_code": type(exc).__name__},
+                            )
+
                     with telemetry.stage(
                         "graph.extraction",
-                        metadata={"selected_chunk_count": len(evidence_items)},
-                    ):
-                        raw_result = await self.extractor.extract(
-                            project_id,
-                            paper_id,
-                            evidence_items,
-                        )
-                    if isinstance(raw_result, ExtractionResult):
-                        extraction_result = raw_result
-                    elif isinstance(raw_result, str):
-                        extraction_result = parse_and_validate_extraction(
-                            raw_result,
-                            project_id,
-                            paper_id,
-                            evidence_items,
-                        )
-                    elif isinstance(raw_result, (dict, list)):
-                        extraction_result = parse_and_validate_extraction(
-                            json.dumps(raw_result),
-                            project_id,
-                            paper_id,
-                            evidence_items,
-                        )
-                    else:
-                        extraction_result = parse_and_validate_extraction(
-                            str(raw_result),
-                            project_id,
-                            paper_id,
-                            evidence_items,
-                        )
+                        metadata={
+                            "selected_chunk_count": len(evidence_items),
+                            "cache_outcome": "hit" if extraction_result is not None else "miss",
+                        },
+                    ) as extraction_span:
+                        if extraction_result is None:
+                            raw_result = await self.extractor.extract(
+                                project_id,
+                                paper_id,
+                                evidence_items,
+                            )
+                            if isinstance(raw_result, ExtractionResult):
+                                extraction_result = ExtractionResult.model_validate(
+                                    raw_result.model_dump(mode="json")
+                                )
+                            elif isinstance(raw_result, str):
+                                extraction_result = parse_and_validate_extraction(
+                                    raw_result,
+                                    project_id,
+                                    paper_id,
+                                    evidence_items,
+                                )
+                            elif isinstance(raw_result, (dict, list)):
+                                extraction_result = parse_and_validate_extraction(
+                                    json.dumps(raw_result),
+                                    project_id,
+                                    paper_id,
+                                    evidence_items,
+                                )
+                            else:
+                                extraction_result = parse_and_validate_extraction(
+                                    str(raw_result),
+                                    project_id,
+                                    paper_id,
+                                    evidence_items,
+                                )
+                            # Rejected/malformed model output is deliberately not
+                            # cached: a later attempt may produce a valid result.
+                            if cache_key is not None and extraction_result.rejected_count == 0:
+                                try:
+                                    cache.set(
+                                        cache_key,
+                                        extraction_result.model_dump(mode="json"),
+                                        ttl_seconds=GRAPH_EXTRACTION_CACHE_TTL_SECONDS,
+                                    )
+                                except Exception as exc:
+                                    logger.info(
+                                        "Graph extraction cache write failed; continuing",
+                                        extra={"error_code": type(exc).__name__},
+                                    )
 
                     valid_candidates = []
                     verification_rejections: Counter[str] = Counter()

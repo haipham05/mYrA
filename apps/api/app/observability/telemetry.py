@@ -173,7 +173,7 @@ def _metadata_without_text(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _retention_state_allows_text(path: Path) -> bool:
-    """Require fresh verified cleanup state for both Langfuse projects."""
+    """Require fresh verified cleanup state for the personal Langfuse project."""
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
             return False
@@ -188,23 +188,20 @@ def _retention_state_allows_text(path: Path) -> bool:
         return False
 
     now = datetime.now(UTC)
-    for label in ("personal", "synthetic"):
-        project = state["projects"].get(label)
-        if not isinstance(project, dict) or project.get("last_failure_at") is not None:
-            return False
-        timestamp = project.get("last_success_at")
-        if not isinstance(timestamp, str):
-            return False
-        try:
-            success_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if success_at.tzinfo is None or success_at.utcoffset() is None:
-            return False
-        age = now - success_at.astimezone(UTC)
-        if age < timedelta(0) or age > timedelta(hours=2):
-            return False
-    return True
+    project = state["projects"].get("personal")
+    if not isinstance(project, dict) or project.get("last_failure_at") is not None:
+        return False
+    timestamp = project.get("last_success_at")
+    if not isinstance(timestamp, str):
+        return False
+    try:
+        success_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if success_at.tzinfo is None or success_at.utcoffset() is None:
+        return False
+    age = now - success_at.astimezone(UTC)
+    return timedelta(0) <= age <= timedelta(hours=2)
 
 
 class _ObservationPayloadBudget:
