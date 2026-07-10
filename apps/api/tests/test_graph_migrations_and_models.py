@@ -49,7 +49,7 @@ def test_migration_lifecycle_upgrade_downgrade():
 
         engine = create_engine(db_url)
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "i9c8d1e6b2f4"
+        assert current_rev == "k3b5d7f9a1c2"
         assert current_rev in heads
         check_schema_compatibility(engine)
 
@@ -64,6 +64,11 @@ def test_migration_lifecycle_upgrade_downgrade():
         tables = inspector.get_table_names()
         assert "graph_events" in tables
         assert "graph_fact_snapshots" in tables
+        assert {
+            "translation_documents",
+            "translation_segments",
+            "project_translation_glossary_entries",
+        } <= set(tables)
 
         # Verify graph_events columns
         event_cols = {col["name"]: col for col in inspector.get_columns("graph_events")}
@@ -149,7 +154,7 @@ def test_migration_lifecycle_upgrade_downgrade():
         # 4. Re-upgrade back to head
         command.upgrade(cfg, "head")
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "i9c8d1e6b2f4"
+        assert current_rev == "k3b5d7f9a1c2"
         check_schema_compatibility(engine)
 
 

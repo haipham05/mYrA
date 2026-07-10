@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.crud.corpus import has_pending_corpus_revision, read_corpus_revision
 from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
 from app.ingestion.parser import find_verbatim_span
+from app.observability.policy import sanitize_text
 from app.observability.telemetry import get_telemetry
 from app.schemas.evidence import (
     AnchorStatus,
@@ -26,14 +27,29 @@ from app.schemas.evidence import (
 from app.services.cache import get_cache
 from app.services.embedding import get_embedding_provider
 
+_TRACE_PREFIX_CHARS = 240
+
 
 class _RetrievalObservation:
     def __init__(self, observation, metadata: dict) -> None:
         self._observation = observation
         self.metadata = dict(metadata)
+        self.input: dict | None = None
+        self.output: dict | None = None
 
-    def update(self, *, metadata: dict) -> None:
-        self.metadata.update(metadata)
+    def update(
+        self,
+        *,
+        metadata: dict | None = None,
+        input: dict | None = None,
+        output: dict | None = None,
+    ) -> None:
+        if metadata is not None:
+            self.metadata.update(metadata)
+        if input is not None:
+            self.input = input
+        if output is not None:
+            self.output = output
 
 
 @contextmanager
@@ -60,11 +76,15 @@ def _retrieval_observation(telemetry, name: str, metadata: dict):
         if recorder is not None:
             try:
                 observation.update(
-                    metadata={
-                        **recorder.metadata,
-                        "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                        "outcome": "error" if error is not None else "success",
-                        **({"error_code": type(error).__name__} if error else {}),
+                    **{
+                        "metadata": {
+                            **recorder.metadata,
+                            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                            "outcome": "error" if error is not None else "success",
+                            **({"error_code": type(error).__name__} if error else {}),
+                        },
+                        **({"input": recorder.input} if recorder.input is not None else {}),
+                        **({"output": recorder.output} if recorder.output is not None else {}),
                     }
                 )
             except Exception:
@@ -80,6 +100,31 @@ def _retrieval_observation(telemetry, name: str, metadata: dict):
             pass
 
 
+def _trace_prefix(value: str) -> tuple[str, bool]:
+    sanitized = sanitize_text(value)
+    return sanitized[:_TRACE_PREFIX_CHARS], len(sanitized) > _TRACE_PREFIX_CHARS
+
+
+def _candidate_trace_item(
+    *,
+    chunk_id: UUID | str,
+    paper_id: UUID | str,
+    text_value: str,
+    rank: int,
+    score_name: str,
+    score: float | None,
+) -> dict:
+    prefix, truncated = _trace_prefix(text_value)
+    return {
+        "chunk_id": str(chunk_id),
+        "paper_id": str(paper_id),
+        "rank": rank,
+        "score": {"metric": score_name, "value": score},
+        "text_prefix": prefix,
+        "text_truncated": truncated,
+    }
+
+
 def cosine_similarity(v1: list[float], v2: list[float]) -> float:
     if not v1 or not v2 or len(v1) != len(v2):
         return 0.0
@@ -91,7 +136,13 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
     return dot / (norm1 * norm2)
 
 
-def _rerank_with_cache(query: str, documents: list[str], reranker) -> list[tuple[int, float]]:
+def _rerank_with_cache(
+    query: str,
+    documents: list[str],
+    reranker,
+    *,
+    observation: _RetrievalObservation | None = None,
+) -> list[tuple[int, float]]:
     """Cache ordered reranker scores without persisting query/document text."""
     content_hashes = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in documents]
     cache_key = "rerank:" + json.dumps(
@@ -132,7 +183,11 @@ def _rerank_with_cache(query: str, documents: list[str], reranker) -> list[tuple
     cache = get_cache()
     cached = cache.get(cache_key, validate)
     if cached is not None:
+        if observation is not None:
+            observation.update(metadata={"cache_status": "hit"})
         return cached
+    if observation is not None:
+        observation.update(metadata={"cache_status": "miss"})
     result = reranker.rerank(query, documents)
     cache.set(cache_key, [[index, score] for index, score in result], ttl_seconds=3600)
     return result
@@ -394,7 +449,8 @@ class HybridRetriever:
 
         # 1. Native pgvector cosine distance query
         dense_sql = text("""
-            SELECT pc.id
+            SELECT pc.id, pc.paper_id, pc.text,
+                   1.0 - (pc.embedding_vec <=> :query_vec) AS cosine_similarity
             FROM paper_chunks pc
             JOIN papers p ON pc.paper_id = p.id
             WHERE p.project_id = :project_id
@@ -426,8 +482,22 @@ class HybridRetriever:
                     "limit": self.top_candidates,
                 },
             ).fetchall()
+            dense_trace = [
+                _candidate_trace_item(
+                    chunk_id=row[0],
+                    paper_id=row[1],
+                    text_value=row[2],
+                    rank=rank,
+                    score_name="cosine_similarity",
+                    score=float(row[3]),
+                )
+                for rank, row in enumerate(dense_rows, 1)
+            ]
             if observation is not None:
-                observation.update(metadata={"candidate_count": len(dense_rows)})
+                observation.update(
+                    metadata={"candidate_count": len(dense_rows)},
+                    output={"candidates": dense_trace},
+                )
         dense_cids = [row[0] for row in dense_rows]
 
         if strategy == "dense-only":
@@ -440,7 +510,8 @@ class HybridRetriever:
         fts_tokens = SimpleLexicalReranker._tokens(query)
         fts_query = " ".join(fts_tokens) if fts_tokens else query
         fts_sql = text("""
-            SELECT pc.id
+            SELECT pc.id, pc.paper_id, pc.text,
+                   ts_rank(pc.tsv_content, plainto_tsquery('english', :query)) AS fts_score
             FROM paper_chunks pc
             JOIN papers p ON pc.paper_id = p.id
             WHERE p.project_id = :project_id
@@ -463,8 +534,22 @@ class HybridRetriever:
                     "limit": self.top_candidates,
                 },
             ).fetchall()
+            fts_trace = [
+                _candidate_trace_item(
+                    chunk_id=row[0],
+                    paper_id=row[1],
+                    text_value=row[2],
+                    rank=rank,
+                    score_name="postgres_fts_rank",
+                    score=float(row[3]),
+                )
+                for rank, row in enumerate(fts_rows, 1)
+            ]
             if observation is not None:
-                observation.update(metadata={"candidate_count": len(fts_rows)})
+                observation.update(
+                    metadata={"candidate_count": len(fts_rows)},
+                    output={"candidates": fts_trace},
+                )
         fts_cids = [row[0] for row in fts_rows]
 
         # 3. Reciprocal Rank Fusion (RRF)
@@ -490,7 +575,37 @@ class HybridRetriever:
                 : self.top_candidates
             ]
             if observation is not None:
-                observation.update(metadata={"candidate_count": len(sorted_cids)})
+                dense_by_id = {item["chunk_id"]: item for item in dense_trace}
+                fts_by_id = {item["chunk_id"]: item for item in fts_trace}
+                fused_trace = []
+                for rank, cid in enumerate(sorted_cids, 1):
+                    dense_item = dense_by_id.get(str(cid))
+                    fts_item = fts_by_id.get(str(cid))
+                    candidate = dense_item or fts_item
+                    if candidate is None:
+                        continue
+                    fused_trace.append(
+                        {
+                            "chunk_id": str(cid),
+                            "paper_id": candidate["paper_id"],
+                            "rank": rank,
+                            "score": {
+                                "metric": "reciprocal_rank_fusion",
+                                "value": rrf_scores[cid],
+                            },
+                            "dense_rank": dense_item["rank"] if dense_item else None,
+                            "dense_score": dense_item["score"] if dense_item else None,
+                            "fts_rank": fts_item["rank"] if fts_item else None,
+                            "fts_score": fts_item["score"] if fts_item else None,
+                            "text_prefix": candidate["text_prefix"],
+                            "text_truncated": candidate["text_truncated"],
+                        }
+                    )
+                observation.update(
+                    metadata={"candidate_count": len(sorted_cids)},
+                    input={"dense_candidates": dense_trace, "fts_candidates": fts_trace},
+                    output={"candidates": fused_trace},
+                )
 
         if not sorted_cids:
             return []
@@ -547,8 +662,22 @@ class HybridRetriever:
                 sim = cosine_similarity(query_vec, vec)
                 dense_scores.append((chunk, sim))
             dense_scores.sort(key=lambda x: x[1], reverse=True)
+            dense_trace = [
+                _candidate_trace_item(
+                    chunk_id=chunk.id,
+                    paper_id=chunk.paper_id,
+                    text_value=chunk.text,
+                    rank=rank,
+                    score_name="cosine_similarity",
+                    score=float(score),
+                )
+                for rank, (chunk, score) in enumerate(dense_scores[: self.top_candidates], 1)
+            ]
             if observation is not None:
-                observation.update(metadata={"candidate_count": len(dense_scores)})
+                observation.update(
+                    metadata={"candidate_count": len(dense_scores)},
+                    output={"candidates": dense_trace},
+                )
 
         if strategy == "dense-only":
             return [chunk for chunk, _ in dense_scores[: self.top_candidates]]
@@ -565,8 +694,22 @@ class HybridRetriever:
                 matches = sum(1 for term in query_terms if term in chunk_lower)
                 lexical_scores.append((chunk, matches))
             lexical_scores.sort(key=lambda x: x[1], reverse=True)
+            fts_trace = [
+                _candidate_trace_item(
+                    chunk_id=chunk.id,
+                    paper_id=chunk.paper_id,
+                    text_value=chunk.text,
+                    rank=rank,
+                    score_name="term_match_count",
+                    score=float(matches),
+                )
+                for rank, (chunk, matches) in enumerate(lexical_scores[: self.top_candidates], 1)
+            ]
             if observation is not None:
-                observation.update(metadata={"candidate_count": len(lexical_scores)})
+                observation.update(
+                    metadata={"candidate_count": len(lexical_scores)},
+                    output={"candidates": fts_trace},
+                )
 
         with _retrieval_observation(
             telemetry,
@@ -595,7 +738,37 @@ class HybridRetriever:
                 : self.top_candidates
             ]
             if observation is not None:
-                observation.update(metadata={"candidate_count": len(sorted_cids)})
+                dense_by_id = {item["chunk_id"]: item for item in dense_trace}
+                fts_by_id = {item["chunk_id"]: item for item in fts_trace}
+                fused_trace = []
+                for rank, cid in enumerate(sorted_cids, 1):
+                    dense_item = dense_by_id.get(str(cid))
+                    fts_item = fts_by_id.get(str(cid))
+                    candidate = dense_item or fts_item
+                    if candidate is None:
+                        continue
+                    fused_trace.append(
+                        {
+                            "chunk_id": str(cid),
+                            "paper_id": candidate["paper_id"],
+                            "rank": rank,
+                            "score": {
+                                "metric": "reciprocal_rank_fusion",
+                                "value": rrf_scores[cid],
+                            },
+                            "dense_rank": dense_item["rank"] if dense_item else None,
+                            "dense_score": dense_item["score"] if dense_item else None,
+                            "fts_rank": fts_item["rank"] if fts_item else None,
+                            "fts_score": fts_item["score"] if fts_item else None,
+                            "text_prefix": candidate["text_prefix"],
+                            "text_truncated": candidate["text_truncated"],
+                        }
+                    )
+                observation.update(
+                    metadata={"candidate_count": len(sorted_cids)},
+                    input={"dense_candidates": dense_trace, "fts_candidates": fts_trace},
+                    output={"candidates": fused_trace},
+                )
         return [chunk_lookup[cid] for cid in sorted_cids]
 
     def retrieve(
@@ -649,7 +822,10 @@ class HybridRetriever:
         ) as observation:
             query_vec = embed_provider.embed_query(query)
             if observation is not None:
-                observation.update(metadata={"vector_dimensions": len(query_vec)})
+                observation.update(
+                    metadata={"vector_dimensions": len(query_vec)},
+                    input={"question": query},
+                )
 
         # Check if database dialect is PostgreSQL
         is_postgres = False
@@ -687,6 +863,7 @@ class HybridRetriever:
         cache = get_cache()
         caching_enabled = bool(getattr(cache, "enabled", True))
         pending_mutation = has_pending_corpus_revision(db)
+        candidate_cache_hit = False
         if not caching_enabled or pending_mutation:
             candidate_chunks = retrieve_candidates()
         else:
@@ -755,6 +932,7 @@ class HybridRetriever:
                         break
                     if ending_revision == starting_revision:
                         stable_revision = True
+                        candidate_cache_hit = from_cache
                         if not from_cache and not has_pending_corpus_revision(db):
                             cache.set(
                                 cache_key,
@@ -777,6 +955,37 @@ class HybridRetriever:
                             pass
                 if not stable_revision:
                     candidate_chunks = []
+
+        if candidate_cache_hit:
+            with _retrieval_observation(
+                telemetry,
+                "retrieval.candidate_cache",
+                {
+                    "cache_status": "hit",
+                    "skipped_stages": [
+                        "retrieval.dense_search",
+                        "retrieval.fts_search",
+                        "retrieval.fusion",
+                    ],
+                    "candidate_count": len(candidate_chunks),
+                },
+            ) as observation:
+                if observation is not None:
+                    observation.update(
+                        output={
+                            "candidates": [
+                                _candidate_trace_item(
+                                    chunk_id=chunk.id,
+                                    paper_id=chunk.paper_id,
+                                    text_value=chunk.text,
+                                    rank=rank,
+                                    score_name="unavailable_from_candidate_cache",
+                                    score=None,
+                                )
+                                for rank, chunk in enumerate(candidate_chunks, 1)
+                            ]
+                        }
+                    )
 
         if not candidate_chunks:
             return []
@@ -803,9 +1012,47 @@ class HybridRetriever:
                     "evidence_limit": self.top_evidence,
                 },
             ) as observation:
-                reranked_order = _rerank_with_cache(query, docs, reranker)
+                reranked_order = _rerank_with_cache(query, docs, reranker, observation=observation)
                 if observation is not None:
-                    observation.update(metadata={"ranked_candidate_count": len(reranked_order)})
+                    reranked_trace = []
+                    selected_indices = {
+                        index for index, _score in reranked_order[: self.top_evidence]
+                    }
+                    for rank, (index, score) in enumerate(reranked_order, 1):
+                        chunk = candidate_chunks[index]
+                        prefix, truncated = _trace_prefix(chunk.text)
+                        reranked_trace.append(
+                            {
+                                "chunk_id": str(chunk.id),
+                                "paper_id": str(chunk.paper_id),
+                                "rank": rank,
+                                "score": {
+                                    "metric": "reranker_score",
+                                    "value": float(score),
+                                },
+                                "text_prefix": prefix,
+                                "text_truncated": truncated,
+                                "selected_for_evidence": index in selected_indices,
+                            }
+                        )
+                    observation.update(
+                        metadata={"ranked_candidate_count": len(reranked_order)},
+                        input={
+                            "question": query,
+                            "candidates": [
+                                _candidate_trace_item(
+                                    chunk_id=chunk.id,
+                                    paper_id=chunk.paper_id,
+                                    text_value=chunk.text,
+                                    rank=rank,
+                                    score_name="not_scored_before_reranking",
+                                    score=None,
+                                )
+                                for rank, chunk in enumerate(candidate_chunks, 1)
+                            ],
+                        },
+                        output={"candidates": reranked_trace},
+                    )
 
             top_chunks = [candidate_chunks[idx] for idx, _ in reranked_order[: self.top_evidence]]
 

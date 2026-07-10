@@ -465,3 +465,124 @@ class GraphFactSnapshot(Base):
 
     event: Mapped["GraphEvent | None"] = relationship(back_populates="snapshots")
     project: Mapped["Project"] = relationship()
+
+
+class TranslationDocument(Base):
+    """Durable translation request and independent worker queue state."""
+
+    __tablename__ = "translation_documents"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "paper_id", "idempotency_key", name="uq_translation_request_key"
+        ),
+        Index("ix_translation_queue", "status", "lease_expires_at", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[UUID] = mapped_column(
+        ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(40), default="QUEUED", nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    acknowledge_external_processing: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_storage_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    source_filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_map: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    glossary_snapshot: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    engine_version: Mapped[str] = mapped_column(String(50), default="2.9.0", nullable=False)
+    babeldoc_version: Mapped[str] = mapped_column(String(50), default="0.6.2", nullable=False)
+    provider_policy_version: Mapped[str] = mapped_column(
+        String(50), default="siliconflowfree-v1", nullable=False
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attempt_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_units: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_storage_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_retryable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped["Project"] = relationship()
+    paper: Mapped["Paper"] = relationship()
+    segments: Mapped[list["TranslationSegment"]] = relationship(
+        back_populates="translation",
+        cascade="all, delete-orphan",
+        order_by="TranslationSegment.ordinal",
+    )
+
+
+class TranslationSegment(Base):
+    """Validated translation checkpoint linked back to original page and quote."""
+
+    __tablename__ = "translation_segments"
+    __table_args__ = (
+        UniqueConstraint("translation_id", "ordinal", name="uq_translation_segment_ordinal"),
+        Index(
+            "uq_translation_segment_checkpoint",
+            "translation_id",
+            "engine_checkpoint_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    translation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("translation_documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    engine_checkpoint_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_element_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    source_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_quote: Mapped[str] = mapped_column(Text, nullable=False)
+    translated_text: Mapped[str] = mapped_column(Text, nullable=False)
+    translated_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_boxes: Mapped[list[dict[str, float]] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="VALIDATED", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    translation: Mapped["TranslationDocument"] = relationship(back_populates="segments")
+
+
+class ProjectTranslationGlossaryEntry(Base):
+    __tablename__ = "project_translation_glossary_entries"
+    __table_args__ = (
+        UniqueConstraint("project_id", "source_term", name="uq_project_glossary_source_term"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_term: Mapped[str] = mapped_column(String(255), nullable=False)
+    preferred_translation: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )

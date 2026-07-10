@@ -47,3 +47,4 @@ npm-debug.log*
 .idea/
 .vscode/
 .local/observability/
+.local/translation/

@@ -7,6 +7,7 @@ import MemoryInspector from "@/components/MemoryInspector";
 import PaperUploader from "@/components/PaperUploader";
 import PdfViewer from "@/components/PdfViewer";
 import ProjectSelector from "@/components/ProjectSelector";
+import TranslationPanel from "@/components/TranslationPanel";
 import type {
   Citation,
   Conversation,
@@ -606,6 +607,50 @@ export default function Home() {
                 />
               </div>
             </section>
+
+            {selectedProject && selectedPaper && (
+              <TranslationPanel
+                apiUrl={apiUrl}
+                projectId={selectedProject.id}
+                paperId={selectedPaper.id}
+                paperStatus={selectedPaper.status}
+                onOpenSource={(source) => {
+                  const verified =
+                    source.anchor_status === "verified" &&
+                    source.source_char_start !== null &&
+                    source.source_char_end !== null &&
+                    source.document_sha256 === selectedPaper.document_sha256 &&
+                    source.parser_version === "translation-page-rawtext-v1";
+                  setActiveCitation({
+                    citation_index: 1,
+                    evidence_id: `translation-source-${selectedPaper.id}-${source.ordinal}`,
+                    paper_id: selectedPaper.id,
+                    page_number: source.source_page_number,
+                    bounding_boxes: [],
+                    quote: source.source_quote,
+                    document_sha256: source.document_sha256,
+                    parser_version: verified ? source.parser_version : null,
+                    anchor_status: verified ? "verified" : "unresolved",
+                    anchors: verified
+                      ? [
+                          {
+                            id: `translation-anchor-${selectedPaper.id}-${source.ordinal}`,
+                            page_number: source.source_page_number,
+                            source_element_id: source.source_element_id,
+                            exact_quote: source.source_quote,
+                            source_char_start: source.source_char_start,
+                            source_char_end: source.source_char_end,
+                            document_sha256: source.document_sha256,
+                            parser_version: source.parser_version,
+                            anchor_status: "verified",
+                            bounding_boxes: [],
+                          },
+                        ]
+                      : [],
+                  });
+                }}
+              />
+            )}
           </>
         )}
       </main>

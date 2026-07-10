@@ -313,7 +313,8 @@ export default function PdfViewer({
         a.anchor_status === "verified" &&
         a.document_sha256 === activeCitation.document_sha256 &&
         a.parser_version === activeCitation.parser_version &&
-        a.source_element_id &&
+        (a.source_element_id ||
+          a.parser_version === "translation-page-rawtext-v1") &&
         a.source_char_start != null &&
         a.source_char_end != null &&
         a.source_char_end > a.source_char_start,

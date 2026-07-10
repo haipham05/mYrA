@@ -70,6 +70,23 @@ def test_retrieval_observation_records_metadata_without_content():
     assert not any("text" in key or "query" in key for key in result)
 
 
+def test_candidate_trace_item_sanitizes_before_truncating():
+    text_value = "contact test@example.com; " + ("evidence " * 80)
+    item = retrieval_module._candidate_trace_item(
+        chunk_id=uuid4(),
+        paper_id=uuid4(),
+        text_value=text_value,
+        rank=1,
+        score_name="cosine_similarity",
+        score=0.75,
+    )
+    assert len(item["text_prefix"]) <= retrieval_module._TRACE_PREFIX_CHARS
+    assert "test@example.com" not in item["text_prefix"]
+    assert "[EMAIL REDACTED]" in item["text_prefix"]
+    assert item["text_truncated"] is True
+    assert item["score"] == {"metric": "cosine_similarity", "value": 0.75}
+
+
 def test_retrieval_observation_failure_does_not_change_product_exception():
     class BrokenTelemetry:
         def stage(self, *_args, **_kwargs):
@@ -111,10 +128,32 @@ def test_reranking_cache_uses_model_and_ordered_content_hashes(monkeypatch):
     reranker = Reranker()
     monkeypatch.setattr(retrieval_module, "get_cache", lambda: cache)
 
+    class Observation:
+        def __init__(self):
+            self.metadata = {}
+
+        def update(self, *, metadata=None, **_kwargs):
+            if metadata:
+                self.metadata.update(metadata)
+
     expected = [(1, 0.9), (0, 0.2)]
     docs = ["secret-document-A", "secret-document-B"]
-    assert retrieval_module._rerank_with_cache("private query", docs, reranker) == expected
-    assert retrieval_module._rerank_with_cache("private query", docs, reranker) == expected
+    miss_observation = Observation()
+    assert (
+        retrieval_module._rerank_with_cache(
+            "private query", docs, reranker, observation=miss_observation
+        )
+        == expected
+    )
+    hit_observation = Observation()
+    assert (
+        retrieval_module._rerank_with_cache(
+            "private query", docs, reranker, observation=hit_observation
+        )
+        == expected
+    )
+    assert miss_observation.metadata["cache_status"] == "miss"
+    assert hit_observation.metadata["cache_status"] == "hit"
     assert reranker.calls == 1
 
     retrieval_module._rerank_with_cache("private query", list(reversed(docs)), reranker)
@@ -262,6 +301,25 @@ def test_retrieval_reuses_candidate_ids_without_caching_text(monkeypatch):
 
     cache = Cache()
     monkeypatch.setattr(retrieval_module, "get_cache", lambda: cache)
+    trace_events = []
+
+    class TraceObservation:
+        def __init__(self, name):
+            self.name = name
+
+        def update(self, **kwargs):
+            trace_events.append({"name": self.name, **kwargs})
+
+    class TraceTelemetry:
+        @contextmanager
+        def stage(self, name, *, metadata=None, **_kwargs):
+            trace_events.append({"name": name, "metadata": metadata or {}})
+            yield TraceObservation(name)
+
+        def event(self, name, *, metadata=None, **_kwargs):
+            trace_events.append({"name": name, "metadata": metadata or {}})
+
+    monkeypatch.setattr(retrieval_module, "get_telemetry", lambda: TraceTelemetry())
     set_embedding_provider(embedder)
     set_reranker(SimpleLexicalReranker())
     retriever = HybridRetriever(top_candidates=10)
@@ -275,6 +333,7 @@ def test_retrieval_reuses_candidate_ids_without_caching_text(monkeypatch):
 
     monkeypatch.setattr(retriever, "_retrieve_fallback", count_retrieval)
     first = retriever.retrieve(db, project.id, "attention question", strategy="hybrid-unreranked")
+    trace_events.clear()
     second = retriever.retrieve(db, project.id, "attention question", strategy="hybrid-unreranked")
 
     assert first and second
@@ -285,6 +344,23 @@ def test_retrieval_reuses_candidate_ids_without_caching_text(monkeypatch):
     assert ttl == 300
     assert "attention question" not in cache.written[0][0]
     assert "attention evidence text" not in repr(value)
+    cache_observation = next(
+        event for event in reversed(trace_events) if event["name"] == "retrieval.candidate_cache"
+    )
+    candidate_output = cache_observation["output"]["candidates"][0]
+    assert candidate_output["chunk_id"] == str(chunk.id)
+    assert candidate_output["text_prefix"] == "attention evidence text"
+    assert candidate_output["score"]["value"] is None
+    assert cache_observation["metadata"]["cache_status"] == "hit"
+    assert cache_observation["metadata"]["skipped_stages"] == [
+        "retrieval.dense_search",
+        "retrieval.fts_search",
+        "retrieval.fusion",
+    ]
+    second_stage_names = {event["name"] for event in trace_events if "name" in event}
+    assert "retrieval.dense_search" not in second_stage_names
+    assert "retrieval.fts_search" not in second_stage_names
+    assert "retrieval.fusion" not in second_stage_names
     db.close()
     set_embedding_provider(None)
     set_reranker(None)
@@ -468,14 +544,17 @@ def test_retriever_project_isolation(monkeypatch):
     observed = []
 
     class RecordingObservation:
+        def __init__(self, name):
+            self.name = name
+
         def update(self, **kwargs):
-            observed.append(kwargs.get("metadata", {}))
+            observed.append({"name": self.name, **kwargs})
 
     class RecordingTelemetry:
         @contextmanager
         def stage(self, name, *, metadata=None, **_kwargs):
             observed.append({"name": name, **(metadata or {})})
-            yield RecordingObservation()
+            yield RecordingObservation(name)
 
         def event(self, name, *, metadata=None, **_kwargs):
             observed.append({"name": name, **(metadata or {})})
@@ -516,6 +595,8 @@ def test_retriever_project_isolation(monkeypatch):
         token_count=10,
         embedding=embedder.embed_query("Quantum computing fundamentals and qubits."),
         embedding_vec=embedder.embed_query("Quantum computing fundamentals and qubits."),
+        embedding_model=embedder.model_name,
+        embedding_version=embedder.model_version,
     )
     db.add(chunk1)
     db.flush()
@@ -579,7 +660,31 @@ def test_retriever_project_isolation(monkeypatch):
         "retrieval.reranking",
         "retrieval.evidence_built",
     } <= stage_names
-    assert all("quantum computing" not in str(entry) for entry in observed)
+    query_embedding = next(
+        entry for entry in reversed(observed) if entry.get("name") == "retrieval.query_embedding"
+    )
+    assert query_embedding["input"] == {"question": "quantum computing"}
+    dense = next(
+        entry for entry in reversed(observed) if entry.get("name") == "retrieval.dense_search"
+    )
+    dense_candidates = dense["output"]["candidates"]
+    assert dense_candidates[0]["chunk_id"] == str(chunk1.id)
+    assert dense_candidates[0]["paper_id"] == str(paper1.id)
+    assert dense_candidates[0]["score"]["metric"] == "cosine_similarity"
+    assert dense_candidates[0]["text_prefix"].startswith("Quantum computing")
+    fts = next(entry for entry in reversed(observed) if entry.get("name") == "retrieval.fts_search")
+    assert fts["output"]["candidates"]
+    assert fts["output"]["candidates"][0]["score"]["metric"] == "term_match_count"
+    fusion = next(entry for entry in reversed(observed) if entry.get("name") == "retrieval.fusion")
+    assert fusion["input"]["dense_candidates"]
+    assert fusion["input"]["fts_candidates"]
+    assert fusion["output"]["candidates"][0]["score"]["metric"] == ("reciprocal_rank_fusion")
+    reranking = next(
+        entry for entry in reversed(observed) if entry.get("name") == "retrieval.reranking"
+    )
+    assert reranking["input"]["question"] == "quantum computing"
+    assert reranking["output"]["candidates"]
+    assert reranking["output"]["candidates"][0]["score"]["metric"] == "reranker_score"
 
     # Query Project 2 for "quantum" -> should find no results or only project 2 items
     ev2 = retriever.retrieve(db, project_id=p2.id, query="quantum computing")
@@ -615,10 +720,23 @@ def test_rrf_rank_fusion_logic():
 
 def test_postgres_dense_search_filters_embedding_space():
     calls = []
+    stages = {}
 
     class EmptyResult:
         def fetchall(self):
             return []
+
+    class Observation:
+        def __init__(self, name):
+            self.name = name
+
+        def update(self, **kwargs):
+            stages[self.name] = kwargs
+
+    class Telemetry:
+        @contextmanager
+        def stage(self, name, **_kwargs):
+            yield Observation(name)
 
     class RecordingSession:
         def execute(self, statement, params):
@@ -628,7 +746,13 @@ def test_postgres_dense_search_filters_embedding_space():
     retriever = HybridRetriever()
     assert (
         retriever._retrieve_postgres(
-            RecordingSession(), uuid4(), "question", [0.1] * 1024, "BAAI/bge-m3", "sha123"
+            RecordingSession(),
+            uuid4(),
+            "question",
+            [0.1] * 1024,
+            "BAAI/bge-m3",
+            "sha123",
+            telemetry=Telemetry(),
         )
         == []
     )
@@ -638,6 +762,92 @@ def test_postgres_dense_search_filters_embedding_space():
     assert dense_params["embedding_model"] == "BAAI/bge-m3"
     assert dense_params["embedding_version"] == "sha123"
     assert "p.project_id = :project_id" in dense_sql
+    assert stages["retrieval.dense_search"]["metadata"]["candidate_count"] == 0
+    assert stages["retrieval.dense_search"]["output"] == {"candidates": []}
+    assert stages["retrieval.fts_search"]["metadata"]["candidate_count"] == 0
+    assert stages["retrieval.fts_search"]["output"] == {"candidates": []}
+
+
+def test_postgres_trace_reports_native_scores_in_search_order():
+    dense_id, fts_id = uuid4(), uuid4()
+    paper_id = uuid4()
+    stages = {}
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class Observation:
+        def __init__(self, name):
+            self.name = name
+
+        def update(self, **kwargs):
+            stages[self.name] = kwargs
+
+    class Telemetry:
+        @contextmanager
+        def stage(self, name, **_kwargs):
+            yield Observation(name)
+
+    class Query:
+        def filter(self, *_args):
+            return self
+
+        def all(self):
+            return [type("Chunk", (), {"id": fts_id})(), type("Chunk", (), {"id": dense_id})()]
+
+    class RecordingSession:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, _params):
+            sql = str(statement)
+            self.calls.append(sql)
+            if len(self.calls) == 1:
+                return Result(
+                    [
+                        (dense_id, paper_id, "dense first", 0.91),
+                        (fts_id, paper_id, "dense second", 0.72),
+                    ]
+                )
+            return Result(
+                [
+                    (fts_id, paper_id, "fts first", 0.44),
+                    (dense_id, paper_id, "fts second", 0.13),
+                ]
+            )
+
+        def query(self, _model):
+            return Query()
+
+    session = RecordingSession()
+    result = HybridRetriever(top_candidates=5)._retrieve_postgres(
+        session,
+        uuid4(),
+        "attention",
+        [0.1] * 1024,
+        "BAAI/bge-m3",
+        "revision-1",
+        telemetry=Telemetry(),
+    )
+
+    assert [chunk.id for chunk in result] == [dense_id, fts_id]
+    dense = stages["retrieval.dense_search"]["output"]["candidates"]
+    fts = stages["retrieval.fts_search"]["output"]["candidates"]
+    assert [candidate["chunk_id"] for candidate in dense] == [str(dense_id), str(fts_id)]
+    assert [candidate["score"]["value"] for candidate in dense] == [0.91, 0.72]
+    assert [candidate["chunk_id"] for candidate in fts] == [str(fts_id), str(dense_id)]
+    assert [candidate["score"] for candidate in fts] == [
+        {"metric": "postgres_fts_rank", "value": 0.44},
+        {"metric": "postgres_fts_rank", "value": 0.13},
+    ]
+    assert "1.0 - (pc.embedding_vec <=> :query_vec) AS cosine_similarity" in session.calls[0]
+    assert "ORDER BY pc.embedding_vec <=> :query_vec ASC" in session.calls[0]
+    assert "ts_rank(pc.tsv_content" in session.calls[1]
+    assert "ORDER BY ts_rank(pc.tsv_content" in session.calls[1]
 
 
 def test_sqlite_dense_search_ignores_incompatible_vectors(monkeypatch):
