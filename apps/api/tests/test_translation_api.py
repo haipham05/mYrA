@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -93,6 +95,38 @@ def test_translation_request_is_idempotent_and_project_scoped(translation_client
     )
     assert listed.status_code == 200
     assert len(listed.json()["items"]) == 1
+
+
+def test_translation_request_marks_deliberate_live_validation(translation_client, monkeypatch):
+    from app.api.v1 import translations
+
+    client, project_id, paper_id, _, _ = translation_client
+    observations = []
+
+    class FakeObservation:
+        def update(self, **kwargs):
+            observations[-1]["update"] = kwargs
+
+    class FakeTelemetry:
+        @contextmanager
+        def operation(self, name, *, input=None, metadata=None):
+            observations.append({"name": name, "input": input, "metadata": metadata})
+            yield FakeObservation()
+
+    monkeypatch.setattr(translations, "get_telemetry", lambda: FakeTelemetry())
+    response = client.post(
+        f"/api/v1/papers/{paper_id}/translations",
+        headers={"X-MyRA-Test-Run": "true"},
+        json={"project_id": str(project_id), "acknowledge_external_processing": True},
+    )
+    assert response.status_code == 202
+    assert observations[0]["name"] == "translation.request"
+    assert observations[0]["metadata"]["test_run"] is True
+    assert observations[0]["input"] == {
+        "project_id": str(project_id),
+        "paper_id": str(paper_id),
+    }
+    assert observations[0]["update"]["output"]["outcome"] == "created"
 
 
 def test_translation_checkpoints_are_idempotent_and_attempt_fenced(translation_client):

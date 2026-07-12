@@ -179,3 +179,24 @@ def test_processor_rejects_incomplete_engine_output(database, tmp_path):
 
     with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE"):
         asyncio.run(process())
+
+
+def test_processor_rejects_unchanged_required_prose_checkpoint(database):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    processor = BabelDocTranslationProcessor(session_factory=database)
+    unchanged = "This required scientific prose must not remain in English."
+    with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE"):
+        processor._persist_checkpoint(
+            job,
+            {
+                "segment_key": hashlib.sha256(b"same").hexdigest(),
+                "page_number": 1,
+                "ordinal": 0,
+                "source_quote": unchanged,
+                "source_sha256": hashlib.sha256(unchanged.encode()).hexdigest(),
+                "translated_text": unchanged,
+                "translated_sha256": hashlib.sha256(unchanged.encode()).hexdigest(),
+                "status": "validated",
+            },
+        )

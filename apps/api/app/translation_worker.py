@@ -28,6 +28,7 @@ from app.crud.translation import (
 )
 from app.db.models import TranslationDocument
 from app.db.session import SessionLocal
+from app.observability.telemetry import get_telemetry
 
 logger = logging.getLogger("myra.translation_worker")
 LEASE_SECONDS = 300
@@ -239,6 +240,16 @@ class TranslationWorker:
             return False
 
         logger.info("translation_claimed", extra={"translation_id": str(job.id)})
+        get_telemetry().event(
+            "translation.claim",
+            metadata={
+                "translation_id": str(job.id),
+                "attempt": job.attempt_count,
+                "worker_id": self.worker_id,
+                "test_run": os.getenv("MYRA_TRANSLATION_TEST_RUN", "false").lower() == "true",
+            },
+            output={"outcome": "claimed"},
+        )
         lost_lease = asyncio.Event()
         processing = asyncio.create_task(self._run_processor(job))
         self._active_processing = processing

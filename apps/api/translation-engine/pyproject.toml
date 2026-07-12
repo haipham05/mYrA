@@ -1,0 +1,13 @@
+[project]
+name = "myra-translation-engine"
+version = "0.1.0"
+description = "Isolated PDFMathTranslate-next runtime for mYrA"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pdf2zh-next==2.9.0",
+    "babeldoc==0.6.2",
+    "httpx>=0.27,<1.0",
+]
+
+[tool.uv]
+package = false

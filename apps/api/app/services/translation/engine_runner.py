@@ -117,6 +117,9 @@ class TranslationCheckpointRecorder:
                     "context_hash": None,
                     "status": "pending",
                 }
+                if record["layout_label"] == "abandon" and len(quote.strip()) <= 3:
+                    record["status"] = "skipped"
+                    self.skipped += 1
                 identity = {
                     "source_pdf_sha256": self.source_sha256,
                     "page_number": record["page_number"],
@@ -160,8 +163,9 @@ class TranslationCheckpointRecorder:
         if not record:
             return
         if text is None:
-            record["status"] = "skipped"
-            self.skipped += 1
+            if record["status"] != "skipped":
+                record["status"] = "skipped"
+                self.skipped += 1
             return
         record["preprocessed_input"] = text
         batch = getattr(self.local, "batch", None)
@@ -182,6 +186,14 @@ class TranslationCheckpointRecorder:
             record["status"] = "invalid"
             self.failed += 1
             return
+        unchanged_prose = _is_unchanged_english_prose(
+            validation_source, translated_text, layout_label=record.get("layout_label")
+        )
+        preserve_official_title = record.get("layout_label") == "title" and unchanged_prose
+        if unchanged_prose and not preserve_official_title:
+            record["status"] = "unchanged_prose"
+            self.failed += 1
+            return
         if len(source) > 65_536 or len(translated_text) > 65_536:
             record["status"] = "oversized"
             self.failed += 1
@@ -192,7 +204,7 @@ class TranslationCheckpointRecorder:
         key = self.key_for(record, context_hash)
         translated_sha = hashlib.sha256(translated_text.encode()).hexdigest()
         with self.lock:
-            record["status"] = "completed"
+            record["status"] = "preserved" if preserve_official_title else "completed"
             self.completed += 1
             _emit(
                 {
@@ -213,12 +225,12 @@ class TranslationCheckpointRecorder:
                         "glossary_sha256": self.glossary_sha256,
                         "translated_text": translated_text,
                         "translated_sha256": translated_sha,
-                        "status": "validated",
+                        "status": "preserved" if preserve_official_title else "validated",
                     },
                 }
             )
 
-    def finish(self) -> dict[str, int]:
+    def finish(self) -> dict[str, Any]:
         for record in self.records.values():
             if record["status"] == "pending":
                 record["status"] = "untranslated"
@@ -230,9 +242,110 @@ class TranslationCheckpointRecorder:
             "failed": self.failed,
         }
 
+    def failure_reasons(self) -> dict[str, int]:
+        reasons: dict[str, int] = {}
+        for record in self.records.values():
+            status = record["status"]
+            if status in {"invalid", "unchanged_prose", "oversized", "untranslated"}:
+                reasons[status] = reasons.get(status, 0) + 1
+        return reasons
+
+    def failure_units(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "page_number": record["page_number"],
+                "ordinal": record["ordinal"],
+                "status": record["status"],
+                "source_chars": len(record["source_quote"]),
+                "layout_label": record["layout_label"],
+            }
+            for record in self.records.values()
+            if record["status"] in {"invalid", "unchanged_prose", "oversized", "untranslated"}
+        ]
+
 
 def _protected_tokens(text: str) -> tuple[str, ...]:
     return tuple(_PROTECTED_TOKEN.findall(text))
+
+
+_ENGLISH_FUNCTION_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "can",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "our",
+        "that",
+        "the",
+        "their",
+        "this",
+        "these",
+        "those",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "we",
+        "you",
+    }
+)
+_NON_PROSE_LAYOUT_LABELS = frozenset({"code", "equation", "formula", "math"})
+_PROSE_LAYOUT_LABELS = frozenset({"caption", "heading", "text", "title"})
+
+
+def _is_unchanged_english_prose(
+    source: str, translated: str, *, layout_label: str | None = None
+) -> bool:
+    """Catch obvious unchanged English sentences, not equations or short terms.
+
+    This deliberately uses a conservative language heuristic rather than a new
+    language-detection dependency. BabelDOC already marks formula-only units as
+    skipped; the word/function-word threshold guards mixed technical content.
+    """
+    if layout_label and layout_label.casefold().strip() in _NON_PROSE_LAYOUT_LABELS:
+        return False
+
+    def normalize(text: str) -> str:
+        text = _PROTECTED_TOKEN.sub(" ", text)
+        text = re.sub(r"\\[A-Za-z]+(?:\{[^}]*\})?", " ", text)
+        return " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+
+    source_normalized = normalize(source)
+    if not source_normalized or source_normalized != normalize(translated):
+        return False
+    words = source_normalized.split()
+    if len(words) < 4:
+        return False
+    function_word_count = sum(word in _ENGLISH_FUNCTION_WORDS for word in words)
+    prose_label = (layout_label or "").casefold().strip() in _PROSE_LAYOUT_LABELS
+    acronym_count = len(re.findall(r"\b[A-Z][A-Z0-9-]{1,}\b", source))
+    if acronym_count >= 2 and function_word_count < 2:
+        return False
+    if function_word_count < 2 and not (prose_label and function_word_count >= 1):
+        return False
+    # Obvious equations/markup-rich fragments should remain eligible unchanged.
+    math_markers = len(re.findall(r"[=^_{}]", source)) + len(
+        re.findall(r"\\(?:frac|sum|int|sqrt|begin)\b", source)
+    )
+    return math_markers < 2
 
 
 def _apply_first_occurrence_terms(translated_text: str, terms: list[dict[str, str]]) -> str:
@@ -345,6 +458,20 @@ def _preflight_offline_assets(layout_model: Path) -> None:
     _check_layout_model(layout_model)
     try:
         from babeldoc.assets import assets
+        from babeldoc.assets.embedding_assets_metadata import TIKTOKEN_CACHES
+
+        asset_root = Path(
+            os.environ.get("MYRA_TRANSLATION_ASSET_DIR", "/tmp/.cache/babeldoc")
+        ).resolve()
+        original_cache_path = assets.get_cache_file_path
+
+        def offline_cache_path(filename: str, sub_folder: str | None = None) -> Path:
+            if sub_folder in {"models", "fonts", "cmap", "tiktoken"}:
+                return asset_root / sub_folder / filename
+            return original_cache_path(filename, sub_folder)
+
+        assets.get_cache_file_path = offline_cache_path
+        os.environ["TIKTOKEN_CACHE_DIR"] = str(asset_root / "tiktoken")
 
         required_fonts = assets.get_font_family("Vietnamese")
         font_names = {
@@ -358,6 +485,10 @@ def _preflight_offline_assets(layout_model: Path) -> None:
                 raise SafeEngineError("FONT_ASSETS_UNAVAILABLE")
             cached_path = assets.get_cache_file_path(font_name, "fonts")
             if not assets.verify_file(cached_path, metadata["sha3_256"]):
+                raise SafeEngineError("FONT_ASSETS_UNAVAILABLE")
+        for cache_name, expected_hash in TIKTOKEN_CACHES.items():
+            cache_path = assets.get_cache_file_path(cache_name, "tiktoken")
+            if not assets.verify_file(cache_path, expected_hash):
                 raise SafeEngineError("FONT_ASSETS_UNAVAILABLE")
     except SafeEngineError:
         raise
@@ -624,7 +755,7 @@ async def _translate(request: dict[str, Any]) -> None:
     )
     completion: dict[str, Any] | None = None
     with _checkpoint_hooks(ILTranslator, ILTranslatorLLMOnly, recorder):
-        async for event in high_level.async_translate(config):
+        async for event in _render_with_progress(high_level, config):
             if event.get("type") == "error":
                 # Do not forward BabelDOC's error text; it may contain paper text.
                 raise SafeEngineError("ENGINE_FAILURE")
@@ -663,6 +794,41 @@ async def _translate(request: dict[str, Any]) -> None:
     if completion is None:
         raise SafeEngineError("ENGINE_FAILURE")
     _emit(completion)
+
+
+async def _render_with_progress(high_level: Any, config: Any):
+    """Run BabelDOC's synchronous renderer without its hanging async wrapper.
+
+    BabelDOC 0.6.2's ``async_translate`` can yield its terminal ``finish`` event
+    and then wait forever on an internal event. The supported ``do_translate``
+    entry point performs the same render; this adapter forwards its documented
+    progress callbacks while keeping the engine subprocess responsive to the
+    parent worker's deadline/cancellation handling.
+    """
+    from babeldoc.progress_monitor import ProgressMonitor
+
+    loop = asyncio.get_running_loop()
+    progress: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    def on_progress(**event: Any) -> None:
+        loop.call_soon_threadsafe(progress.put_nowait, event)
+
+    monitor = ProgressMonitor(
+        high_level.get_translation_stage(config),
+        progress_change_callback=on_progress,
+        report_interval=config.report_interval,
+    )
+    future = loop.run_in_executor(None, high_level.do_translate, monitor, config)
+    while not future.done():
+        try:
+            event = await asyncio.wait_for(progress.get(), timeout=0.2)
+        except TimeoutError:
+            continue
+        yield event
+    while not progress.empty():
+        yield progress.get_nowait()
+    result = await future
+    yield {"type": "finish", "translate_result": result}
 
 
 @contextmanager
@@ -755,7 +921,14 @@ def _checkpoint_hooks(
             return original_whole(self, docs)
         finally:
             counts = recorder.finish()
-            _emit({"type": "segment_summary", **counts})
+            _emit(
+                {
+                    "type": "segment_summary",
+                    **counts,
+                    "failure_reasons": recorder.failure_reasons(),
+                    "failure_units": recorder.failure_units(),
+                }
+            )
 
     il_translator.pre_translate_paragraph = pre_translate
     il_translator.post_translate_paragraph = post_translate

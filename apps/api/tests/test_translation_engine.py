@@ -84,6 +84,39 @@ def test_protocol_rejects_completion_with_untranslated_segments() -> None:
         _safe_event(event)
 
 
+def test_protocol_keeps_only_safe_failure_unit_metadata() -> None:
+    event = _safe_event(
+        {
+            "type": "segment_summary",
+            "total": 2,
+            "completed": 0,
+            "skipped": 0,
+            "failed": 2,
+            "failure_reasons": {"unchanged_prose": 1, "untranslated": 1},
+            "failure_units": [
+                {
+                    "page_number": 2,
+                    "ordinal": 4,
+                    "status": "unchanged_prose",
+                    "source_chars": 84,
+                    "layout_label": "text",
+                    "source_quote": "This source content must never enter the protocol.",
+                }
+            ],
+        }
+    )
+    assert event["failure_reasons"] == {"unchanged_prose": 1, "untranslated": 1}
+    assert event["failure_units"] == [
+        {
+            "page_number": 2,
+            "ordinal": 4,
+            "status": "unchanged_prose",
+            "source_chars": 84,
+            "layout_label": "text",
+        }
+    ]
+
+
 def test_checkpoint_recorder_emits_page_quote_offsets_and_hashes(monkeypatch) -> None:
     output = io.StringIO()
     monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
@@ -132,6 +165,109 @@ def test_checkpoint_recorder_rejects_dropped_protected_placeholders(monkeypatch)
 
     assert output.getvalue() == ""
     assert recorder.finish()["failed"] == 1
+
+
+def test_checkpoint_recorder_rejects_obvious_unchanged_english_prose(monkeypatch) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
+    text = "Attention Is All You Need for sequence modeling."
+    paragraph = _paragraph(text)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, text)
+
+    recorder.complete(record, text)
+
+    assert record["status"] == "unchanged_prose"
+    assert output.getvalue() == ""
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
+    assert recorder.failure_reasons() == {"unchanged_prose": 1}
+
+
+def test_checkpoint_recorder_preserves_unchanged_official_title(monkeypatch) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
+    text = "Attention Is All You Need for sequence modeling."
+    paragraph = _paragraph(text)
+    paragraph.layout_label = "title"
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, text)
+    recorder.complete(record, text)
+    counts = recorder.finish()
+    checkpoint = json.loads(output.getvalue().splitlines()[0])
+    assert counts == {"total": 1, "completed": 1, "skipped": 0, "failed": 0}
+    assert checkpoint["segment"]["status"] == "preserved"
+
+
+@pytest.mark.parametrize("text", ["E=mc^2", "API and SDK"])
+def test_checkpoint_recorder_allows_unchanged_equations_and_short_terms(
+    monkeypatch, text: str
+) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
+    paragraph = _paragraph(text)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, text)
+
+    recorder.complete(record, text)
+
+    assert record["status"] == "completed"
+    assert recorder.finish()["failed"] == 0
+
+
+def test_checkpoint_recorder_skips_short_abandoned_layout_fragment() -> None:
+    paragraph = _paragraph("1")
+    paragraph.layout_label = "abandon"
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
+
+
+def test_checkpoint_recorder_preserves_babeldoc_intentionally_skipped_units() -> None:
+    paragraph = _paragraph("Only an equation")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    recorder.note_preprocessed(paragraph, None)
+
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
 
 
 def test_first_glossary_occurrence_includes_english_and_preferred_vietnamese() -> None:

@@ -19,6 +19,7 @@ from app.crud.translation import (
 from app.db.models import Paper, PaperPage
 from app.db.session import get_db
 from app.ingestion.parser import find_verbatim_span
+from app.observability.telemetry import get_telemetry
 from app.schemas.translation import (
     TranslationCreate,
     TranslationGlossaryEntry,
@@ -87,21 +88,41 @@ def submit_translation(
     payload: TranslationCreate,
     response: Response,
     idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
+    test_run: bool = Header(default=False, alias="X-MyRA-Test-Run"),
     db: Session = Depends(get_db),
 ) -> TranslationResponse:
     key = payload.idempotency_key or idempotency_header or uuid4().hex
-    try:
-        translation, created = create_translation(
-            db,
-            project_id=payload.project_id,
-            paper_id=paper_id,
-            idempotency_key=key,
-            acknowledge_external_processing=payload.acknowledge_external_processing,
-        )
-    except TranslationConflict as err:
-        message = str(err)
-        code = 404 if "not found" in message.lower() else 409
-        raise HTTPException(status_code=code, detail=message) from err
+    with get_telemetry().operation(
+        "translation.request",
+        input={"project_id": str(payload.project_id), "paper_id": str(paper_id)},
+        metadata={
+            "test_run": test_run,
+            "language_pair": "en-vi",
+            "provider_policy": "siliconflowfree-v1",
+        },
+    ) as observation:
+        try:
+            translation, created = create_translation(
+                db,
+                project_id=payload.project_id,
+                paper_id=paper_id,
+                idempotency_key=key,
+                acknowledge_external_processing=payload.acknowledge_external_processing,
+            )
+        except TranslationConflict as err:
+            message = str(err)
+            code = 404 if "not found" in message.lower() else 409
+            if observation is not None:
+                observation.update(output={"outcome": "rejected", "http_status": code})
+            raise HTTPException(status_code=code, detail=message) from err
+        if observation is not None:
+            observation.update(
+                output={
+                    "translation_id": str(translation.id),
+                    "outcome": "created" if created else "existing",
+                    "status": translation.status,
+                }
+            )
     response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
     return _response(translation)
 

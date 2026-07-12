@@ -84,17 +84,29 @@ class BabelDocTranslationProcessor:
             "MYRA_TRANSLATION_ENGINE_RUNNER", _ENGINE_RUNNER
         )
         self.layout_model = layout_model or os.getenv(
-            "MYRA_TRANSLATION_LAYOUT_MODEL", "/opt/myra-translation/assets/doclayout.onnx"
+            "MYRA_TRANSLATION_LAYOUT_MODEL",
+            "/tmp/.cache/babeldoc/models/doclayout_yolo_docstructbench_imgsz1024.onnx",
         )
 
-    def _engine(self) -> TranslationEngineProcess:
+    def _engine(self, *, home_dir: Path) -> TranslationEngineProcess:
         if self.engine_factory:
             return self.engine_factory()
         return TranslationEngineProcess(
             python=self.engine_python,
             runner=self.engine_runner,
-            env={"PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": "/tmp"},
+            env={
+                "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HOME": str(home_dir),
+                "MYRA_TRANSLATION_ASSET_DIR": "/tmp/.cache/babeldoc",
+            },
         )
+
+    @staticmethod
+    def _trace_metadata(**fields: Any) -> dict[str, Any]:
+        return {
+            "test_run": os.getenv("MYRA_TRANSLATION_TEST_RUN", "false").lower() == "true",
+            **fields,
+        }
 
     def _existing_checkpoints(self, job: TranslationJob) -> list[dict[str, str]]:
         with self.session_factory() as db:
@@ -130,6 +142,14 @@ class BabelDocTranslationProcessor:
         ):
             raise TranslationProcessingError(
                 "ENGINE_PROTOCOL_ERROR", "A translation unit failed validation.", retryable=False
+            )
+        if len(_normalize_text(source_quote)) >= 24 and _normalize_text(
+            source_quote
+        ) == _normalize_text(translated_text):
+            raise TranslationProcessingError(
+                "ENGINE_INCOMPLETE",
+                "A required prose segment was returned without translation.",
+                retryable=False,
             )
         with self.session_factory() as db:
             saved = save_translation_segment(
@@ -196,11 +216,16 @@ class BabelDocTranslationProcessor:
             )
         translated_rows = [row for row in rows if row.status == "VALIDATED"]
         normalized_pdf_text = _normalize_text(text)
-        if not translated_rows or not any(
-            len(_normalize_text(row.translated_text)) >= 12
-            and _normalize_text(row.translated_text) in normalized_pdf_text
-            for row in translated_rows
-        ):
+        meaningful_rows = [
+            row for row in translated_rows if len(_normalize_text(row.translated_text)) >= 24
+        ]
+        matched_rows = [
+            row
+            for row in meaningful_rows
+            if _normalize_text(row.translated_text) in normalized_pdf_text
+        ]
+        minimum_matches = max(1, (len(meaningful_rows) * 3 + 4) // 5)
+        if not meaningful_rows or len(matched_rows) < minimum_matches:
             raise TranslationProcessingError(
                 "OUTPUT_TRANSLATION_NOT_FOUND",
                 "The translated PDF did not contain a verified translated text segment.",
@@ -235,10 +260,14 @@ class BabelDocTranslationProcessor:
             working_dir = root / "working"
             output_dir.mkdir()
             working_dir.mkdir()
+            engine_home = working_dir / "engine-home"
+            engine_home.mkdir()
 
             with telemetry.stage(
                 "translation.source_download",
-                metadata={"translation_id": str(job.id), "attempt": job.attempt_count},
+                metadata=self._trace_metadata(
+                    translation_id=str(job.id), attempt=job.attempt_count
+                ),
             ) as observation:
                 try:
                     source = await storage.get(_storage_key(job.source_storage_path))
@@ -273,10 +302,30 @@ class BabelDocTranslationProcessor:
             }
 
             async def on_engine_progress(event: dict[str, Any]) -> None:
+                if event.get("type") == "segment_summary":
+                    get_telemetry().event(
+                        "translation.validation",
+                        metadata=self._trace_metadata(
+                            translation_id=str(job.id),
+                            failure_reasons=event.get("failure_reasons", {}),
+                            failure_units=event.get("failure_units", []),
+                        ),
+                        output={
+                            "outcome": "complete" if event.get("failed") == 0 else "partial",
+                            "total": event.get("total"),
+                            "completed": event.get("completed"),
+                            "skipped": event.get("skipped"),
+                            "failed": event.get("failed"),
+                        },
+                    )
+                    on_progress(
+                        "translation",
+                        completed_units=event.get("completed"),
+                        total_units=event.get("total"),
+                    )
+                    return
                 on_progress(
                     event.get("stage", "translation"),
-                    completed_units=event.get("current"),
-                    total_units=event.get("total"),
                 )
 
             async def on_checkpoint(segment: dict[str, Any]) -> None:
@@ -284,25 +333,27 @@ class BabelDocTranslationProcessor:
 
             with telemetry.stage(
                 "translation.layout_analysis",
-                metadata={"translation_id": str(job.id), "source_pages": job.source_page_count},
+                metadata=self._trace_metadata(
+                    translation_id=str(job.id), source_pages=job.source_page_count
+                ),
             ):
                 on_progress("layout_analysis")
             with telemetry.stage(
                 "translation.translate",
                 input={"glossary_terms": len(job.glossary_snapshot)},
-                metadata={
-                    "translation_id": str(job.id),
-                    "engine_version": "2.9.0",
-                    "babeldoc_version": "0.6.2",
-                    "provider_policy": "siliconflowfree-v1",
-                    "documented_model": "THUDM/GLM-4-9B-0414",
-                    "provider_reported_model": None,
-                    "provider_usage": None,
-                    "checkpoint_hits": len(checkpoints),
-                },
+                metadata=self._trace_metadata(
+                    translation_id=str(job.id),
+                    engine_version="2.9.0",
+                    babeldoc_version="0.6.2",
+                    provider_policy="siliconflowfree-v1",
+                    documented_model="THUDM/GLM-4-9B-0414",
+                    provider_reported_model=None,
+                    provider_usage=None,
+                    checkpoint_hits=len(checkpoints),
+                ),
             ):
                 try:
-                    completion = await self._engine().run(
+                    completion = await self._engine(home_dir=engine_home).run(
                         request,
                         on_progress=on_engine_progress,
                         on_checkpoint=on_checkpoint,
@@ -339,7 +390,7 @@ class BabelDocTranslationProcessor:
                 )
             with telemetry.stage(
                 "translation.validation",
-                metadata={"translation_id": str(job.id), "segment_counts": counts},
+                metadata=self._trace_metadata(translation_id=str(job.id), segment_counts=counts),
             ):
                 output, source_map = await self._validate_pdf(output_path, job)
             if not self._source_is_current(job):
@@ -363,7 +414,7 @@ class BabelDocTranslationProcessor:
             )
             with telemetry.stage(
                 "translation.publication",
-                metadata={"translation_id": str(job.id), "output_sha256": output_sha},
+                metadata=self._trace_metadata(translation_id=str(job.id), output_sha256=output_sha),
             ):
                 try:
                     stored_path = await storage.put_stream(

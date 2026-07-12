@@ -35,7 +35,15 @@ CheckpointCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 def _minimal_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """Pass only runtime paths and locale settings, never the application's secrets."""
-    allowed = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "HF_HOME"}
+    allowed = {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "HF_HOME",
+        "MYRA_TRANSLATION_ASSET_DIR",
+    }
     source = dict(os.environ)
     if extra:
         source.update(extra)
@@ -115,7 +123,44 @@ def _safe_event(value: Any) -> dict[str, Any]:
         counts = {name: value.get(name) for name in ("total", "completed", "skipped", "failed")}
         if not all(isinstance(item, int) and item >= 0 for item in counts.values()):
             raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
-        return {"type": "segment_summary", **counts}
+        reasons = value.get("failure_reasons", {})
+        if not isinstance(reasons, dict) or not all(
+            key in {"invalid", "unchanged_prose", "oversized", "untranslated"}
+            and isinstance(count, int)
+            and count >= 0
+            for key, count in reasons.items()
+        ):
+            raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
+        units = value.get("failure_units", [])
+        if not isinstance(units, list) or any(
+            not isinstance(unit, dict)
+            or not isinstance(unit.get("page_number"), int)
+            or not isinstance(unit.get("ordinal"), int)
+            or not isinstance(unit.get("source_chars"), int)
+            or unit.get("status") not in {"invalid", "unchanged_prose", "oversized", "untranslated"}
+            or (unit.get("layout_label") is not None and not isinstance(unit["layout_label"], str))
+            for unit in units
+        ):
+            raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
+        return {
+            "type": "segment_summary",
+            **counts,
+            "failure_reasons": reasons,
+            "failure_units": [
+                {
+                    "page_number": unit["page_number"],
+                    "ordinal": unit["ordinal"],
+                    "status": unit["status"],
+                    "source_chars": unit["source_chars"],
+                    "layout_label": (
+                        unit["layout_label"][:100]
+                        if isinstance(unit.get("layout_label"), str)
+                        else None
+                    ),
+                }
+                for unit in units
+            ],
+        }
     if event_type == "error":
         code = value.get("code")
         allowed_codes = {
