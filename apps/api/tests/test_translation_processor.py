@@ -177,8 +177,9 @@ def test_processor_rejects_incomplete_engine_output(database, tmp_path):
     async def process():
         await processor.process(job, on_progress=lambda *args, **kwargs: None)
 
-    with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE"):
+    with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE") as error:
         asyncio.run(process())
+    assert error.value.retryable is True
 
 
 def test_processor_rejects_unchanged_required_prose_checkpoint(database):

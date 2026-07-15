@@ -20,6 +20,9 @@ _SAFE_EXTRA_FIELDS = frozenset(
         "evidence_count",
         "expected_heads",
         "failure_class",
+        "failure_count",
+        "failure_reasons",
+        "failure_units",
         "job_id",
         "latency_ms",
         "model_revision",
@@ -35,6 +38,10 @@ _SAFE_EXTRA_FIELDS = frozenset(
         "retry_count",
         "stage",
         "token_count_estimate",
+        "total_units",
+        "completed_units",
+        "skipped_units",
+        "translation_id",
         "worker_id",
     }
 )

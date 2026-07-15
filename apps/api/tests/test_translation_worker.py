@@ -136,6 +136,15 @@ def test_once_mode_claims_and_completes_at_most_one_job(database):
     assert asyncio.run(worker.process_one()) is False
 
 
+def test_module_entrypoint_uses_canonical_worker_main(monkeypatch):
+    from app import translation_worker
+
+    calls = []
+    monkeypatch.setattr(translation_worker, "main", lambda: calls.append("canonical"))
+    translation_worker._run_canonical_main()
+    assert calls == ["canonical"]
+
+
 def test_heartbeat_lease_loss_cancels_active_processor(database):
     processor = BlockingProcessor()
     worker = TranslationWorker(
@@ -192,6 +201,10 @@ def test_unexpected_exception_is_redacted_from_state_and_logs(database, caplog):
     assert "provider credentials" not in caplog.text
     assert "source quote" not in caplog.text
     assert "Traceback" not in caplog.text
+    assert "translation_failed: RuntimeError" in caplog.text
+    assert any(
+        getattr(record, "failure_class", None) == "RuntimeError" for record in caplog.records
+    )
 
 
 def test_stale_attempt_cannot_publish_after_cancellation(database):

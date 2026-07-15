@@ -121,6 +121,36 @@ def test_log_formatter_keeps_safe_metrics_and_context_only() -> None:
     assert "prompt" not in formatted
 
 
+def test_log_formatter_keeps_safe_translation_validation_summary_only() -> None:
+    record = logging.LogRecord(
+        "myra.translation.processor",
+        logging.INFO,
+        __file__,
+        1,
+        "translation_segment_validation",
+        (),
+        None,
+    )
+    record.stage = "validation"
+    record.total_units = 31
+    record.completed_units = 29
+    record.skipped_units = 2
+    record.failure_count = 0
+    record.failure_reasons = {}
+    record.failure_units = []
+    record.translation_id = "translation-test-id"
+    record.source_quote = "private research text"
+
+    formatted = json.loads(JsonFormatter().format(record))
+
+    assert formatted["total_units"] == 31
+    assert formatted["completed_units"] == 29
+    assert formatted["failure_count"] == 0
+    assert "failure_units" in formatted
+    assert formatted["translation_id"] == "translation-test-id"
+    assert "source_quote" not in formatted
+
+
 def test_log_formatter_redacts_sensitive_text() -> None:
     record = logging.LogRecord(
         "myra.api",

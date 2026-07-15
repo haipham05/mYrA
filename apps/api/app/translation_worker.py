@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
 
+from app.config import Settings
 from app.crud.translation import (
     claim_next_translation,
     complete_translation,
@@ -28,6 +29,7 @@ from app.crud.translation import (
 )
 from app.db.models import TranslationDocument
 from app.db.session import SessionLocal
+from app.logging import configure_logging
 from app.observability.telemetry import get_telemetry
 
 logger = logging.getLogger("myra.translation_worker")
@@ -310,7 +312,7 @@ class TranslationWorker:
                 "translation_failed",
                 extra={"translation_id": str(job.id), "error_code": exc.code},
             )
-        except Exception:
+        except Exception as exc:
             self._fail(
                 job,
                 code="TRANSLATION_FAILED",
@@ -319,7 +321,11 @@ class TranslationWorker:
             )
             # Deliberately omit exception text and traceback: engine/provider
             # exceptions can contain document text, URLs, or credentials.
-            logger.error("translation_failed", extra={"translation_id": str(job.id)})
+            logger.error(
+                "translation_failed: %s",
+                type(exc).__name__,
+                extra={"translation_id": str(job.id), "failure_class": type(exc).__name__},
+            )
         finally:
             heartbeat.cancel()
             self._active_processing = None
@@ -396,6 +402,8 @@ class TranslationWorker:
 
 
 async def run_translation_worker(*, once: bool = False, poll_interval: float = 2.0) -> None:
+    settings = Settings.from_environment()
+    configure_logging(settings.log_level)
     worker = TranslationWorker(poll_interval=poll_interval)
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -416,5 +424,12 @@ def main() -> None:
     asyncio.run(run_translation_worker(once=args.once, poll_interval=args.poll_interval))
 
 
+def _run_canonical_main() -> None:
+    """Avoid duplicate exception classes when this module is executed as a module."""
+    from app.translation_worker import main as canonical_main
+
+    canonical_main()
+
+
 if __name__ == "__main__":
-    main()
+    _run_canonical_main()

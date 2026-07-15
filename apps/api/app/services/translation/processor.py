@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import logging
 import os
 import re
 import tempfile
@@ -32,6 +33,7 @@ from app.translation_worker import (
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ENGINE_PYTHON = "/opt/myra-translation/.venv/bin/python"
 _ENGINE_RUNNER = "/app/app/services/translation/engine_runner.py"
+logger = logging.getLogger("myra.translation.processor")
 
 
 def _storage_key(path: str) -> str:
@@ -303,6 +305,18 @@ class BabelDocTranslationProcessor:
 
             async def on_engine_progress(event: dict[str, Any]) -> None:
                 if event.get("type") == "segment_summary":
+                    logger.info(
+                        "translation_segment_validation",
+                        extra={
+                            "stage": "validation",
+                            "total_units": event.get("total"),
+                            "completed_units": event.get("completed"),
+                            "skipped_units": event.get("skipped"),
+                            "failure_count": event.get("failed"),
+                            "failure_reasons": event.get("failure_reasons", {}),
+                            "failure_units": event.get("failure_units", [])[:20],
+                        },
+                    )
                     get_telemetry().event(
                         "translation.validation",
                         metadata=self._trace_metadata(
@@ -380,7 +394,8 @@ class BabelDocTranslationProcessor:
                 raise TranslationProcessingError(
                     completion.get("failure_code") or "ENGINE_INCOMPLETE",
                     "Some document text could not be translated safely.",
-                    retryable=completion.get("failure_code") == "PROVIDER_RATE_LIMITED",
+                    retryable=completion.get("failure_code") == "PROVIDER_RATE_LIMITED"
+                    or counts.get("failed", 0) > 0,
                 )
 
             output_path = Path(completion["output_pdf"]).resolve()
