@@ -187,7 +187,7 @@ def test_processor_rejects_unchanged_required_prose_checkpoint(database):
     job = _create_processing_job(database, source)
     processor = BabelDocTranslationProcessor(session_factory=database)
     unchanged = "This required scientific prose must not remain in English."
-    with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE"):
+    with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE") as error:
         processor._persist_checkpoint(
             job,
             {
@@ -201,3 +201,107 @@ def test_processor_rejects_unchanged_required_prose_checkpoint(database):
                 "status": "validated",
             },
         )
+    assert error.value.retryable is True
+
+
+def test_processor_persists_explicitly_preserved_official_title(database):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    processor = BabelDocTranslationProcessor(session_factory=database)
+    title = "Attention Is All You Need for Sequence Modeling"
+    title_hash = hashlib.sha256(title.encode()).hexdigest()
+
+    processor._persist_checkpoint(
+        job,
+        {
+            "segment_key": hashlib.sha256(b"preserved-title").hexdigest(),
+            "page_number": 1,
+            "ordinal": 0,
+            "source_quote": title,
+            "source_sha256": title_hash,
+            "translated_text": title,
+            "translated_sha256": title_hash,
+            "status": "preserved",
+            "layout_label": "title",
+        },
+    )
+
+    with database() as db:
+        saved = db.scalars(
+            select(TranslationSegment).where(TranslationSegment.translation_id == job.id)
+        ).one()
+    assert saved.status == "PRESERVED"
+    assert saved.translated_text == title
+
+
+def test_processor_rejects_changed_checkpoint_mislabeled_as_preserved_title(database):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    processor = BabelDocTranslationProcessor(session_factory=database)
+    title = "Attention Is All You Need for Sequence Modeling"
+    translated = "Một tiêu đề đã được thay đổi"
+
+    with pytest.raises(TranslationProcessingError, match="ENGINE_PROTOCOL_ERROR"):
+        processor._persist_checkpoint(
+            job,
+            {
+                "segment_key": hashlib.sha256(b"changed-preserved-title").hexdigest(),
+                "page_number": 1,
+                "ordinal": 0,
+                "source_quote": title,
+                "source_sha256": hashlib.sha256(title.encode()).hexdigest(),
+                "translated_text": translated,
+                "translated_sha256": hashlib.sha256(translated.encode()).hexdigest(),
+                "status": "preserved",
+                "layout_label": "title",
+            },
+        )
+
+
+def test_processor_withholds_unchanged_checkpoint_until_document_finishes(database, tmp_path):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    storage = MemoryStorage()
+    asyncio.run(storage.put("papers/fixture.pdf", source))
+    unchanged = "This required scientific prose remains untranslated."
+
+    class UnchangedEngine:
+        async def run(self, request, *, on_progress, on_checkpoint):
+            await on_checkpoint(
+                {
+                    "segment_key": hashlib.sha256(b"unchanged").hexdigest(),
+                    "page_number": 1,
+                    "ordinal": 0,
+                    "source_quote": unchanged,
+                    "source_sha256": hashlib.sha256(unchanged.encode()).hexdigest(),
+                    "translated_text": unchanged,
+                    "translated_sha256": hashlib.sha256(unchanged.encode()).hexdigest(),
+                    "status": "validated",
+                }
+            )
+            output = Path(request["output_dir"]) / "output.pdf"
+            shutil.copyfile(FIXTURE_PDF, output)
+            return {
+                "output_pdf": str(output),
+                "segment_counts": {"total": 1, "completed": 1, "skipped": 0, "failed": 0},
+                "failure_code": None,
+            }
+
+    processor = BabelDocTranslationProcessor(
+        storage=storage,
+        session_factory=database,
+        engine_factory=UnchangedEngine,
+        layout_model=str(tmp_path / "unused-layout.onnx"),
+    )
+
+    async def process():
+        await processor.process(job, on_progress=lambda *args, **kwargs: None)
+
+    with pytest.raises(TranslationProcessingError, match="ENGINE_INCOMPLETE") as error:
+        asyncio.run(process())
+    assert error.value.retryable is True
+    with database() as db:
+        saved = db.scalars(
+            select(TranslationSegment).where(TranslationSegment.translation_id == job.id)
+        ).all()
+    assert saved == []

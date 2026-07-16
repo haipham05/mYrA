@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import json
+import logging
 from collections.abc import Generator
 
 import pytest
@@ -12,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 from app.crud.translation import cancel_translation
 from app.db.base import Base
 from app.db.models import Paper, Project, TranslationDocument
+from app.logging import JsonFormatter
 from app.translation_worker import (
     TranslationJob,
     TranslationProcessingError,
@@ -188,23 +192,37 @@ def test_processor_failures_store_only_safe_classification(database, retryable):
     assert record.output_storage_path is None
 
 
-def test_unexpected_exception_is_redacted_from_state_and_logs(database, caplog):
+def test_unexpected_exception_is_redacted_from_state_and_logs(database, monkeypatch):
+    previous_disable_level = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    monkeypatch.setattr(logging.root.manager, "disable", previous_disable_level)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    logger = logging.getLogger("myra.translation_worker")
+    monkeypatch.setattr(logger, "disabled", False)
+    monkeypatch.setattr(logger, "level", logging.DEBUG)
+    logger.addHandler(handler)
     worker = TranslationWorker(
         UnexpectedFailingProcessor(), session_factory=database, worker_id="test-worker"
     )
 
-    asyncio.run(worker.process_one())
+    try:
+        asyncio.run(worker.process_one())
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
 
     record = _translation(database)
+    logs = [json.loads(line) for line in stream.getvalue().splitlines()]
+    log = next(item for item in logs if item["message"].startswith("translation_failed"))
     assert record.error_code == "TRANSLATION_FAILED"
     assert "source quote" not in (record.error_message or "")
-    assert "provider credentials" not in caplog.text
-    assert "source quote" not in caplog.text
-    assert "Traceback" not in caplog.text
-    assert "translation_failed: RuntimeError" in caplog.text
-    assert any(
-        getattr(record, "failure_class", None) == "RuntimeError" for record in caplog.records
-    )
+    assert "provider credentials" not in stream.getvalue()
+    assert "source quote" not in stream.getvalue()
+    assert "Traceback" not in stream.getvalue()
+    assert log["message"] == "translation_failed: RuntimeError"
+    assert log["failure_class"] == "RuntimeError"
 
 
 def test_stale_attempt_cannot_publish_after_cancellation(database):

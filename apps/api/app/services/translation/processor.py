@@ -134,8 +134,14 @@ class BabelDocTranslationProcessor:
     def _persist_checkpoint(self, job: TranslationJob, segment: dict[str, Any]) -> None:
         source_quote = segment["source_quote"]
         translated_text = segment["translated_text"]
+        preserved_title = (
+            segment.get("status") == "preserved"
+            and segment.get("layout_label") == "title"
+            and _normalize_text(source_quote) == _normalize_text(translated_text)
+        )
         if (
             segment.get("status") not in {"validated", "preserved"}
+            or (segment.get("status") == "preserved" and not preserved_title)
             or not _SHA256.fullmatch(segment["segment_key"])
             or not _SHA256.fullmatch(segment["source_sha256"])
             or not _SHA256.fullmatch(segment["translated_sha256"])
@@ -145,13 +151,15 @@ class BabelDocTranslationProcessor:
             raise TranslationProcessingError(
                 "ENGINE_PROTOCOL_ERROR", "A translation unit failed validation.", retryable=False
             )
-        if len(_normalize_text(source_quote)) >= 24 and _normalize_text(
-            source_quote
-        ) == _normalize_text(translated_text):
+        if (
+            not preserved_title
+            and len(_normalize_text(source_quote)) >= 24
+            and _normalize_text(source_quote) == _normalize_text(translated_text)
+        ):
             raise TranslationProcessingError(
                 "ENGINE_INCOMPLETE",
                 "A required prose segment was returned without translation.",
-                retryable=False,
+                retryable=True,
             )
         with self.session_factory() as db:
             saved = save_translation_segment(
@@ -166,7 +174,7 @@ class BabelDocTranslationProcessor:
                 source_quote=source_quote,
                 translated_text=translated_text,
                 translated_text_hash=segment["translated_sha256"],
-                status="PRESERVED" if segment["status"] == "preserved" else "VALIDATED",
+                status="PRESERVED" if preserved_title else "VALIDATED",
             )
         if not saved:
             raise TranslationProcessingError(
@@ -314,6 +322,7 @@ class BabelDocTranslationProcessor:
                             "skipped_units": event.get("skipped"),
                             "failure_count": event.get("failed"),
                             "failure_reasons": event.get("failure_reasons", {}),
+                            "skip_reasons": event.get("skip_reasons", {}),
                             "failure_units": event.get("failure_units", [])[:20],
                         },
                     )
@@ -322,6 +331,7 @@ class BabelDocTranslationProcessor:
                         metadata=self._trace_metadata(
                             translation_id=str(job.id),
                             failure_reasons=event.get("failure_reasons", {}),
+                            skip_reasons=event.get("skip_reasons", {}),
                             failure_units=event.get("failure_units", []),
                         ),
                         output={
@@ -342,7 +352,27 @@ class BabelDocTranslationProcessor:
                     event.get("stage", "translation"),
                 )
 
+            rejected_prose_units: list[dict[str, int | str]] = []
+
             async def on_checkpoint(segment: dict[str, Any]) -> None:
+                source_quote = segment.get("source_quote")
+                translated_text = segment.get("translated_text")
+                if (
+                    segment.get("status") != "preserved"
+                    and isinstance(source_quote, str)
+                    and isinstance(translated_text, str)
+                    and len(_normalize_text(source_quote)) >= 24
+                    and _normalize_text(source_quote) == _normalize_text(translated_text)
+                ):
+                    rejected_prose_units.append(
+                        {
+                            "page_number": segment.get("page_number", 0),
+                            "ordinal": segment.get("ordinal", 0),
+                            "status": "unchanged_prose",
+                            "source_chars": len(source_quote),
+                        }
+                    )
+                    return
                 self._persist_checkpoint(job, segment)
 
             with telemetry.stage(
@@ -381,6 +411,7 @@ class BabelDocTranslationProcessor:
                             "PROVIDER_RATE_LIMITED",
                             "PROVIDER_UNAVAILABLE",
                             "ENGINE_DEADLINE_EXCEEDED",
+                            "ENGINE_INCOMPLETE",
                         },
                     ) from exc
 
@@ -390,12 +421,33 @@ class BabelDocTranslationProcessor:
                 or counts.get("failed", 0) != 0
                 or counts.get("completed", 0) + counts.get("skipped", 0) != counts.get("total")
                 or counts.get("completed", 0) == 0
+                or rejected_prose_units
             ):
+                failure_count = max(counts.get("failed", 0), len(rejected_prose_units))
+                failure_units = rejected_prose_units[:20]
+                logger.warning(
+                    "translation_segment_validation_failed",
+                    extra={
+                        "stage": "validation",
+                        "total_units": counts.get("total"),
+                        "completed_units": counts.get("completed"),
+                        "skipped_units": counts.get("skipped"),
+                        "failure_count": failure_count,
+                        "failure_reasons": (
+                            {"unchanged_prose": len(rejected_prose_units)}
+                            if rejected_prose_units
+                            else {}
+                        ),
+                        "failure_units": failure_units,
+                    },
+                )
                 raise TranslationProcessingError(
                     completion.get("failure_code") or "ENGINE_INCOMPLETE",
                     "Some document text could not be translated safely.",
                     retryable=completion.get("failure_code") == "PROVIDER_RATE_LIMITED"
-                    or counts.get("failed", 0) > 0,
+                    or counts.get("failed", 0) > 0
+                    or counts.get("completed", 0) + counts.get("skipped", 0) != counts.get("total")
+                    or bool(rejected_prose_units),
                 )
 
             output_path = Path(completion["output_pdf"]).resolve()

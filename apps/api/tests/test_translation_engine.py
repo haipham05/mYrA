@@ -93,6 +93,7 @@ def test_protocol_keeps_only_safe_failure_unit_metadata() -> None:
             "skipped": 0,
             "failed": 2,
             "failure_reasons": {"unchanged_prose": 1, "untranslated": 1},
+            "skip_reasons": {"below_engine_minimum": 3, "numeric_or_symbol_only": 2},
             "failure_units": [
                 {
                     "page_number": 2,
@@ -106,6 +107,7 @@ def test_protocol_keeps_only_safe_failure_unit_metadata() -> None:
         }
     )
     assert event["failure_reasons"] == {"unchanged_prose": 1, "untranslated": 1}
+    assert event["skip_reasons"] == {"below_engine_minimum": 3, "numeric_or_symbol_only": 2}
     assert event["failure_units"] == [
         {
             "page_number": 2,
@@ -192,6 +194,67 @@ def test_checkpoint_recorder_rejects_obvious_unchanged_english_prose(monkeypatch
     assert recorder.failure_reasons() == {"unchanged_prose": 1}
 
 
+def test_unchanged_prose_guard_matches_processor_normalization() -> None:
+    text = "Transformer design uses unusual technical terminology."
+    assert engine_runner._is_unchanged_english_prose(text, text, layout_label="text")
+
+
+def test_checkpoint_recorder_emits_safe_summary_once_on_engine_failure(monkeypatch) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
+    paragraph = _paragraph("A required scientific paragraph that is still English.")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    recorder.note_preprocessed(paragraph, paragraph.unicode)
+
+    recorder.emit_summary()
+    recorder.emit_summary()
+
+    events = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(events) == 1
+    assert events[0]["failure_reasons"] == {"untranslated": 1}
+    assert events[0]["failure_units"][0]["source_chars"] == len(paragraph.unicode)
+    assert "source_quote" not in events[0]["failure_units"][0]
+
+
+def test_checkpoint_recorder_fails_unvisited_required_prose() -> None:
+    paragraph = _paragraph("A long required paragraph omitted by the engine selector.")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+
+    counts = recorder.finish()
+
+    assert counts == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
+    assert recorder.failure_reasons() == {"untranslated": 1}
+
+
+def test_checkpoint_recorder_skips_only_short_unselected_content() -> None:
+    paragraph = _paragraph("abc")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
+    assert recorder.skip_reasons() == {"below_engine_minimum": 1}
+
+
 def test_checkpoint_recorder_preserves_unchanged_official_title(monkeypatch) -> None:
     output = io.StringIO()
     monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
@@ -253,10 +316,12 @@ def test_checkpoint_recorder_skips_short_abandoned_layout_fragment() -> None:
         SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
     )
     assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
+    assert recorder.skip_reasons() == {"below_engine_minimum": 1}
 
 
 def test_checkpoint_recorder_preserves_babeldoc_intentionally_skipped_units() -> None:
     paragraph = _paragraph("Only an equation")
+    paragraph.layout_label = "equation"
     recorder = engine_runner.TranslationCheckpointRecorder(
         source_sha256="a" * 64,
         glossary=[],
@@ -268,6 +333,7 @@ def test_checkpoint_recorder_preserves_babeldoc_intentionally_skipped_units() ->
     recorder.note_preprocessed(paragraph, None)
 
     assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
+    assert recorder.skip_reasons() == {"protected_scientific_content": 1}
 
 
 def test_first_glossary_occurrence_includes_english_and_preferred_vietnamese() -> None:

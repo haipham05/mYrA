@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ PDF2ZH_VERSION = "2.9.0"
 BABELDOC_VERSION = "0.6.2"
 LAYOUT_MODEL_SHA3_256 = "60be061226930524958b5465c8c04af3d7c03bcb0beb66454f5da9f792e3cf2a"
 PROTOCOL_STDOUT = sys.stdout
+_ACTIVE_RECORDER: TranslationCheckpointRecorder | None = None
 _PROTECTED_TOKEN = re.compile(
     r"\{v\d+\}|\{[A-Za-z][\w.-]*\}|%[sd]|\[\[.*?\]\]|%%.*?%%|</?style\b[^>]*>|</?b\d+>"
 )
@@ -94,6 +96,7 @@ class TranslationCheckpointRecorder:
         self.completed = 0
         self.skipped = 0
         self.failed = 0
+        self.summary_emitted = False
 
     def begin(self, docs: Any) -> None:
         global_ordinal = 0
@@ -119,6 +122,7 @@ class TranslationCheckpointRecorder:
                 }
                 if record["layout_label"] == "abandon" and len(quote.strip()) <= 3:
                     record["status"] = "skipped"
+                    record["skip_reason"] = "below_engine_minimum"
                     self.skipped += 1
                 identity = {
                     "source_pdf_sha256": self.source_sha256,
@@ -163,8 +167,10 @@ class TranslationCheckpointRecorder:
         if not record:
             return
         if text is None:
-            if record["status"] != "skipped":
+            reason = self._intentional_skip_reason(record)
+            if reason and record["status"] != "skipped":
                 record["status"] = "skipped"
+                record["skip_reason"] = reason
                 self.skipped += 1
             return
         record["preprocessed_input"] = text
@@ -233,8 +239,16 @@ class TranslationCheckpointRecorder:
     def finish(self) -> dict[str, Any]:
         for record in self.records.values():
             if record["status"] == "pending":
-                record["status"] = "untranslated"
-                self.failed += 1
+                # BabelDOC also omits long paragraphs for layout/ID reasons. Unless
+                # preservation is objectively clear, an unvisited unit is unresolved.
+                reason = self._intentional_skip_reason(record)
+                if reason:
+                    record["status"] = "skipped"
+                    record["skip_reason"] = reason
+                    self.skipped += 1
+                else:
+                    record["status"] = "untranslated"
+                    self.failed += 1
         return {
             "total": len(self.records),
             "completed": self.completed,
@@ -242,12 +256,37 @@ class TranslationCheckpointRecorder:
             "failed": self.failed,
         }
 
+    @staticmethod
+    def _intentional_skip_reason(record: dict[str, Any]) -> str | None:
+        source = record["source_quote"]
+        normalized = source.strip()
+        label = str(record.get("layout_label") or "").casefold()
+        if not normalized:
+            return "empty"
+        if len(normalized) < 5:
+            return "below_engine_minimum"
+        if label in {"equation", "formula", "math"}:
+            return "protected_scientific_content"
+        if _PROTECTED_TOKEN.fullmatch(normalized):
+            return "placeholder_only"
+        if re.fullmatch(r"[\d\s.,:%/+−–—=()\[\]{}]+", normalized):
+            return "numeric_or_symbol_only"
+        return None
+
     def failure_reasons(self) -> dict[str, int]:
         reasons: dict[str, int] = {}
         for record in self.records.values():
             status = record["status"]
             if status in {"invalid", "unchanged_prose", "oversized", "untranslated"}:
                 reasons[status] = reasons.get(status, 0) + 1
+        return reasons
+
+    def skip_reasons(self) -> dict[str, int]:
+        reasons: dict[str, int] = {}
+        for record in self.records.values():
+            reason = record.get("skip_reason")
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
         return reasons
 
     def failure_units(self) -> list[dict[str, Any]]:
@@ -262,6 +301,20 @@ class TranslationCheckpointRecorder:
             for record in self.records.values()
             if record["status"] in {"invalid", "unchanged_prose", "oversized", "untranslated"}
         ]
+
+    def emit_summary(self) -> None:
+        if self.summary_emitted:
+            return
+        self.summary_emitted = True
+        _emit(
+            {
+                "type": "segment_summary",
+                **self.finish(),
+                "failure_reasons": self.failure_reasons(),
+                "skip_reasons": self.skip_reasons(),
+                "failure_units": self.failure_units(),
+            }
+        )
 
 
 def _protected_tokens(text: str) -> tuple[str, ...]:
@@ -322,6 +375,14 @@ def _is_unchanged_english_prose(
     """
     if layout_label and layout_label.casefold().strip() in _NON_PROSE_LAYOUT_LABELS:
         return False
+
+    def normalize_exact(text: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
+
+    if len(normalize_exact(source)) >= 24 and normalize_exact(source) == normalize_exact(
+        translated
+    ):
+        return True
 
     def normalize(text: str) -> str:
         text = _PROTECTED_TOKEN.sub(" ", text)
@@ -704,6 +765,7 @@ def _stage_name(raw: Any) -> str:
 
 
 async def _translate(request: dict[str, Any]) -> None:
+    global _ACTIVE_RECORDER
     _check_versions()
     input_pdf = Path(request["input_pdf"])
     output_dir = Path(request["output_dir"])
@@ -729,6 +791,7 @@ async def _translate(request: dict[str, Any]) -> None:
         glossary=request.get("glossary", []),
         checkpoint_results=request.get("checkpoint_results", []),
     )
+    _ACTIVE_RECORDER = recorder
     limiter = SharedRateLimiter(2)
     translator = SiliconFlowFreeTranslator("English", "Vietnamese", limiter, recorder)
     glossary_entries = [
@@ -920,15 +983,7 @@ def _checkpoint_hooks(
         try:
             return original_whole(self, docs)
         finally:
-            counts = recorder.finish()
-            _emit(
-                {
-                    "type": "segment_summary",
-                    **counts,
-                    "failure_reasons": recorder.failure_reasons(),
-                    "failure_units": recorder.failure_units(),
-                }
-            )
+            recorder.emit_summary()
 
     il_translator.pre_translate_paragraph = pre_translate
     il_translator.post_translate_paragraph = post_translate
@@ -958,9 +1013,13 @@ def main() -> int:
                 sys.stdout = PROTOCOL_STDOUT
         return 0
     except SafeEngineError as exc:
+        if _ACTIVE_RECORDER is not None:
+            _ACTIVE_RECORDER.emit_summary()
         _emit({"type": "error", "code": exc.code})
         return 1
     except BaseException:
+        if _ACTIVE_RECORDER is not None:
+            _ACTIVE_RECORDER.emit_summary()
         _emit({"type": "error", "code": "ENGINE_FAILURE"})
         return 1
 

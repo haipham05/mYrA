@@ -131,6 +131,21 @@ def _safe_event(value: Any) -> dict[str, Any]:
             for key, count in reasons.items()
         ):
             raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
+        skip_reasons = value.get("skip_reasons", {})
+        if not isinstance(skip_reasons, dict) or not all(
+            key
+            in {
+                "empty",
+                "below_engine_minimum",
+                "protected_scientific_content",
+                "placeholder_only",
+                "numeric_or_symbol_only",
+            }
+            and isinstance(count, int)
+            and count >= 0
+            for key, count in skip_reasons.items()
+        ):
+            raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
         units = value.get("failure_units", [])
         if not isinstance(units, list) or any(
             not isinstance(unit, dict)
@@ -146,6 +161,7 @@ def _safe_event(value: Any) -> dict[str, Any]:
             "type": "segment_summary",
             **counts,
             "failure_reasons": reasons,
+            "skip_reasons": skip_reasons,
             "failure_units": [
                 {
                     "page_number": unit["page_number"],
