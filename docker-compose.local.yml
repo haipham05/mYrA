@@ -1,0 +1,54 @@
+# Local data profile. The init script creates the ignored credential files first:
+# python3 scripts/init_local_runtime.py
+services:
+  myra-local-postgres:
+    image: pgvector/pgvector@sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21
+    restart: unless-stopped
+    env_file:
+      - path: .local/runtime/local-postgres.env
+        required: true
+    volumes:
+      - myra_local_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - default
+
+  api:
+    env_file:
+      - path: .local/runtime/local-app.env
+        required: true
+    depends_on:
+      myra-local-postgres:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./.local/runtime/files
+        target: /app/data
+        bind:
+          create_host_path: false
+
+  worker:
+    env_file:
+      - path: .local/runtime/local-app.env
+        required: true
+    depends_on:
+      myra-local-postgres:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./.local/runtime/files
+        target: /app/data
+        bind:
+          create_host_path: false
+
+volumes:
+  myra_local_postgres_data:

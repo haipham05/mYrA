@@ -14,6 +14,7 @@ import type {
   MemorySource,
   Message,
   Paper,
+  ProviderBudgetUsage,
   Project,
 } from "@/types";
 
@@ -32,6 +33,9 @@ export default function Home() {
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [isAsking, setIsAsking] = useState(false);
   const [deepseekStatus, setDeepseekStatus] = useState<string | null>(null);
+  const [budgetUsage, setBudgetUsage] = useState<ProviderBudgetUsage | null>(
+    null,
+  );
   const [chatError, setChatError] = useState<string | null>(null);
 
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
@@ -54,6 +58,11 @@ export default function Home() {
         );
       })
       .catch(() => {});
+
+    fetch(`${apiUrl}/api/v1/budget/usage`)
+      .then((res) => (res.ok ? res.json() : Promise.reject()))
+      .then((data: ProviderBudgetUsage) => setBudgetUsage(data))
+      .catch(() => setBudgetUsage(null));
   }, [apiUrl]);
 
   // 2. Fetch projects
@@ -547,6 +556,61 @@ export default function Home() {
                 </span>
               )}
             </div>
+
+            <details className="relative text-xs text-zinc-700">
+              <summary className="cursor-pointer rounded-md border border-zinc-200 px-3 py-2 font-medium hover:bg-zinc-50">
+                Provider usage
+              </summary>
+              <div className="absolute right-0 z-20 mt-2 w-72 rounded-lg border border-zinc-200 bg-white p-4 shadow-lg">
+                {budgetUsage?.status === "available" ? (
+                  <>
+                    <p className="font-semibold text-zinc-900">
+                      Estimated daily allowance
+                    </p>
+                    <p className="mt-1 text-sm text-zinc-700">
+                      $
+                      {Number(
+                        budgetUsage.daily_remaining_estimate_usd ?? 0,
+                      ).toFixed(4)}{" "}
+                      remaining of $
+                      {Number(budgetUsage.daily_limit_estimate_usd).toFixed(2)}
+                    </p>
+                    <dl className="mt-3 space-y-1 text-zinc-600">
+                      <div className="flex justify-between gap-3">
+                        <dt>Estimated committed</dt>
+                        <dd>
+                          $
+                          {Number(
+                            budgetUsage.daily.committed_estimate_usd,
+                          ).toFixed(4)}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-3">
+                        <dt>Reported prompt tokens</dt>
+                        <dd>
+                          {budgetUsage.daily.reported_prompt_tokens ??
+                            "Unknown"}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between gap-3">
+                        <dt>Reported completion tokens</dt>
+                        <dd>
+                          {budgetUsage.daily.reported_completion_tokens ??
+                            "Unknown"}
+                        </dd>
+                      </div>
+                    </dl>
+                    <p className="mt-3 text-[11px] leading-4 text-zinc-500">
+                      {budgetUsage.usage_note}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-zinc-600">
+                    Usage tracking is unavailable for this runtime profile.
+                  </p>
+                )}
+              </div>
+            </details>
           </div>
         </div>
       </header>

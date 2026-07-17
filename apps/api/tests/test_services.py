@@ -1,17 +1,21 @@
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import httpx
 import pytest
 
 from app.config import Settings
+from app.observability.context import OperationContext, use_operation_context
 from app.services.embedding import (
     DeterministicEmbeddingProvider,
 )
 from app.services.llm import (
     DeepSeekLLMProvider,
     FakeLLMProvider,
+    GenerationOptions,
     GenerationResult,
     GenerationUsage,
     LLMProvider,
@@ -250,6 +254,101 @@ async def test_deepseek_generation_without_usage_keeps_usage_unknown(monkeypatch
 
 
 @pytest.mark.anyio
+async def test_deepseek_generation_options_control_model_output_and_routing(monkeypatch):
+    original_client = httpx.AsyncClient
+    observed_payload: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        observed_payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-flash-2026-10",
+                "choices": [{"message": {"content": '{"intent":"qa"}'}}],
+            },
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    provider = DeepSeekLLMProvider(
+        "test-key", "https://example.invalid", model_name="deepseek-chat"
+    )
+
+    result = await generate_with_metadata(
+        provider,
+        "Return a JSON object",
+        "What does the paper claim?",
+        options=GenerationOptions(
+            model_name="deepseek-flash",
+            max_output_tokens=512,
+            structured_json=True,
+            disable_thinking=True,
+        ),
+    )
+
+    assert observed_payload["model"] == "deepseek-flash"
+    assert observed_payload["max_tokens"] == 512
+    assert observed_payload["response_format"] == {"type": "json_object"}
+    assert observed_payload["thinking"] == {"type": "disabled"}
+    assert result.requested_model == "deepseek-flash"
+    assert result.reported_model == "deepseek-flash-2026-10"
+    assert result.content == '{"intent":"qa"}'
+
+
+def test_generation_options_validate_limits_and_are_immutable():
+    with pytest.raises(ValueError, match="model_name"):
+        GenerationOptions(model_name=" ")
+    with pytest.raises(ValueError, match="between 1 and 65536"):
+        GenerationOptions(max_output_tokens=65_537)
+    with pytest.raises(ValueError, match="between 1 and 65536"):
+        GenerationOptions(max_output_tokens=0)
+
+    options = GenerationOptions(model_name="deepseek-flash", max_output_tokens=128)
+    with pytest.raises((AttributeError, TypeError)):
+        options.model_name = "deepseek-chat"  # type: ignore[misc]
+
+
+@pytest.mark.anyio
+async def test_deepseek_provider_defaults_apply_to_each_call_without_shared_mutation(monkeypatch):
+    original_client = httpx.AsyncClient
+    observed: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        observed.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    provider = DeepSeekLLMProvider(
+        "test-key",
+        "https://example.invalid",
+        model_name="deepseek-flash",
+        max_output_tokens=256,
+        structured_json=True,
+        disable_thinking=True,
+    )
+
+    results = await asyncio.gather(
+        provider.generate_result("system", "one"),
+        provider.generate_result(
+            "system", "two", options=GenerationOptions(model_name="deepseek-chat")
+        ),
+    )
+
+    assert [request["model"] for request in observed] == ["deepseek-flash", "deepseek-chat"]
+    assert all(request["max_tokens"] == 256 for request in observed)
+    assert all(request["response_format"] == {"type": "json_object"} for request in observed)
+    assert all(request["thinking"] == {"type": "disabled"} for request in observed)
+    assert [result.requested_model for result in results] == ["deepseek-flash", "deepseek-chat"]
+
+
+@pytest.mark.anyio
 async def test_deepseek_concurrent_calls_keep_metadata_per_response(monkeypatch):
     original_client = httpx.AsyncClient
 
@@ -283,3 +382,105 @@ async def test_deepseek_concurrent_calls_keep_metadata_per_response(monkeypatch)
     assert first.usage == GenerationUsage(prompt_tokens=1)
     assert second.response_id == "response-two"
     assert second.usage == GenerationUsage(prompt_tokens=2)
+
+
+@pytest.mark.anyio
+async def test_paid_generation_reserves_before_dispatch_and_settles_reported_usage(monkeypatch):
+    original_client = httpx.AsyncClient
+    reservation_id = uuid4()
+    manager = Mock()
+    manager.reserve.return_value = SimpleNamespace(reservation_id=reservation_id)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-flash",
+                "choices": [{"message": {"content": "answer"}}],
+                "usage": {"prompt_tokens": 15, "completion_tokens": 4},
+            },
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    provider = DeepSeekLLMProvider(
+        "test-key",
+        model_name="deepseek-flash",
+        max_output_tokens=200,
+        budget_manager=manager,
+    )
+    context = OperationContext.validated(correlation_id="research-run-1")
+
+    with use_operation_context(context):
+        result = await provider.generate_result("system", "user")
+
+    assert result.content == "answer"
+    manager.reserve.assert_called_once_with(
+        run_id="research-run-1",
+        requested_model="deepseek-flash",
+        input_bytes=10,
+        max_output_tokens=200,
+    )
+    manager.settle.assert_called_once_with(
+        reservation_id,
+        prompt_tokens=15,
+        completion_tokens=4,
+        cache_hit_tokens=None,
+        cache_miss_tokens=None,
+    )
+    manager.mark_unknown.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_paid_generation_refusal_happens_before_provider_dispatch(monkeypatch):
+    from app.services.budget import BudgetDeniedError
+
+    original_client = httpx.AsyncClient
+    request_count = 0
+    manager = Mock()
+    manager.reserve.side_effect = BudgetDeniedError("run cap reached")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "answer"}}]})
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    provider = DeepSeekLLMProvider("test-key", budget_manager=manager)
+
+    with pytest.raises(BudgetDeniedError, match="run cap"):
+        await provider.generate_result("system", "user")
+
+    assert request_count == 0
+    manager.mark_unknown.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_provider_failure_keeps_the_attempt_reservation_unknown(monkeypatch):
+    original_client = httpx.AsyncClient
+    reservation_id = uuid4()
+    manager = Mock()
+    manager.reserve.return_value = SimpleNamespace(reservation_id=reservation_id)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "temporary"})
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    provider = DeepSeekLLMProvider("test-key", budget_manager=manager)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await provider.generate_result("system", "user")
+
+    manager.mark_unknown.assert_called_once_with(reservation_id)
+    manager.settle.assert_not_called()

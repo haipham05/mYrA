@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.crud.chat import create_conversation
+from app.crud.chat import create_conversation, list_messages
 from app.crud.memory import create_memory, list_memories
 from app.db.base import Base
 from app.db.models import (
@@ -382,6 +382,183 @@ async def test_verified_paper_memory_routes_through_evidence_and_citations(db: S
     assert resp.citations[0].page_number == 1
     assert resp.citations[0].anchor_status == AnchorStatus.VERIFIED
     assert resp.citations[0].quote == quote
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "wrapped_claim",
+    [
+        (
+            'The paper proves "The Transformer model relies entirely on '
+            'self-attention" and cures cancer.'
+        ),
+        (
+            "The paper proves **The Transformer model relies entirely on "
+            "self-attention** and cures cancer."
+        ),
+    ],
+)
+async def test_chat_publishes_only_verified_quote_from_unsupported_wrapper(
+    db: Session, wrapped_claim: str
+) -> None:
+    project = Project(name="Quoted Claim Project")
+    db.add(project)
+    db.commit()
+    conv = create_conversation(db, project_id=project.id, title="Quoted Claim")
+    paper, _, _, chunk = setup_ingested_paper(
+        db,
+        project_id=project.id,
+        page_text="The Transformer model relies entirely on self-attention.",
+    )
+    quote = "The Transformer model relies entirely on self-attention."
+    anchor = CitationAnchor(
+        page_number=1,
+        exact_quote=quote,
+        document_sha256=paper.document_sha256,
+        parser_version="docling_test",
+        source_element_id=uuid4(),
+        source_char_start=0,
+        source_char_end=len(quote),
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+    evidence = EvidenceItem(
+        id="E1",
+        chunk_id=chunk.id,
+        paper_id=paper.id,
+        paper_title="Transformer paper",
+        page_number=1,
+        quote=quote,
+        document_sha256=paper.document_sha256,
+        parser_version="docling_test",
+        anchors=[anchor],
+    )
+    retriever = MagicMock()
+    retriever.retrieve.return_value = [evidence]
+    llm = AsyncMock()
+    llm.generate.return_value = f"{wrapped_claim} [E1]"
+    llm.model_name = "test-deepseek"
+
+    with (
+        patch("app.services.chat_service.get_llm_provider", return_value=llm),
+        patch("app.services.chat_service.retrieve_project_memories", return_value=[]),
+        patch("app.services.chat_service.retrieve_graph_evidence", return_value=([], None)),
+        patch(
+            "app.services.embedding.get_embedding_provider",
+            return_value=MagicMock(embed_query=MagicMock(return_value=None)),
+        ),
+    ):
+        response = await ChatService(retriever=retriever).answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What does the paper say about the Transformer?",
+        )
+
+    assert "cures cancer" not in response.content
+    assert "proves" not in response.content
+    assert f"“{quote.removesuffix('.')}” [1]" == response.content
+    assert len(response.citations) == 1
+
+    messages, _ = list_messages(db, conv.id)
+    saved_answer = messages[-1]
+    assert saved_answer.content == response.content
+    assert "cures cancer" not in saved_answer.content
+
+
+@pytest.mark.anyio
+async def test_chat_preserves_valid_multi_element_verbatim_quote(db: Session) -> None:
+    project = Project(name="Multi Element Quote Project")
+    db.add(project)
+    db.commit()
+    conv = create_conversation(db, project_id=project.id, title="Multi Element Quote")
+    page_text = "A Transformer uses attention mechanisms. The decoder removes recurrent layers."
+    paper = Paper(
+        project_id=project.id,
+        filename="transformer.pdf",
+        storage_path="papers/transformer.pdf",
+        document_sha256="multi-element-hash",
+        status="READY",
+    )
+    db.add(paper)
+    db.flush()
+    page = PaperPage(
+        paper_id=paper.id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text=page_text,
+    )
+    first_text = "A Transformer uses attention mechanisms."
+    second_text = "The decoder removes recurrent layers."
+    elements = [
+        PaperElement(
+            paper_id=paper.id,
+            page_number=1,
+            element_index=index,
+            element_type="paragraph",
+            text=text,
+            page_width=612.0,
+            page_height=792.0,
+            parser_version="docling_test",
+        )
+        for index, text in enumerate((first_text, second_text))
+    ]
+    chunk = PaperChunk(paper_id=paper.id, chunk_type="child", chunk_index=0, text=page_text)
+    db.add_all([page, *elements, chunk])
+    db.flush()
+    anchors = [
+        CitationAnchor(
+            page_number=1,
+            exact_quote=text,
+            document_sha256=paper.document_sha256,
+            parser_version="docling_test",
+            source_element_id=element.id,
+            source_char_start=start,
+            source_char_end=start + len(text),
+            anchor_status=AnchorStatus.VERIFIED,
+        )
+        for text, element, start in (
+            (first_text, elements[0], 0),
+            (second_text, elements[1], len(first_text) + 1),
+        )
+    ]
+    evidence = EvidenceItem(
+        id="E1",
+        chunk_id=chunk.id,
+        paper_id=paper.id,
+        paper_title="Transformer paper",
+        page_number=1,
+        quote=first_text,
+        document_sha256=paper.document_sha256,
+        parser_version="docling_test",
+        anchors=anchors,
+    )
+    retriever = MagicMock()
+    retriever.retrieve.return_value = [evidence]
+    quote = f"{first_text} {second_text}"
+    llm = AsyncMock()
+    llm.generate.return_value = f'The paper states "{quote}" [E1].'
+    llm.model_name = "test-deepseek"
+
+    with (
+        patch("app.services.chat_service.get_llm_provider", return_value=llm),
+        patch("app.services.chat_service.retrieve_project_memories", return_value=[]),
+        patch("app.services.chat_service.retrieve_graph_evidence", return_value=([], None)),
+        patch(
+            "app.services.embedding.get_embedding_provider",
+            return_value=MagicMock(embed_query=MagicMock(return_value=None)),
+        ),
+    ):
+        response = await ChatService(retriever=retriever).answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What does the paper say about attention and recurrence?",
+        )
+
+    assert response.content == f"“{quote}” [1]"
+    assert len(response.citations) == 1
+    assert response.citations[0].quote == quote
+    messages, _ = list_messages(db, conv.id)
+    assert messages[-1].content == response.content
 
 
 @pytest.mark.anyio

@@ -1,5 +1,6 @@
 from collections.abc import Generator
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
@@ -10,7 +11,31 @@ from app.db.base import Base
 
 settings = Settings.from_environment()
 
-DATABASE_URL = settings.database_url or "sqlite:///./myra_dev.db"
+
+def resolve_database_url(settings: Settings) -> str:
+    """Resolve an explicit profile without silently crossing local/cloud boundaries."""
+    if settings.runtime_profile == "local":
+        if not settings.database_url:
+            raise ValueError("local profile requires DATABASE_URL")
+        parsed = urlsplit(settings.database_url)
+        local_hosts = {"localhost", "127.0.0.1", "::1", "myra-local-postgres"}
+        if not parsed.scheme.startswith("postgresql") or parsed.hostname not in local_hosts:
+            raise ValueError("local profile DATABASE_URL must target the local PostgreSQL service")
+        return settings.database_url
+
+    if settings.runtime_profile == "cloud-data":
+        # Settings rejects missing cloud values; never fall back to SQLite in this profile.
+        if not settings.database_url:
+            raise ValueError("cloud-data profile requires DATABASE_URL")
+        parsed = urlsplit(settings.database_url)
+        if parsed.scheme not in {"postgresql", "postgresql+psycopg2"} or not parsed.hostname:
+            raise ValueError("cloud-data profile DATABASE_URL must target PostgreSQL")
+        return settings.database_url
+
+    return settings.database_url or "sqlite:///./myra_dev.db"
+
+
+DATABASE_URL = resolve_database_url(settings)
 
 connect_args = {}
 if DATABASE_URL.startswith("sqlite"):

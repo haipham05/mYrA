@@ -6,6 +6,23 @@ export interface Project {
   updated_at: string;
 }
 
+export interface ProviderBudgetUsage {
+  status: "available" | "unavailable";
+  runtime_profile: string;
+  unavailable_reason?: string | null;
+  currency: "USD";
+  daily_limit_estimate_usd: string;
+  daily_remaining_estimate_usd: string | null;
+  daily: {
+    committed_estimate_usd: string;
+    active_reservation_usd: string;
+    unknown_reservation_usd: string;
+    reported_prompt_tokens: number | null;
+    reported_completion_tokens: number | null;
+  };
+  usage_note: string;
+}
+
 export type PaperStatus = "PROCESSING" | "READY" | "FAILED";
 
 export interface Paper {

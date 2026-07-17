@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import Home from "./page";
@@ -15,9 +15,28 @@ describe("Home", () => {
   it("shows the connected state when the API responds", async () => {
     vi.stubGlobal(
       "fetch",
-      vi
-        .fn()
-        .mockResolvedValue({ ok: true, json: async () => ({ status: "ok" }) }),
+      vi.fn((input: RequestInfo | URL) => {
+        if (String(input).endsWith("/api/v1/budget/usage")) {
+          return Promise.resolve(
+            jsonResponse({
+              status: "available",
+              runtime_profile: "local",
+              currency: "USD",
+              daily_limit_estimate_usd: "1.00",
+              daily_remaining_estimate_usd: "0.85",
+              daily: {
+                committed_estimate_usd: "0.15",
+                active_reservation_usd: "0",
+                unknown_reservation_usd: "0",
+                reported_prompt_tokens: 100,
+                reported_completion_tokens: 25,
+              },
+              usage_note: "Costs are estimates, not provider invoices.",
+            }),
+          );
+        }
+        return Promise.resolve(jsonResponse({ status: "ok" }));
+      }),
     );
 
     render(<Home />);
@@ -26,6 +45,10 @@ describe("Home", () => {
     await waitFor(() =>
       expect(screen.getByText("Connected")).toBeInTheDocument(),
     );
+    expect(screen.getByText("Provider usage")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Provider usage"));
+    expect(screen.getByText("$0.8500 remaining of $1.00")).toBeInTheDocument();
+    expect(screen.getByText("100")).toBeInTheDocument();
   });
 
   it("shows the unavailable state when the API request fails", async () => {

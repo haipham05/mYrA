@@ -48,3 +48,6 @@ npm-debug.log*
 .vscode/
 .local/observability/
 .local/translation/
+.local/runtime/
+.local/planning-archive/
+plans/research_assistant/

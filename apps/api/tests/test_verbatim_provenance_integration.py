@@ -150,13 +150,12 @@ async def test_full_provenance_roundtrip(test_db_session):
     assert citation.anchor_status == AnchorStatus.VERIFIED
     assert len(citation.bounding_boxes) > 0
 
-    # A model may wrap a real quotation in prose.
-    # Preserve the complete sentence and its verified citation.
+    # Keep the verified extract, but do not retain unsupported generated prose.
     set_llm_provider(FakeLLMProvider(fixed_response=f'The paper explains "{top_item.quote}" [E1].'))
     extractive = await chat_service.answer_question(db, conv.id, "Explain scaled attention")
     assert top_item.quote in extractive.content
     assert "[1]" in extractive.content
-    assert "The paper explains" in extractive.content
+    assert "The paper explains" not in extractive.content
     assert len(extractive.citations) == 1
 
 

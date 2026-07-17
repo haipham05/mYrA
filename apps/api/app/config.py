@@ -2,11 +2,12 @@ import json
 import os
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Settings(BaseModel):
     app_name: str = "mYrA API"
+    runtime_profile: Literal["auto", "local", "cloud-data"] = "auto"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -16,11 +17,14 @@ class Settings(BaseModel):
     )
     cors_headers: list[str] = Field(default_factory=lambda: ["*"])
     database_url: str | None = None
+    local_storage_root: str = "data/storage"
     supabase_project_ref: str | None = None
     google_cloud_project: str | None = None
     gcs_bucket_name: str | None = None
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model_name: str = "deepseek-flash"
+    deepseek_max_output_tokens: int = Field(default=4096, ge=1, le=65_536)
     max_upload_size_bytes: int = 50 * 1024 * 1024
     max_pdf_pages: int = 150
     check_migration_compatibility: bool = True
@@ -35,9 +39,20 @@ class Settings(BaseModel):
     redis_url: str | None = None
     cache_namespace: str = "production"
 
+    @model_validator(mode="after")
+    def validate_cloud_data_profile(self) -> "Settings":
+        if self.runtime_profile == "cloud-data":
+            if not self.database_url:
+                raise ValueError("cloud-data profile requires DATABASE_URL")
+            if not self.gcs_bucket_name:
+                raise ValueError("cloud-data profile requires GCS_BUCKET_NAME")
+        return self
+
     @classmethod
     def from_environment(cls) -> "Settings":
         values: dict[str, object] = {}
+        if runtime_profile := os.getenv("MYRA_RUNTIME_PROFILE"):
+            values["runtime_profile"] = runtime_profile
         if app_name := os.getenv("MYRA_APP_NAME"):
             values["app_name"] = app_name
         if log_level := os.getenv("MYRA_LOG_LEVEL"):
@@ -50,6 +65,8 @@ class Settings(BaseModel):
             values["cors_headers"] = json.loads(cors_headers)
         if database_url := os.getenv("DATABASE_URL"):
             values["database_url"] = database_url
+        if storage_root := os.getenv("MYRA_LOCAL_STORAGE_ROOT"):
+            values["local_storage_root"] = storage_root
         if supabase_ref := os.getenv("SUPABASE_PROJECT_REF"):
             values["supabase_project_ref"] = supabase_ref
         if gcp_project := os.getenv("GOOGLE_CLOUD_PROJECT"):
@@ -60,6 +77,10 @@ class Settings(BaseModel):
             values["deepseek_api_key"] = deepseek_key
         if deepseek_base := os.getenv("DEEPSEEK_BASE_URL"):
             values["deepseek_base_url"] = deepseek_base
+        if deepseek_model := os.getenv("MYRA_DEEPSEEK_MODEL"):
+            values["deepseek_model_name"] = deepseek_model
+        if max_output_tokens := os.getenv("MYRA_DEEPSEEK_MAX_OUTPUT_TOKENS"):
+            values["deepseek_max_output_tokens"] = int(max_output_tokens)
         if max_size := os.getenv("MYRA_MAX_UPLOAD_SIZE_BYTES"):
             values["max_upload_size_bytes"] = int(max_size)
         if max_pages := os.getenv("MYRA_MAX_PDF_PAGES"):

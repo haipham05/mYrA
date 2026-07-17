@@ -972,11 +972,25 @@ class ChatService:
                     retained_lines.append(line)
                     continue
 
-                line_sentences = [
-                    s.replace("<DOT>", ".").strip()
-                    for s in re.split(r"(?<=[.!?])\s+(?!\[E\d+\])", clean_line)
-                    if s.strip()
-                ]
+                # Sentence punctuation inside a verbatim quote is part of the
+                # source span, not a boundary between generated claims.
+                quote_punctuation = {".": "<QPERIOD>", "!": "<QEXCLAMATION>", "?": "<QQUESTION>"}
+
+                def protect_quoted_punctuation(match: re.Match) -> str:
+                    return "".join(quote_punctuation.get(char, char) for char in match.group(0))
+
+                split_ready_line = re.sub(
+                    r'(?:["“][^"”]+["”]|(?:\*\*|__)[^*_]+(?:\*\*|__))',
+                    protect_quoted_punctuation,
+                    clean_line,
+                )
+                line_sentences = []
+                for sentence_part in re.split(r"(?<=[.!?])\s+(?!\[E\d+\])", split_ready_line):
+                    restored = sentence_part.replace("<DOT>", ".")
+                    for punctuation, placeholder in quote_punctuation.items():
+                        restored = restored.replace(placeholder, punctuation)
+                    if restored.strip():
+                        line_sentences.append(restored.strip())
 
                 retained_line_sentences: list[str] = []
                 for sentence in line_sentences:
@@ -1066,7 +1080,24 @@ class ChatService:
                         eid = f"E{m.group(1)}"
                         return f"[{citation_to_display_index[eid]}]"
 
-                    retained_line_sentences.append(re.sub(r"\[E(\d+)\]", replace_cite, sentence))
+                    # A verbatim fragment can be verified even when the prose
+                    # around it is not. In that case, publish only the verified
+                    # source text with its citation; never keep the model's
+                    # unsupported wrapper or trailing claim.
+                    verified_phrases = {
+                        phrase
+                        for _, phrase in resolved_anchors_for_sentence.values()
+                        if phrase is not None
+                    }
+                    if len(cite_matches) == 1 and verified_phrases:
+                        phrase = next(iter(verified_phrases))
+                        e_id = f"E{cite_matches[0].group(1)}"
+                        display_index = citation_to_display_index[e_id]
+                        retained_line_sentences.append(f"“{phrase}” [{display_index}]")
+                    else:
+                        retained_line_sentences.append(
+                            re.sub(r"\[E(\d+)\]", replace_cite, sentence)
+                        )
 
                 if retained_line_sentences:
                     bullet_prefix = ""

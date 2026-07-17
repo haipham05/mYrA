@@ -14,7 +14,16 @@ def get_storage(settings: Settings | None = None) -> ObjectStorage:
     if settings is None:
         settings = Settings.from_environment()
 
-    if settings.gcs_bucket_name:
+    if settings.runtime_profile == "local":
+        _storage_instance = LocalStorage(base_dir=settings.local_storage_root)
+    elif settings.runtime_profile == "cloud-data":
+        # Settings validates the required bucket before the provider is constructed.
+        _storage_instance = GCSStorage(
+            bucket_name=settings.gcs_bucket_name,
+            project_id=settings.google_cloud_project,
+        )
+    elif settings.gcs_bucket_name:
+        # Preserve the legacy automatic profile until callers opt into an explicit profile.
         _storage_instance = GCSStorage(
             bucket_name=settings.gcs_bucket_name,
             project_id=settings.google_cloud_project,

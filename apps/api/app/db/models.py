@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -7,12 +8,14 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     FetchedValue,
     Float,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -586,3 +589,46 @@ class ProjectTranslationGlossaryEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
+
+
+class ProviderBudgetDay(Base):
+    """Persist daily provider-budget usage across process restarts and data profiles."""
+
+    __tablename__ = "provider_budget_days"
+
+    utc_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    committed_usd: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=0, server_default="0", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class ProviderBudgetReservation(Base):
+    """One pre-dispatch reservation and its eventual usage estimate or unknown state."""
+
+    __tablename__ = "provider_budget_reservations"
+    __table_args__ = (
+        Index("ix_provider_budget_run_day", "run_id", "utc_date"),
+        Index("ix_provider_budget_day_status", "utc_date", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    utc_date: Mapped[date] = mapped_column(
+        Date, ForeignKey("provider_budget_days.utc_date", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    requested_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    pricing_snapshot: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserved_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    settled_estimate_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

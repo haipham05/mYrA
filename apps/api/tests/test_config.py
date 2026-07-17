@@ -1,8 +1,15 @@
 import json
 import logging
 
+import pytest
+from pydantic import ValidationError
+
 from app.config import Settings
+from app.db.session import resolve_database_url
 from app.logging import JsonFormatter
+from app.storage.factory import get_storage, set_storage
+from app.storage.gcs import GCSStorage
+from app.storage.local import LocalStorage
 
 
 def test_settings_read_environment(monkeypatch) -> None:
@@ -49,6 +56,62 @@ def test_settings_read_environment(monkeypatch) -> None:
     assert settings.neo4j_database == "custom_graph"
     assert settings.neo4j_timeout_seconds == 15.5
     assert settings.graph_batch_limit == 100
+
+
+def test_explicit_local_profile_uses_local_database_and_storage(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MYRA_RUNTIME_PROFILE", "local")
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg2://local:secret@myra-local-postgres:5432/myra"
+    )
+    monkeypatch.setenv("GCS_BUCKET_NAME", "owner-cloud-bucket")
+    monkeypatch.setenv("MYRA_LOCAL_STORAGE_ROOT", str(tmp_path / "papers"))
+
+    settings = Settings.from_environment()
+    set_storage(None)
+    try:
+        storage = get_storage(settings)
+        assert isinstance(storage, LocalStorage)
+        assert storage.base_dir == tmp_path / "papers"
+        assert resolve_database_url(settings) == settings.database_url
+    finally:
+        set_storage(None)
+
+
+def test_explicit_profiles_fail_closed_instead_of_falling_back(monkeypatch) -> None:
+    with pytest.raises(ValidationError, match="cloud-data profile requires DATABASE_URL"):
+        Settings(runtime_profile="cloud-data", gcs_bucket_name="bucket")
+
+    local_settings = Settings(
+        runtime_profile="local",
+        database_url="postgresql+psycopg2://local:secret@db.example.com:5432/myra",
+    )
+    with pytest.raises(ValueError, match="must target the local PostgreSQL service"):
+        resolve_database_url(local_settings)
+
+
+def test_cloud_data_profile_selects_gcs_explicitly(monkeypatch) -> None:
+    settings = Settings(
+        runtime_profile="cloud-data",
+        database_url="postgresql+psycopg2://user:secret@db.example.com:5432/myra",
+        gcs_bucket_name="research-bucket",
+    )
+    set_storage(None)
+    try:
+        assert isinstance(get_storage(settings), GCSStorage)
+        assert resolve_database_url(settings) == settings.database_url
+    finally:
+        set_storage(None)
+
+
+def test_cloud_data_profile_rejects_sqlite_database_url() -> None:
+    settings = Settings(
+        runtime_profile="cloud-data",
+        database_url="sqlite:///./local.db",
+        gcs_bucket_name="research-bucket",
+    )
+
+    with pytest.raises(ValueError, match="must target PostgreSQL"):
+        resolve_database_url(settings)
 
 
 def test_settings_defaults_when_env_vars_absent(monkeypatch) -> None:
