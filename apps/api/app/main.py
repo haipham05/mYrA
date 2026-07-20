@@ -23,10 +23,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     current_settings = Settings.from_environment()
     configure_logging(current_settings.log_level)
     if current_settings.check_migration_compatibility:
-        from app.db.compatibility import check_schema_compatibility
+        from app.db.compatibility import (
+            check_budget_schema_compatibility,
+            check_schema_compatibility,
+        )
         from app.db.session import engine
 
         check_schema_compatibility(engine)
+        check_budget_schema_compatibility(current_settings)
     logging.getLogger("myra.api").info("application_started")
     yield
 
@@ -82,6 +86,7 @@ async def readiness_check() -> dict[str, Any]:
         "service": "myra-api",
         "database": "unknown",
         "storage": "unknown",
+        "budget_ledger": "shared",
     }
 
     try:
@@ -121,6 +126,20 @@ async def readiness_check() -> dict[str, Any]:
                 status_code=503,
                 detail={"status": "unready", "error": "Schema revision check failed"},
             ) from err
+
+        if current_settings.runtime_profile in {"local", "cloud-data"}:
+            try:
+                from app.db.compatibility import check_budget_schema_compatibility
+
+                check_budget_schema_compatibility(current_settings)
+                readiness["budget_ledger"] = "compatible"
+            except Exception as err:
+                readiness["status"] = "unready"
+                readiness["budget_ledger"] = "incompatible"
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "unready", "error": "Budget ledger schema check failed"},
+                ) from err
 
     try:
         storage = get_storage(current_settings)

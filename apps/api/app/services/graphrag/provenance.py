@@ -12,10 +12,11 @@ from uuid import UUID
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
-from app.ingestion.parser import find_verbatim_span, normalize_text
+from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement
+from app.ingestion.parser import normalize_text
 from app.schemas.evidence import AnchorStatus, BoundingBox, CitationAnchor, CoordinateOrigin
 from app.schemas.graph import GraphProvenanceSchema
+from app.services.source_resolution import resolve_exact_source_anchor
 
 
 def resolve_graph_source_anchor(
@@ -101,35 +102,25 @@ def resolve_graph_source_anchor(
         if str(doc_sha).strip().lower() != paper.document_sha256.strip().lower():
             return (None, AnchorStatus.UNRESOLVED)
 
-    # 3. Locate PaperPage and verify verbatim quote
-    page = (
-        db.query(PaperPage)
-        .filter(PaperPage.paper_id == paper.id, PaperPage.page_number == page_number)
-        .first()
+    # 3. Resolve exact source existence centrally. Graph-specific chunk and
+    # element linkage checks below remain a separate provenance policy.
+    resolved_anchor = resolve_exact_source_anchor(
+        db,
+        project_id=project_id,
+        paper_id=paper.id,
+        page_number=page_number,
+        exact_quote=exact_quote,
+        document_sha256=paper.document_sha256,
+        char_start=char_start,
+        char_end=char_end,
+        parser_version=parser_ver,
     )
-    if not page or not page.raw_text:
+    if resolved_anchor is None:
         return (None, AnchorStatus.UNRESOLVED)
-
-    span = find_verbatim_span(page.raw_text, exact_quote, preferred_char_start=char_start)
-    if span is None:
+    start_char = resolved_anchor.source_char_start
+    end_char = resolved_anchor.source_char_end
+    if start_char is None or end_char is None:
         return (None, AnchorStatus.UNRESOLVED)
-
-    start_char, end_char = span
-    if char_start is not None and char_end is not None:
-        if (
-            char_start < 0
-            or char_end > len(page.raw_text)
-            or page.raw_text[char_start:char_end] != exact_quote
-        ):
-            return (None, AnchorStatus.UNRESOLVED)
-        if (start_char, end_char) != (char_start, char_end):
-            return (None, AnchorStatus.UNRESOLVED)
-    elif char_start is not None:
-        if start_char != char_start:
-            return (None, AnchorStatus.UNRESOLVED)
-    elif char_end is not None:
-        if end_char != char_end:
-            return (None, AnchorStatus.UNRESOLVED)
 
     # 4. Locate and verify linked child chunk
     chunk = (
@@ -234,7 +225,7 @@ def resolve_graph_source_anchor(
             )
         )
 
-    effective_parser_ver = parser_ver or element.parser_version or "v1"
+    effective_parser_ver = element.parser_version or "v1"
 
     anchor = CitationAnchor(
         page_number=page_number,

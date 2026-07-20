@@ -188,6 +188,7 @@ def test_resolve_claim_anchor_direct_monotonic():
         evidence,
         "The Transformer model relies entirely on self-attention.",
         cite_count=1,
+        project_id=uuid4(),
     )
     assert matched == anchor
     assert phrase is None
@@ -196,10 +197,11 @@ def test_resolve_claim_anchor_direct_monotonic():
 def test_resolve_claim_anchor_multi_element_verbatim_quote():
     from unittest.mock import MagicMock
 
-    from app.db.models import PaperElement, PaperPage
+    from app.db.models import Paper, PaperElement, PaperPage
 
     mock_db = MagicMock()
     paper_id = uuid4()
+    project_id = uuid4()
     raw_page_text = (
         "We propose a new simple network architecture, the Transformer, "
         "based solely on attention mechanisms, dispensing with recurrence "
@@ -255,9 +257,18 @@ def test_resolve_claim_anchor_multi_element_verbatim_quote():
     # Set up mock_db queries
     def query_mock(model):
         q = MagicMock()
-        if model == PaperPage:
+        if model is Paper:
+            q.filter.return_value.first.return_value = Paper(
+                id=paper_id,
+                project_id=project_id,
+                filename="source.pdf",
+                storage_path="local/source.pdf",
+                document_sha256="doc-hash-123",
+                status="READY",
+            )
+        elif model is PaperPage:
             q.filter.return_value.first.return_value = page_rec
-        elif model == PaperElement:
+        elif model is PaperElement:
             q.filter.return_value.order_by.return_value.all.return_value = [elem1, elem2]
         return q
 
@@ -291,7 +302,9 @@ def test_resolve_claim_anchor_multi_element_verbatim_quote():
         "based solely on attention mechanisms, dispensing with recurrence "
         'and convolutions entirely."'
     )
-    matched, phrase = resolve_claim_anchor(mock_db, evidence, claim, cite_count=1)
+    matched, phrase = resolve_claim_anchor(
+        mock_db, evidence, claim, cite_count=1, project_id=project_id
+    )
 
     assert matched is not None
     assert matched.anchor_status == AnchorStatus.VERIFIED
@@ -306,10 +319,11 @@ def test_resolve_claim_anchor_multi_element_verbatim_quote():
 def test_resolve_claim_anchor_rejects_hallucination():
     from unittest.mock import MagicMock
 
-    from app.db.models import PaperElement, PaperPage
+    from app.db.models import Paper, PaperElement, PaperPage
 
     mock_db = MagicMock()
     paper_id = uuid4()
+    project_id = uuid4()
     page_rec = PaperPage(
         paper_id=paper_id,
         page_number=1,
@@ -320,9 +334,18 @@ def test_resolve_claim_anchor_rejects_hallucination():
 
     def query_mock(model):
         q = MagicMock()
-        if model == PaperPage:
+        if model is Paper:
+            q.filter.return_value.first.return_value = Paper(
+                id=paper_id,
+                project_id=project_id,
+                filename="source.pdf",
+                storage_path="local/source.pdf",
+                document_sha256="doc-hash-123",
+                status="READY",
+            )
+        elif model is PaperPage:
             q.filter.return_value.first.return_value = page_rec
-        elif model == PaperElement:
+        elif model is PaperElement:
             q.filter.return_value.order_by.return_value.all.return_value = []
         return q
 
@@ -340,6 +363,8 @@ def test_resolve_claim_anchor_rejects_hallucination():
     )
 
     claim = 'The authors "invented time travel and infinite energy".'
-    matched, phrase = resolve_claim_anchor(mock_db, evidence, claim, cite_count=1)
+    matched, phrase = resolve_claim_anchor(
+        mock_db, evidence, claim, cite_count=1, project_id=project_id
+    )
     assert matched is None
     assert phrase is None

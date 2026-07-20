@@ -35,18 +35,36 @@ def test_credentials_are_private_and_idempotent(tmp_path: Path) -> None:
     assert f"myra:{first_password}@myra-local-postgres" in application_file.read_text()
 
 
-def test_application_profile_is_repaired_without_rotating_database_password(
+def test_application_profile_keeps_owner_profile_and_adds_local_budget_url(
     tmp_path: Path,
 ) -> None:
     runtime_dir = tmp_path / "runtime"
     database_file, application_file = BOOTSTRAP.ensure_local_credentials(runtime_dir)
     password = BOOTSTRAP._read_password(database_file)
-    application_file.write_text("MYRA_RUNTIME_PROFILE=local\n", encoding="utf-8")
+    cloud_database_url = "postgresql+psycopg2://owner:example@db.example.invalid:5432/app"
+    application_file.write_text(
+        "\n".join(
+            (
+                "MYRA_RUNTIME_PROFILE=cloud-data",
+                f"DATABASE_URL={cloud_database_url}",
+                "GCS_BUCKET_NAME=research-bucket",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
 
     BOOTSTRAP.ensure_local_credentials(runtime_dir)
 
     assert BOOTSTRAP._read_password(database_file) == password
-    assert f"myra:{password}@myra-local-postgres" in application_file.read_text()
+    application_contents = application_file.read_text()
+    assert "MYRA_RUNTIME_PROFILE=cloud-data" in application_contents
+    assert f"DATABASE_URL={cloud_database_url}" in application_contents
+    assert "GCS_BUCKET_NAME=research-bucket" in application_contents
+    assert (
+        f"MYRA_BUDGET_DATABASE_URL=postgresql+psycopg2://myra:{password}@myra-local-postgres"
+        in application_contents
+    )
 
 
 def test_invalid_existing_database_secret_is_not_silently_rotated(tmp_path: Path) -> None:

@@ -7,19 +7,19 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.crud.chat import add_message, get_conversation
-from app.db.models import Memory, Message, PaperElement, PaperPage
-from app.ingestion.parser import find_verbatim_span
+from app.db.models import Memory, Message, PaperPage
 from app.observability.telemetry import Observation, TelemetryAdapter, get_telemetry
 from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import (
     AnchorStatus,
-    BoundingBox,
     Citation,
     CitationAnchor,
-    CoordinateOrigin,
+    ClaimEvidenceSupport,
     EvidenceItem,
 )
 from app.schemas.memory import MemoryStatus, MemoryType
+from app.services.chat_prompts import build_chat_system_prompt, build_chat_user_prompt
+from app.services.evidence_assembly import assemble_evidence_items
 from app.services.graphrag.neo4j_repository import Neo4jRepository
 from app.services.graphrag.router import (
     GraphIntent,
@@ -34,6 +34,7 @@ from app.services.memory_service import (
     retrieve_project_memories,
 )
 from app.services.retrieval import HybridRetriever
+from app.services.source_resolution import resolve_exact_source_anchor
 
 logger = logging.getLogger("myra.chat")
 
@@ -480,6 +481,7 @@ def resolve_claim_anchor(
     evidence: EvidenceItem,
     clean_claim: str,
     cite_count: int,
+    project_id: UUID,
 ) -> tuple[CitationAnchor | None, str | None]:
     """Resolve a verified CitationAnchor supporting clean_claim from evidence.
 
@@ -548,53 +550,21 @@ def resolve_claim_anchor(
                     if not page_rec or not page_rec.raw_text:
                         continue
 
-                    span = find_verbatim_span(page_rec.raw_text, cand_phrase)
-                    if span is None:
-                        continue
-
-                    start_char, end_char = span
-                    elems = (
-                        db.query(PaperElement)
-                        .filter(
-                            PaperElement.paper_id == evidence.paper_id,
-                            PaperElement.page_number == p_num,
-                        )
-                        .order_by(PaperElement.element_index)
-                        .all()
-                    )
-                    overlapping_boxes: list[BoundingBox] = []
-                    first_elem_id = None
-                    for elem in elems:
-                        e_span = find_verbatim_span(page_rec.raw_text, elem.text)
-                        if e_span and e_span[0] < end_char and e_span[1] > start_char:
-                            if first_elem_id is None:
-                                first_elem_id = elem.id
-                            if elem.bbox_x_min is not None and elem.page_width and elem.page_height:
-                                overlapping_boxes.append(
-                                    BoundingBox(
-                                        x_min=elem.bbox_x_min,
-                                        y_min=elem.bbox_y_min or 0.0,
-                                        x_max=elem.bbox_x_max or 0.0,
-                                        y_max=elem.bbox_y_max or 0.0,
-                                        page_width=elem.page_width,
-                                        page_height=elem.page_height,
-                                        origin=CoordinateOrigin(elem.coordinate_origin),
-                                        rotation=elem.rotation,
-                                    )
-                                )
-
-                    new_anchor = CitationAnchor(
+                    new_anchor = resolve_exact_source_anchor(
+                        db,
+                        project_id=project_id,
+                        paper_id=evidence.paper_id,
                         page_number=p_num,
-                        source_element_id=first_elem_id
-                        or (verified_anchors[0].source_element_id if verified_anchors else None),
                         exact_quote=cand_phrase,
-                        source_char_start=start_char,
-                        source_char_end=end_char,
                         document_sha256=evidence.document_sha256,
                         parser_version=evidence.parser_version,
-                        anchor_status=AnchorStatus.VERIFIED,
-                        bounding_boxes=overlapping_boxes,
                     )
+                    if new_anchor is None:
+                        continue
+                    if not new_anchor.source_element_id and verified_anchors:
+                        new_anchor = new_anchor.model_copy(
+                            update={"source_element_id": verified_anchors[0].source_element_id}
+                        )
                     return new_anchor, cand_phrase
 
     # 3. Check combined multi-element support for unquoted monotonic claims
@@ -685,14 +655,7 @@ class ChatService:
                 evidence=[],
             )
 
-        # 2a. Retrieve evidence
-        evidence_items: list[EvidenceItem] = self.retriever.retrieve(
-            db=db,
-            project_id=project_id,
-            query=question,
-        )
-
-        # 2b. Retrieve active project memories with semantic scoring if available
+        # Share one query embedding between retrieval and semantic memory lookup.
         query_embedding = None
         try:
             from app.services.embedding import get_embedding_provider
@@ -700,8 +663,20 @@ class ChatService:
             embed_provider = get_embedding_provider()
             query_embedding = embed_provider.embed_query(question)
         except Exception:
+            # Retrieval retains its existing behavior and computes the vector itself
+            # if a memory-specific embedding attempt is unavailable.
             query_embedding = None
 
+        # 2a. Retrieve evidence
+        evidence_items: list[EvidenceItem] = self.retriever.retrieve(
+            db=db,
+            project_id=project_id,
+            query=question,
+            query_embedding=query_embedding,
+        )
+        supplementary_evidence: list[EvidenceItem] = []
+
+        # 2b. Retrieve active project memories with semantic scoring if available
         raw_project_memories = retrieve_project_memories(
             db=db,
             project_id=project_id,
@@ -725,30 +700,11 @@ class ChatService:
                 decision_preference_memories.append(mem)
 
         # Resolve PAPER_FACT memory sources to verified EvidenceItem and CitationAnchor
-        existing_evidence_quotes = {e.quote.strip().lower() for e in evidence_items}
         for p_mem in paper_fact_memories:
             for src in p_mem.sources:
                 ev_item, anchor, status = resolve_paper_memory_source(db, project_id, src)
                 if status == AnchorStatus.VERIFIED and ev_item and anchor:
-                    if ev_item.quote.strip().lower() in existing_evidence_quotes:
-                        continue
-                    existing_evidence_quotes.add(ev_item.quote.strip().lower())
-                    new_id = f"E{len(evidence_items) + 1}"
-                    resolved_evidence = EvidenceItem(
-                        id=new_id,
-                        paper_id=ev_item.paper_id,
-                        paper_title=ev_item.paper_title,
-                        chunk_id=ev_item.chunk_id,
-                        quote=ev_item.quote,
-                        parent_context=ev_item.parent_context,
-                        page_number=ev_item.page_number,
-                        bounding_boxes=ev_item.bounding_boxes,
-                        source_element_ids=ev_item.source_element_ids,
-                        document_sha256=ev_item.document_sha256,
-                        parser_version=ev_item.parser_version,
-                        anchors=[anchor],
-                    )
-                    evidence_items.append(resolved_evidence)
+                    supplementary_evidence.append(ev_item.model_copy(update={"anchors": [anchor]}))
 
         # 2c. Retrieve graph evidence
         graph_evidence_items, graph_notice = retrieve_graph_evidence(
@@ -759,13 +715,9 @@ class ChatService:
             intent=intent,
         )
         for g_item in graph_evidence_items:
-            norm_q = g_item.quote.strip().lower()
-            if norm_q in existing_evidence_quotes:
-                continue
-            existing_evidence_quotes.add(norm_q)
-            new_id = f"E{len(evidence_items) + 1}"
-            g_item.id = new_id
-            evidence_items.append(g_item)
+            supplementary_evidence.append(g_item)
+
+        evidence_items = assemble_evidence_items(evidence_items + supplementary_evidence)
 
         evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
         memory_block = format_memories_for_prompt(
@@ -787,62 +739,9 @@ class ChatService:
 
         history_block = "\n".join(history_turns[-6:]) if history_turns else ""
 
-        system_prompt = (
-            "You are mYrA, an academic research assistant. "
-            "Answer the QUESTION using the provided EVIDENCE quotes and PROJECT MEMORY, "
-            "maintaining continuity with CONVERSATION HISTORY when relevant.\n\n"
-            "ANSWER DIRECTNESS & FLUENCY RULES:\n"
-            "- Answer directly, precisely, and concisely to the specific QUESTION asked.\n"
-            "- Always explicitly name the subject at the beginning (e.g., "
-            "'The Transformer is...', 'BERT is...'). "
-            "NEVER start answers with vague pronouns like "
-            "'It is...', 'This is...', or 'It was...'.\n"
-            "- Write fluent, natural, grammatically complete sentences. "
-            "NEVER use artificial bracketed "
-            "inflections inside quotes (e.g., do NOT write 'eschew[es]' or 'rel[ies]'). "
-            "If quoting, "
-            "quote clean, verbatim grammatical phrases that fit seamlessly into "
-            "the sentence, or state "
-            "the facts directly in well-formed prose.\n"
-            "- Avoid redundancy: do NOT generate multiple sentences stating the same "
-            "definition in different ways. "
-            "Provide one clear, authoritative definition and its key architectural "
-            "principle without repetition.\n"
-            "- Rely strictly on the provided EVIDENCE quotes for factual claims, but use ONLY "
-            "the evidence necessary to answer the user's specific query.\n"
-            "- Do NOT summarize or dump all provided evidence chunks. Do not add unrequested "
-            "tangential details (such as training hardware, GPU hours, benchmark scores, "
-            "dataset names, or hyperparameter layer counts) unless the question "
-            "explicitly asks for them.\n\n"
-            "CITATION & PROVENANCE RULES:\n"
-            "- For any factual claim from papers, support it with a citation ID such as [E1]. "
-            "You may quote key phrases in quotation marks or integrate facts naturally into "
-            "clear, complete sentences.\n"
-            "- Preserve exact technical terms, numbers, and definitions from the cited evidence.\n"
-            "- Never invent a citation ID. Never use [E...] brackets for project decisions "
-            "or user preferences.\n"
-            "- For questions regarding project decisions, user preferences, terminology, or "
-            "choices, answer accurately using the PROJECT MEMORY section without adding "
-            "paper citation brackets.\n"
-            "- If neither the evidence nor the project memory contains enough information "
-            "to answer, state that evidence is insufficient."
+        system_prompt = build_chat_system_prompt(
+            intent, graph_notice if intent != GraphIntent.FACTUAL else None
         )
-
-        if intent == GraphIntent.CONTRADICTION:
-            system_prompt += (
-                "\n\nCONTRADICTION ANALYSIS:\n"
-                "- When differing results or conflicting claims are present in the evidence, "
-                "present each side as its own source-supported statement with its own citation "
-                "(e.g. 'Paper A reports ... [E1], whereas Paper B observes ... [E2]').\n"
-                "- Do not merge conflicting claims into a single synthetic sentence without "
-                "individual citations.\n"
-                "- If the evidence does not contain conflicting or opposing claims on the "
-                "specified topic, clearly state that no direct contradictions were found in "
-                "the current evidence."
-            )
-
-        if graph_notice and intent != GraphIntent.FACTUAL:
-            system_prompt += f"\n\n[NOTE: {graph_notice}]"
 
         evidence_text_parts = []
         for e in evidence_items:
@@ -863,21 +762,12 @@ class ChatService:
         if graph_notice and intent != GraphIntent.FACTUAL:
             evidence_block = f"[NOTE: {graph_notice}]\n\n{evidence_block}"
 
-        prompt_parts = []
-        if memory_block:
-            prompt_parts.append(f"PROJECT MEMORY:\n{memory_block}")
-        prompt_parts.append(f"EVIDENCE:\n{evidence_block}")
-        if history_block:
-            prompt_parts.append(f"CONVERSATION HISTORY:\n{history_block}")
-        prompt_parts.append(
-            f"QUESTION:\n{question}\n\n"
-            f"INSTRUCTION: Answer directly and concisely to the question above. "
-            f"Explicitly name the subject (e.g. 'The Transformer is...'), write fluent "
-            f"English without bracketed words like 'eschew[es]', "
-            f"avoid repeating the definition across multiple sentences, and include "
-            f"only the necessary facts from the evidence."
+        user_prompt = build_chat_user_prompt(
+            question=question,
+            evidence_block=evidence_block,
+            memory_block=memory_block,
+            history_block=history_block,
         )
-        user_prompt = "\n\n".join(prompt_parts)
 
         # 4. Generate answer with LLM
         llm = get_llm_provider()
@@ -943,6 +833,7 @@ class ChatService:
         citation_to_display_index: dict[str, int] = {}
         display_idx = 1
         retained_paragraphs: list[str] = []
+        validated_claim_supports: list[ClaimEvidenceSupport] = []
         citation_validation = {
             "citation_markers": 0,
             "accepted_citations": 0,
@@ -1029,6 +920,7 @@ class ChatService:
                             evidence=evidence,
                             clean_claim=clean_claim,
                             cite_count=len(cite_matches),
+                            project_id=project_id,
                         )
                         if anchor is None:
                             sentence_supported = False
@@ -1089,8 +981,21 @@ class ChatService:
                         for _, phrase in resolved_anchors_for_sentence.values()
                         if phrase is not None
                     }
+                    supported_claim_text = (
+                        next(iter(verified_phrases))
+                        if len(cite_matches) == 1 and verified_phrases
+                        else clean_claim
+                    )
+                    validated_claim_supports.append(
+                        ClaimEvidenceSupport(
+                            claim_text=supported_claim_text,
+                            evidence_ids=list(
+                                dict.fromkeys(f"E{match.group(1)}" for match in cite_matches)
+                            ),
+                        )
+                    )
                     if len(cite_matches) == 1 and verified_phrases:
-                        phrase = next(iter(verified_phrases))
+                        phrase = supported_claim_text
                         e_id = f"E{cite_matches[0].group(1)}"
                         display_index = citation_to_display_index[e_id]
                         retained_line_sentences.append(f"“{phrase}” [{display_index}]")
@@ -1209,6 +1114,7 @@ class ChatService:
             role=MessageRole.ASSISTANT,
             content=formatted_answer,
             citations=validated_citations,
+            claim_supports=validated_claim_supports,
             evidence=evidence_items,
             model_name=assistant_msg.model_name,
             token_count=assistant_msg.token_count,

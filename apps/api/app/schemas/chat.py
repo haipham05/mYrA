@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.schemas.evidence import Citation, EvidenceItem
+from app.schemas.evidence import Citation, ClaimEvidenceSupport, EvidenceItem
 
 
 class MessageRole(StrEnum):
@@ -51,6 +51,7 @@ class MessageResponse(BaseModel):
     role: MessageRole
     content: str
     citations: list[Citation] = Field(default_factory=list)
+    claim_supports: list[ClaimEvidenceSupport] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
     model_name: str | None = None
     token_count: int | None = None

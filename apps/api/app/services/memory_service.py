@@ -22,13 +22,10 @@ from app.db.models import (
     PaperElement,
     PaperPage,
 )
-from app.ingestion.parser import find_verbatim_span
 from app.observability.telemetry import get_telemetry
 from app.schemas.evidence import (
     AnchorStatus,
-    BoundingBox,
     CitationAnchor,
-    CoordinateOrigin,
     EvidenceItem,
 )
 from app.schemas.memory import (
@@ -39,6 +36,7 @@ from app.schemas.memory import (
     MemoryType,
 )
 from app.services.error_sanitizer import redact_secrets
+from app.services.source_resolution import resolve_exact_source_anchor
 
 # Regex patterns for extracting decisions, preferences, and terminology from utterances
 DECISION_PATTERNS = [
@@ -639,46 +637,23 @@ def _resolve_paper_memory_source(
     if not elements:
         return None, None, AnchorStatus.UNRESOLVED
 
-    # 3. Verify page text and locate unambiguous verbatim character span
-    page = (
-        db.query(PaperPage)
-        .filter(PaperPage.paper_id == paper.id, PaperPage.page_number == source.page_number)
-        .first()
+    # 3. Resolve source existence centrally against canonical page text. Claim
+    # support remains the caller's separate responsibility.
+    anchor = resolve_exact_source_anchor(
+        db,
+        project_id=project_id,
+        paper_id=paper.id,
+        page_number=source.page_number,
+        exact_quote=source.quote_text.strip(),
+        document_sha256=source.document_sha256,
     )
-    page_text = page.raw_text if (page and page.raw_text) else ""
-    if not page_text and elements:
-        page_text = "\n\n".join(elem.text for elem in elements if elem.text)
-
-    if not page_text:
+    if not anchor or not anchor.source_element_id:
         return None, None, AnchorStatus.UNRESOLVED
-
-    span = find_verbatim_span(page_text, source.quote_text.strip())
-    if span is None:
-        # Quote missing or ambiguous (multiple occurrences without offset)
+    start_char, end_char = anchor.source_char_start, anchor.source_char_end
+    if start_char is None or end_char is None:
         return None, None, AnchorStatus.UNRESOLVED
-
-    start_char, end_char = span
-
-    best_elem: PaperElement | None = None
     normalized_quote = source.quote_text.strip().lower()
-    for elem in elements:
-        if elem.text and normalized_quote in elem.text.strip().lower():
-            best_elem = elem
-            break
-
-    if best_elem is None:
-        # Match element by highest word overlap on this page
-        quote_words = set(re.findall(r"\w+", normalized_quote))
-        best_score = 0
-        for elem in elements:
-            if not elem.text:
-                continue
-            elem_words = set(re.findall(r"\w+", elem.text.lower()))
-            overlap = len(quote_words & elem_words)
-            if overlap > best_score:
-                best_score = overlap
-                best_elem = elem
-
+    best_elem = next((elem for elem in elements if elem.id == anchor.source_element_id), None)
     if best_elem is None or not best_elem.parser_version:
         return None, None, AnchorStatus.UNRESOLVED
 
@@ -717,26 +692,8 @@ def _resolve_paper_memory_source(
         # Missing or deleted chunk
         return None, None, AnchorStatus.UNRESOLVED
 
-    # 5. Extract bounding boxes from best_elem
-    bboxes: list[BoundingBox] = []
-    if best_elem.bbox_x_min is not None and best_elem.page_width and best_elem.page_height:
-        coord_origin = (
-            CoordinateOrigin(best_elem.coordinate_origin)
-            if best_elem.coordinate_origin
-            else CoordinateOrigin.TOP_LEFT
-        )
-        bboxes.append(
-            BoundingBox(
-                x_min=best_elem.bbox_x_min,
-                y_min=best_elem.bbox_y_min or 0.0,
-                x_max=best_elem.bbox_x_max or 0.0,
-                y_max=best_elem.bbox_y_max or 0.0,
-                page_width=best_elem.page_width,
-                page_height=best_elem.page_height,
-                origin=coord_origin,
-                rotation=best_elem.rotation or 0,
-            )
-        )
+    # 5. Reuse the resolver's display geometry; exact offsets are authoritative.
+    bboxes = anchor.bounding_boxes
 
     # 6. Construct verified CitationAnchor and EvidenceItem
     anchor = CitationAnchor(

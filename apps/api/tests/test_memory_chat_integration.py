@@ -444,7 +444,7 @@ async def test_chat_publishes_only_verified_quote_from_unsupported_wrapper(
         patch("app.services.chat_service.retrieve_graph_evidence", return_value=([], None)),
         patch(
             "app.services.embedding.get_embedding_provider",
-            return_value=MagicMock(embed_query=MagicMock(return_value=None)),
+            return_value=MagicMock(embed_query=MagicMock(return_value=[0.1, 0.2, 0.3])),
         ),
     ):
         response = await ChatService(retriever=retriever).answer_question(
@@ -457,6 +457,11 @@ async def test_chat_publishes_only_verified_quote_from_unsupported_wrapper(
     assert "proves" not in response.content
     assert f"“{quote.removesuffix('.')}” [1]" == response.content
     assert len(response.citations) == 1
+    assert retriever.retrieve.call_args.kwargs["query_embedding"] == [0.1, 0.2, 0.3]
+    assert len(response.claim_supports) == 1
+    assert response.claim_supports[0].claim_text == quote.removesuffix(".")
+    assert response.claim_supports[0].evidence_ids == ["E1"]
+    assert "cures cancer" not in response.claim_supports[0].claim_text
 
     messages, _ = list_messages(db, conv.id)
     saved_answer = messages[-1]

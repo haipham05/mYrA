@@ -6,6 +6,8 @@ from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import Connection, Engine
 
+from app.config import Settings
+
 logger = logging.getLogger("myra.db.compatibility")
 
 
@@ -89,3 +91,18 @@ def check_schema_compatibility(
         "schema_compatibility_verified",
         extra={"current_revision": current_rev, "expected_heads": expected_heads},
     )
+
+
+def check_budget_schema_compatibility(settings: Settings) -> None:
+    """Verify the separate persistent budget ledger when a data profile is explicit."""
+    if settings.runtime_profile not in {"local", "cloud-data"}:
+        return
+
+    from app.db.session import engine, get_budget_session_factory
+
+    budget_engine = get_budget_session_factory(settings).kw.get("bind")
+    if not isinstance(budget_engine, Engine):
+        raise IncompatibleSchemaError("Provider budget ledger database is unavailable")
+    if budget_engine is engine:
+        return
+    check_schema_compatibility(budget_engine)

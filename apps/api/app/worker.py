@@ -70,10 +70,14 @@ async def run_worker(
     configure_logging(settings.log_level)
 
     if settings.check_migration_compatibility:
-        from app.db.compatibility import check_schema_compatibility
+        from app.db.compatibility import (
+            check_budget_schema_compatibility,
+            check_schema_compatibility,
+        )
         from app.db.session import engine
 
         check_schema_compatibility(engine)
+        check_budget_schema_compatibility(settings)
 
     worker_id = f"worker-{os.getpid()}-{uuid4().hex[:6]}"
     logger.info("worker_started", extra={"worker_id": worker_id})

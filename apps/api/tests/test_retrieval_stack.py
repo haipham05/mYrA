@@ -43,6 +43,29 @@ def test_cosine_similarity():
     assert cosine_similarity([0.0, 0.0], [0.0, 0.0]) == 0.0
 
 
+def test_retrieve_forwards_shared_query_embedding(monkeypatch):
+    retriever = HybridRetriever()
+    observed = {}
+
+    def fake_impl(db, project_id, query, telemetry, strategy, *, query_embedding=None):
+        observed.update(
+            db=db,
+            project_id=project_id,
+            query=query,
+            strategy=strategy,
+            query_embedding=query_embedding,
+        )
+        return []
+
+    monkeypatch.setattr(retrieval_module, "get_telemetry", lambda: None)
+    monkeypatch.setattr(retriever, "_retrieve_impl", fake_impl)
+    vector = [0.1, 0.2, 0.3]
+
+    assert retriever.retrieve(None, uuid4(), "shared query", query_embedding=vector) == []
+    assert observed["query_embedding"] == vector
+    assert observed["query"] == "shared query"
+
+
 def test_retrieval_observation_records_metadata_without_content():
     recorded = []
 

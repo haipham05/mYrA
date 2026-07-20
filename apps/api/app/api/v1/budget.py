@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.db.models import ProviderBudgetDay, ProviderBudgetReservation
-from app.db.session import get_db
+from app.db.session import get_budget_db
 from app.services.budget import DAILY_LIMIT_USD, get_budget_manager
 
 router = APIRouter(prefix="/budget", tags=["budget"])
@@ -72,7 +72,7 @@ def _totals(rows: list[ProviderBudgetReservation], committed: Decimal) -> Budget
 @router.get("/usage", response_model=BudgetUsageResponse)
 def get_budget_usage(
     run_id: str | None = Query(default=None, min_length=1, max_length=64),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_budget_db),
 ) -> BudgetUsageResponse:
     """Return today's budget and, when requested, estimates for one run."""
     settings = Settings.from_environment()

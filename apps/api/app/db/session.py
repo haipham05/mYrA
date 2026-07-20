@@ -35,6 +35,26 @@ def resolve_database_url(settings: Settings) -> str:
     return settings.database_url or "sqlite:///./myra_dev.db"
 
 
+def resolve_budget_database_url(settings: Settings) -> str | None:
+    """Keep the spend ledger on the persistent local database across data profiles."""
+    if settings.runtime_profile == "auto":
+        return None
+    database_url = settings.budget_database_url
+    if settings.runtime_profile == "local" and database_url is None:
+        database_url = resolve_database_url(settings)
+    if database_url is None:
+        raise ValueError("cloud-data profile requires MYRA_BUDGET_DATABASE_URL")
+
+    parsed = urlsplit(database_url)
+    local_hosts = {"localhost", "127.0.0.1", "::1", "myra-local-postgres"}
+    if (
+        parsed.scheme not in {"postgresql", "postgresql+psycopg2"}
+        or parsed.hostname not in local_hosts
+    ):
+        raise ValueError("MYRA_BUDGET_DATABASE_URL must target local PostgreSQL")
+    return database_url
+
+
 DATABASE_URL = resolve_database_url(settings)
 
 connect_args = {}
@@ -58,9 +78,43 @@ def set_sqlite_pragma(dbapi_connection: Any, connection_record: Any) -> None:
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+_budget_engine: Engine | None = None
+_budget_engine_url: str | None = None
+_budget_session_factory: sessionmaker | None = None
+
+
+def get_budget_session_factory(settings: Settings) -> sessionmaker:
+    """Return the local persistent ledger session, independent of cloud corpus selection."""
+    database_url = resolve_budget_database_url(settings)
+    if database_url is None or database_url == DATABASE_URL:
+        return SessionLocal
+
+    global _budget_engine, _budget_engine_url, _budget_session_factory
+    if _budget_session_factory is None or _budget_engine_url != database_url:
+        if _budget_engine is not None:
+            _budget_engine.dispose()
+        _budget_engine = create_engine(database_url, pool_pre_ping=True)
+        _budget_session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=_budget_engine,
+        )
+        _budget_engine_url = database_url
+    return _budget_session_factory
+
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_budget_db() -> Generator[Session, None, None]:
+    """Yield a session from the persistent local budget ledger database."""
+    factory = get_budget_session_factory(Settings.from_environment())
+    db = factory()
     try:
         yield db
     finally:

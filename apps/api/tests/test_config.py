@@ -5,7 +5,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.db.session import resolve_database_url
+from app.db.session import (
+    get_budget_session_factory,
+    resolve_budget_database_url,
+    resolve_database_url,
+)
 from app.logging import JsonFormatter
 from app.storage.factory import get_storage, set_storage
 from app.storage.gcs import GCSStorage
@@ -93,12 +97,14 @@ def test_cloud_data_profile_selects_gcs_explicitly(monkeypatch) -> None:
     settings = Settings(
         runtime_profile="cloud-data",
         database_url="postgresql+psycopg2://user:secret@db.example.com:5432/myra",
+        budget_database_url="postgresql+psycopg2://user:secret@myra-local-postgres:5432/myra",
         gcs_bucket_name="research-bucket",
     )
     set_storage(None)
     try:
         assert isinstance(get_storage(settings), GCSStorage)
         assert resolve_database_url(settings) == settings.database_url
+        assert resolve_budget_database_url(settings) == settings.budget_database_url
     finally:
         set_storage(None)
 
@@ -107,11 +113,44 @@ def test_cloud_data_profile_rejects_sqlite_database_url() -> None:
     settings = Settings(
         runtime_profile="cloud-data",
         database_url="sqlite:///./local.db",
+        budget_database_url="postgresql+psycopg2://user:secret@myra-local-postgres:5432/myra",
         gcs_bucket_name="research-bucket",
     )
 
     with pytest.raises(ValueError, match="must target PostgreSQL"):
         resolve_database_url(settings)
+
+
+def test_cloud_data_profile_requires_a_local_budget_database() -> None:
+    with pytest.raises(ValidationError, match="requires MYRA_BUDGET_DATABASE_URL"):
+        Settings(
+            runtime_profile="cloud-data",
+            database_url="postgresql+psycopg2://user:secret@db.example.com:5432/myra",
+            gcs_bucket_name="research-bucket",
+        )
+
+
+def test_cloud_data_budget_rejects_a_remote_database() -> None:
+    settings = Settings(
+        runtime_profile="cloud-data",
+        database_url="postgresql+psycopg2://user:secret@db.example.com:5432/myra",
+        budget_database_url="postgresql+psycopg2://user:secret@db.example.com:5432/myra",
+        gcs_bucket_name="research-bucket",
+    )
+    with pytest.raises(ValueError, match="must target local PostgreSQL"):
+        resolve_budget_database_url(settings)
+
+
+def test_cloud_data_budget_session_uses_local_ledger_database() -> None:
+    settings = Settings(
+        runtime_profile="cloud-data",
+        database_url="postgresql+psycopg2://user:secret@cloud-db.example:5432/myra",
+        budget_database_url="postgresql+psycopg2://user:secret@myra-local-postgres:5432/myra",
+        gcs_bucket_name="research-bucket",
+    )
+
+    factory = get_budget_session_factory(settings)
+    assert factory.kw["bind"].url.host == "myra-local-postgres"
 
 
 def test_settings_defaults_when_env_vars_absent(monkeypatch) -> None:

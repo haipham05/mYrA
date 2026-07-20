@@ -777,6 +777,7 @@ class HybridRetriever:
         project_id: UUID,
         query: str,
         *,
+        query_embedding: list[float] | None = None,
         strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
     ) -> list[EvidenceItem]:
         """Retrieve evidence; ``strategy`` is an opt-in evaluation ablation seam.
@@ -801,7 +802,9 @@ class HybridRetriever:
                 "strategy": strategy,
             },
         ):
-            return self._retrieve_impl(db, project_id, query, telemetry, strategy)
+            return self._retrieve_impl(
+                db, project_id, query, telemetry, strategy, query_embedding=query_embedding
+            )
 
     def _retrieve_impl(
         self,
@@ -810,6 +813,8 @@ class HybridRetriever:
         query: str,
         telemetry,
         strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
+        *,
+        query_embedding: list[float] | None = None,
     ) -> list[EvidenceItem]:
         embed_provider = get_embedding_provider()
         with _retrieval_observation(
@@ -820,7 +825,11 @@ class HybridRetriever:
                 "embedding_revision": embed_provider.model_version,
             },
         ) as observation:
-            query_vec = embed_provider.embed_query(query)
+            query_vec = (
+                query_embedding
+                if query_embedding is not None
+                else embed_provider.embed_query(query)
+            )
             if observation is not None:
                 observation.update(
                     metadata={"vector_dimensions": len(query_vec)},

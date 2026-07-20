@@ -386,7 +386,7 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
     # Verify contradiction instructions were added to system prompt
     _, kwargs = mock_llm.generate.call_args
     assert "CONTRADICTION ANALYSIS:" in kwargs["system_prompt"]
-    assert "present each side as its own source-supported statement" in kwargs["system_prompt"]
+    assert "Present each side as its own source-supported statement" in kwargs["system_prompt"]
 
 
 # =============================================================================

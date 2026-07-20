@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from app.api.v1 import budget as budget_api
 from app.db.base import Base
 from app.db.models import ProviderBudgetDay
-from app.db.session import get_db
+from app.db.session import get_budget_db, get_db
 from app.main import app
 from app.services.budget import BudgetManager
 
@@ -20,22 +20,37 @@ def budget_api_context(tmp_path, monkeypatch):
         f"sqlite:///{tmp_path / 'budget-api.sqlite'}", connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
-    session = factory()
-    manager = BudgetManager(factory)
+    main_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    session = main_factory()
+
+    ledger_engine = create_engine(
+        f"sqlite:///{tmp_path / 'budget-ledger.sqlite'}", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(ledger_engine)
+    ledger_factory = sessionmaker(bind=ledger_engine, expire_on_commit=False)
+    ledger_session = ledger_factory()
+    manager = BudgetManager(ledger_factory)
 
     def override_get_db():
         yield session
 
     app.dependency_overrides[get_db] = override_get_db
+
+    def override_get_budget_db():
+        yield ledger_session
+
+    app.dependency_overrides[get_budget_db] = override_get_budget_db
     monkeypatch.setenv("MYRA_RUNTIME_PROFILE", "local")
     monkeypatch.setattr(budget_api, "get_budget_manager", lambda: manager)
     with TestClient(app) as client:
         yield client, session, manager
     app.dependency_overrides.clear()
     session.close()
+    ledger_session.close()
     Base.metadata.drop_all(engine)
     engine.dispose()
+    Base.metadata.drop_all(ledger_engine)
+    ledger_engine.dispose()
 
 
 def test_budget_usage_requires_explicit_profile(budget_api_context, monkeypatch):

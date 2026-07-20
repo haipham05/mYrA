@@ -16,6 +16,12 @@ class AnchorStatus(StrEnum):
     LEGACY = "legacy"
 
 
+class ClaimSupportKind(StrEnum):
+    SOURCE_BACKED = "source_backed"
+    DERIVED = "derived"
+    INTERPRETATION = "interpretation"
+
+
 class BoundingBox(BaseModel):
     x_min: float
     y_min: float
@@ -128,3 +134,11 @@ class Citation(BaseModel):
             if not data.get("quote", "").strip():
                 data["anchor_status"] = AnchorStatus.UNRESOLVED
         return data
+
+
+class ClaimEvidenceSupport(BaseModel):
+    """Structured mapping from one validated answer claim to its evidence IDs."""
+
+    claim_text: str
+    evidence_ids: list[str] = Field(min_length=1)
+    support_kind: ClaimSupportKind = ClaimSupportKind.SOURCE_BACKED

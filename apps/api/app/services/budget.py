@@ -265,9 +265,9 @@ def get_budget_manager() -> BudgetManager | None:
     if settings.runtime_profile not in {"local", "cloud-data"}:
         return None
     if _budget_manager is None:
-        from app.db.session import SessionLocal
+        from app.db.session import get_budget_session_factory
 
-        _budget_manager = BudgetManager(SessionLocal)
+        _budget_manager = BudgetManager(get_budget_session_factory(settings))
     return _budget_manager
 
 

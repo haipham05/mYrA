@@ -17,6 +17,7 @@ class Settings(BaseModel):
     )
     cors_headers: list[str] = Field(default_factory=lambda: ["*"])
     database_url: str | None = None
+    budget_database_url: str | None = None
     local_storage_root: str = "data/storage"
     supabase_project_ref: str | None = None
     google_cloud_project: str | None = None
@@ -46,6 +47,8 @@ class Settings(BaseModel):
                 raise ValueError("cloud-data profile requires DATABASE_URL")
             if not self.gcs_bucket_name:
                 raise ValueError("cloud-data profile requires GCS_BUCKET_NAME")
+            if not self.budget_database_url:
+                raise ValueError("cloud-data profile requires MYRA_BUDGET_DATABASE_URL")
         return self
 
     @classmethod
@@ -65,6 +68,8 @@ class Settings(BaseModel):
             values["cors_headers"] = json.loads(cors_headers)
         if database_url := os.getenv("DATABASE_URL"):
             values["database_url"] = database_url
+        if budget_database_url := os.getenv("MYRA_BUDGET_DATABASE_URL"):
+            values["budget_database_url"] = budget_database_url
         if storage_root := os.getenv("MYRA_LOCAL_STORAGE_ROOT"):
             values["local_storage_root"] = storage_root
         if supabase_ref := os.getenv("SUPABASE_PROJECT_REF"):
