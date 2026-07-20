@@ -67,6 +67,14 @@ class Paper(Base):
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
     storage_path: Mapped[str] = mapped_column(String(1000), nullable=False)
     document_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authors: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    publication_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    doi: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    arxiv_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    abstract: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_provenance: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(
         String(50), default="PROCESSING", nullable=False, index=True
     )

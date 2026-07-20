@@ -1,6 +1,7 @@
 from app.services.claim_validation import (
     claim_clauses_for_citations,
     is_explicit_comparison,
+    is_explicit_interpretation,
 )
 
 
@@ -29,6 +30,8 @@ def test_single_citation_keeps_full_claim_and_comparison_detection_is_explicit()
     ) == ["The method improved accuracy."]
     assert is_explicit_comparison("Paper A is lower than Paper B")
     assert not is_explicit_comparison("Paper A reports an accuracy result")
+    assert is_explicit_interpretation("Taken together, these results suggest a limitation")
+    assert not is_explicit_interpretation("The paper reports an accuracy result")
 
 
 def test_uncited_tail_remains_attached_to_last_cited_clause():

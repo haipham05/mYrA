@@ -389,11 +389,11 @@ async def test_verified_paper_memory_routes_through_evidence_and_citations(db: S
     "wrapped_claim",
     [
         (
-            'The paper proves "The Transformer model relies entirely on '
+            'This suggests the paper proves "The Transformer model relies entirely on '
             'self-attention" and cures cancer.'
         ),
         (
-            "The paper proves **The Transformer model relies entirely on "
+            "This suggests the paper proves **The Transformer model relies entirely on "
             "self-attention** and cures cancer."
         ),
     ],
@@ -462,6 +462,7 @@ async def test_chat_publishes_only_verified_quote_from_unsupported_wrapper(
     assert response.claim_supports[0].claim_text == quote.removesuffix(".")
     assert response.claim_supports[0].evidence_ids == ["E1"]
     assert "cures cancer" not in response.claim_supports[0].claim_text
+    assert all(support.support_kind != "interpretation" for support in response.claim_supports)
 
     messages, _ = list_messages(db, conv.id)
     saved_answer = messages[-1]

@@ -408,14 +408,18 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
         f"Paper A reports “{quote_a.removesuffix('.')}” [E1] proving it is universally best, "
         f"whereas Paper B reports “{quote_b.removesuffix('.')}” [E2]."
     )
-    wrapped_response = await chat_service.answer_question(
-        db=db,
-        conversation_id=conv.id,
-        question="Compare those findings again.",
-    )
+    prior_generation_calls = mock_llm.generate.await_count
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        wrapped_response = await chat_service.answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="Compare those findings again.",
+        )
+    assert mock_llm.generate.await_count == prior_generation_calls + 1
     assert "universally best" not in wrapped_response.content
     assert "Insufficient evidence" in wrapped_response.content
     assert wrapped_response.citations == []
+    assert wrapped_response.claim_supports == []
 
 
 # =============================================================================
@@ -435,7 +439,7 @@ async def test_ordinary_factual_qa_unchanged(db: Session):
 
     conv = create_conversation(db, project_id=project.id, title="Factual Query")
 
-    quote = "Our architecture achieves 92.4% accuracy on ImageNet benchmarks."
+    quote = "The result suggests our architecture achieves 92.4% accuracy on ImageNet benchmarks."
     doc_hash = "c" * 64
     paper, chunk, elem = _setup_ground_truth_paper(
         db, project.id, "Vision Transformer", quote, doc_hash
@@ -487,9 +491,7 @@ async def test_ordinary_factual_qa_unchanged(db: Session):
     mock_repo.get_node_neighbors.return_value = []
 
     mock_llm = AsyncMock()
-    mock_llm.generate.return_value = (
-        "Our architecture achieves 92.4% accuracy on ImageNet benchmarks [E1]."
-    )
+    mock_llm.generate.return_value = f"{quote} [E1]"
     mock_llm.model_name = "test-deepseek"
 
     with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
@@ -504,6 +506,14 @@ async def test_ordinary_factual_qa_unchanged(db: Session):
     assert len(resp.citations) == 1
     assert resp.citations[0].anchor_status == AnchorStatus.VERIFIED
     assert resp.citations[0].paper_id == paper.id
+    interpretation_claims = [
+        support
+        for support in resp.claim_supports
+        if support.support_kind == ClaimSupportKind.INTERPRETATION
+    ]
+    assert len(interpretation_claims) == 1
+    assert interpretation_claims[0].evidence_ids == ["E1"]
+    assert "suggests" in interpretation_claims[0].claim_text
 
     # Verify no contradiction instructions or outage notice in prompt
     _, kwargs = mock_llm.generate.call_args

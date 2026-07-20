@@ -149,6 +149,15 @@ def test_paper_upload_and_validation(test_env):
         papers_resp = client.get(f"/api/v1/projects/{project_id}/papers")
         assert papers_resp.status_code == 200
         assert papers_resp.json()["total"] == 1
+        listed_paper = papers_resp.json()["items"][0]
+        assert listed_paper["title"] is None
+        assert listed_paper["authors"] is None
+        assert listed_paper["metadata_provenance"] is None
+
+        detail_resp = client.get(f"/api/v1/papers/{paper_id}")
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["filename"] == "valid.pdf"
+        assert detail_resp.json()["doi"] is None
 
 
 @pytest.mark.anyio

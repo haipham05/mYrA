@@ -20,7 +20,11 @@ from app.schemas.evidence import (
 )
 from app.schemas.memory import MemoryStatus, MemoryType
 from app.services.chat_prompts import build_chat_system_prompt, build_chat_user_prompt
-from app.services.claim_validation import claim_clauses_for_citations, is_explicit_comparison
+from app.services.claim_validation import (
+    claim_clauses_for_citations,
+    is_explicit_comparison,
+    is_explicit_interpretation,
+)
 from app.services.evidence_assembly import assemble_evidence_items
 from app.services.graphrag.neo4j_repository import Neo4jRepository
 from app.services.graphrag.router import (
@@ -1037,6 +1041,16 @@ class ChatService:
                                     dict.fromkeys(f"E{match.group(1)}" for match in cite_matches)
                                 ),
                                 support_kind="derived",
+                            )
+                        )
+                    if not verified_phrases and is_explicit_interpretation(clean_claim):
+                        validated_claim_supports.append(
+                            ClaimEvidenceSupport(
+                                claim_text=clean_claim,
+                                evidence_ids=list(
+                                    dict.fromkeys(f"E{match.group(1)}" for match in cite_matches)
+                                ),
+                                support_kind="interpretation",
                             )
                         )
                     if len(cite_matches) == 1 and verified_phrases:

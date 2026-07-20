@@ -99,6 +99,27 @@ def test_schemas_instantiation() -> None:
         updated_at=now,
     )
     assert paper.status == PaperStatus.READY
+    assert paper.title is None
+    assert paper.authors is None
+    assert paper.metadata_provenance is None
+
+    paper_with_metadata = paper.model_copy(
+        update={
+            "title": "Attention Is All You Need",
+            "authors": ["Ashish Vaswani", "Noam Shazeer"],
+            "publication_year": 2017,
+            "doi": "10.48550/arXiv.1706.03762",
+            "arxiv_id": "1706.03762",
+            "abstract": "A paper about attention-based sequence models.",
+            "source_url": "https://arxiv.org/abs/1706.03762",
+            "metadata_provenance": {"title": "manual", "abstract": "catalog"},
+        }
+    )
+    assert paper_with_metadata.authors == ["Ashish Vaswani", "Noam Shazeer"]
+    assert paper_with_metadata.metadata_provenance == {
+        "title": "manual",
+        "abstract": "catalog",
+    }
 
     job = JobResponse(
         id=job_id,

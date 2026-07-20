@@ -58,3 +58,14 @@ def is_explicit_comparison(text: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+def is_explicit_interpretation(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(suggests?|implies?|indicates?|may\s+mean|might\s+mean|likely\s+means?|"
+            r"we\s+infer|can\s+infer|taken\s+together|this\s+means)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
