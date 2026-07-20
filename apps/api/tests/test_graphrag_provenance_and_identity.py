@@ -145,6 +145,35 @@ def test_graph_source_rejects_stale_parser_version(db_session: Session):
     assert status == AnchorStatus.UNRESOLVED
 
 
+def test_graph_source_preserves_unknown_legacy_parser_version(db_session: Session):
+    manifest = validate_manifest(load_manifest())
+    provenance = manifest.projects["project_a"].papers[0].relationships[0].provenance
+    paper = db_session.query(Paper).filter(Paper.id == provenance.paper_id).one()
+    element = db_session.query(PaperElement).filter(PaperElement.id == provenance.element_id).one()
+    element.parser_version = None
+    supplied = GraphProvenanceSchema(
+        paper_id=provenance.paper_id,
+        chunk_id=provenance.chunk_id,
+        page_number=provenance.page_number,
+        element_id=provenance.element_id,
+        exact_quote=provenance.exact_quote,
+        char_start=provenance.char_start,
+        char_end=provenance.char_end,
+        document_sha256=paper.document_sha256,
+        parser_version=None,
+    )
+
+    anchor, status = resolve_graph_source_anchor(
+        db=db_session,
+        project_id=PROJECT_A_ID,
+        provenance=supplied,
+    )
+
+    assert status == AnchorStatus.VERIFIED
+    assert anchor is not None
+    assert anchor.parser_version is None
+
+
 def test_valid_quote_from_dict_without_element_id(db_session: Session):
     """Verify that provenance dict without element_id automatically resolves
     an overlapping element on the page."""

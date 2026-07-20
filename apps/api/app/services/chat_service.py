@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from collections import Counter
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -19,6 +20,7 @@ from app.schemas.evidence import (
 )
 from app.schemas.memory import MemoryStatus, MemoryType
 from app.services.chat_prompts import build_chat_system_prompt, build_chat_user_prompt
+from app.services.claim_validation import claim_clauses_for_citations, is_explicit_comparison
 from app.services.evidence_assembly import assemble_evidence_items
 from app.services.graphrag.neo4j_repository import Neo4jRepository
 from app.services.graphrag.router import (
@@ -911,24 +913,42 @@ class ChatService:
                     sentence_supported = True
                     resolved_anchors_for_sentence: dict[str, tuple[CitationAnchor, str | None]] = {}
                     clean_claim = re.sub(r"\[E\d+\]", "", sentence).strip()
+                    claim_segments = claim_clauses_for_citations(
+                        sentence,
+                        [(match.start(), match.end()) for match in cite_matches],
+                        clean_sentence=clean_claim,
+                    )
+                    claim_counts = Counter(claim_segments)
+                    claim_text_by_evidence_id: dict[str, str] = {}
 
-                    for m in cite_matches:
+                    for m, claim_segment in zip(cite_matches, claim_segments, strict=True):
                         e_id = f"E{m.group(1)}"
                         evidence = evidence_map[e_id]
                         anchor, source_phrase = resolve_claim_anchor(
                             db=db,
                             evidence=evidence,
-                            clean_claim=clean_claim,
-                            cite_count=len(cite_matches),
+                            clean_claim=claim_segment,
+                            cite_count=claim_counts[claim_segment],
                             project_id=project_id,
                         )
                         if anchor is None:
                             sentence_supported = False
                             break
                         resolved_anchors_for_sentence[e_id] = (anchor, source_phrase)
+                        claim_text_by_evidence_id[e_id] = claim_segment
 
                     if not sentence_supported:
                         # Unsupported claim: discard entire sentence
+                        citation_validation["rejected_unsupported_claim"] += len(cite_matches)
+                        continue
+
+                    # A source-verified quotation does not validate its generated
+                    # wrapper. Keep the single-citation extraction behavior below,
+                    # but reject a multi-source sentence rather than publishing
+                    # unsupported wrapper prose as part of a comparison.
+                    if len(cite_matches) > 1 and any(
+                        phrase is not None for _, phrase in resolved_anchors_for_sentence.values()
+                    ):
                         citation_validation["rejected_unsupported_claim"] += len(cite_matches)
                         continue
 
@@ -984,16 +1004,41 @@ class ChatService:
                     supported_claim_text = (
                         next(iter(verified_phrases))
                         if len(cite_matches) == 1 and verified_phrases
-                        else clean_claim
+                        else None
                     )
-                    validated_claim_supports.append(
-                        ClaimEvidenceSupport(
-                            claim_text=supported_claim_text,
-                            evidence_ids=list(
-                                dict.fromkeys(f"E{match.group(1)}" for match in cite_matches)
-                            ),
+                    support_groups: dict[str, list[str]] = {}
+                    for match in cite_matches:
+                        evidence_id = f"E{match.group(1)}"
+                        claim_text = claim_text_by_evidence_id[evidence_id]
+                        if len(cite_matches) == 1 and supported_claim_text:
+                            claim_text = supported_claim_text
+                        support_groups.setdefault(claim_text, []).append(evidence_id)
+                    for claim_text, evidence_ids in support_groups.items():
+                        validated_claim_supports.append(
+                            ClaimEvidenceSupport(
+                                claim_text=claim_text,
+                                evidence_ids=list(dict.fromkeys(evidence_ids)),
+                            )
                         )
-                    )
+                    distinct_papers = {
+                        evidence_map[evidence_id].paper_id
+                        for match in cite_matches
+                        if (evidence_id := f"E{match.group(1)}") in evidence_map
+                    }
+                    if (
+                        len(support_groups) > 1
+                        and len(distinct_papers) > 1
+                        and is_explicit_comparison(clean_claim)
+                    ):
+                        validated_claim_supports.append(
+                            ClaimEvidenceSupport(
+                                claim_text=clean_claim,
+                                evidence_ids=list(
+                                    dict.fromkeys(f"E{match.group(1)}" for match in cite_matches)
+                                ),
+                                support_kind="derived",
+                            )
+                        )
                     if len(cite_matches) == 1 and verified_phrases:
                         phrase = supported_claim_text
                         e_id = f"E{cite_matches[0].group(1)}"

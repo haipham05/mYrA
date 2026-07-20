@@ -21,6 +21,23 @@ def test_contradiction_prompt_has_its_own_comparability_rules():
     assert "no direct contradiction" in prompt
 
 
+def test_relationship_prompt_distinguishes_correlation_from_causation():
+    prompt = build_chat_system_prompt(GraphIntent.RELATIONSHIP)
+
+    assert "RELATIONSHIP ANALYSIS:" in prompt
+    assert "causal mechanism" in prompt
+    assert "missing graph links as proof" in prompt
+
+
+def test_corpus_theme_prompt_limits_claims_to_retrieved_papers():
+    prompt = build_chat_system_prompt(GraphIntent.CORPUS_THEMES)
+
+    assert "CORPUS THEME ANALYSIS:" in prompt
+    assert "multiple papers" in prompt
+    assert "not as universal or exhaustive" in prompt
+    assert "does not establish absence from the full literature" in prompt
+
+
 def test_user_prompt_includes_only_relevant_supplied_sections():
     prompt = build_chat_user_prompt(
         question="Explain the result.",

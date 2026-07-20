@@ -48,6 +48,7 @@ from app.schemas.evidence import (
     AnchorStatus,
     BoundingBox,
     CitationAnchor,
+    ClaimSupportKind,
     CoordinateOrigin,
     EvidenceItem,
 )
@@ -353,7 +354,7 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
 
     mock_llm = AsyncMock()
     # LLM produces two-sided answer citing E1 and E2 individually
-    mock_llm.generate.return_value = f"{quote_a} [E1]. {quote_b} [E2]."
+    mock_llm.generate.return_value = f"{quote_a} [E1], whereas {quote_b} [E2]."
     mock_llm.model_name = "test-deepseek"
 
     mock_retriever = MagicMock()
@@ -383,10 +384,38 @@ async def test_two_sided_cited_contradiction_answer(db: Session):
     assert cit_b.quote == quote_b
     assert cit_b.document_sha256 == hash_b
 
+    source_claims = [
+        support
+        for support in resp.claim_supports
+        if support.support_kind == ClaimSupportKind.SOURCE_BACKED
+    ]
+    derived_claims = [
+        support
+        for support in resp.claim_supports
+        if support.support_kind == ClaimSupportKind.DERIVED
+    ]
+    assert {support.evidence_ids[0] for support in source_claims} == {"E1", "E2"}
+    assert len(derived_claims) == 1
+    assert derived_claims[0].evidence_ids == ["E1", "E2"]
+    assert "whereas" in derived_claims[0].claim_text
+
     # Verify contradiction instructions were added to system prompt
     _, kwargs = mock_llm.generate.call_args
     assert "CONTRADICTION ANALYSIS:" in kwargs["system_prompt"]
     assert "Present each side as its own source-supported statement" in kwargs["system_prompt"]
+
+    mock_llm.generate.return_value = (
+        f"Paper A reports “{quote_a.removesuffix('.')}” [E1] proving it is universally best, "
+        f"whereas Paper B reports “{quote_b.removesuffix('.')}” [E2]."
+    )
+    wrapped_response = await chat_service.answer_question(
+        db=db,
+        conversation_id=conv.id,
+        question="Compare those findings again.",
+    )
+    assert "universally best" not in wrapped_response.content
+    assert "Insufficient evidence" in wrapped_response.content
+    assert wrapped_response.citations == []
 
 
 # =============================================================================

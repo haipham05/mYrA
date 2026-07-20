@@ -122,7 +122,7 @@ def resolve_exact_source_anchor(
     current_parser_versions = list(
         dict.fromkeys(element.parser_version for element in overlapping if element.parser_version)
     )
-    if parser_version and parser_version not in current_parser_versions:
+    if parser_version and current_parser_versions and parser_version not in current_parser_versions:
         return None
     resolved_parser = current_parser_versions[0] if current_parser_versions else None
     return CitationAnchor(

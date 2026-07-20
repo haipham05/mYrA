@@ -44,6 +44,7 @@ def make_provenance(
     char_end: int | None = None,
     page_number: int = 1,
     sha256: str = SAMPLE_SHA256,
+    parser_version: str | None = "v1",
 ) -> GraphProvenanceSchema:
     if char_end is None:
         char_end = char_start + len(exact_quote)
@@ -56,7 +57,7 @@ def make_provenance(
         char_start=char_start,
         char_end=char_end,
         document_sha256=sha256,
-        parser_version="v1",
+        parser_version=parser_version,
     )
 
 
@@ -238,6 +239,12 @@ def test_provenance_valid():
     assert prov.char_end == 15 + len(quote)
     assert prov.exact_quote == quote
     assert prov.document_sha256 == SAMPLE_SHA256
+
+
+def test_legacy_provenance_does_not_assume_parser_version():
+    prov = make_provenance(parser_version=None)
+
+    assert prov.parser_version is None
 
 
 def test_provenance_char_span_mismatch_fails():

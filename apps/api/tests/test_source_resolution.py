@@ -169,3 +169,29 @@ def test_resolver_accepts_only_current_parser_version(tmp_path):
     finally:
         db.close()
         Base.metadata.drop_all(engine)
+
+
+def test_resolver_does_not_invent_version_for_legacy_elements(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'source-legacy-parser.db'}")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project, paper = _source_rows(db)
+        element = db.query(PaperElement).filter_by(paper_id=paper.id).one()
+        element.parser_version = None
+        db.commit()
+
+        anchor = resolve_exact_source_anchor(
+            db,
+            project_id=project.id,
+            paper_id=paper.id,
+            page_number=1,
+            exact_quote="Beta evidence.",
+            parser_version="unverifiable-legacy-input",
+        )
+
+        assert anchor is not None
+        assert anchor.parser_version is None
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)

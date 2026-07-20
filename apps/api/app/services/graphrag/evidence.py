@@ -152,7 +152,7 @@ def resolve_graph_fact_to_evidence(
                     "char_start": raw_prov.get("char_start"),
                     "char_end": raw_prov.get("char_end"),
                     "document_sha256": raw_prov.get("document_sha256"),
-                    "parser_version": raw_prov.get("parser_version") or "v1",
+                    "parser_version": raw_prov.get("parser_version"),
                 }
             else:
                 logger.debug("Fact dict has neither DB snapshot nor complete provenance fields")

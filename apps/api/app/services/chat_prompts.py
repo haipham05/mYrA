@@ -24,6 +24,25 @@ def build_chat_system_prompt(intent: GraphIntent, graph_notice: str | None = Non
             "- If no opposing statements appear in retrieved evidence, say no direct "
             "contradiction was found in the current evidence."
         )
+    elif intent == GraphIntent.RELATIONSHIP:
+        prompt += (
+            "\n\nRELATIONSHIP ANALYSIS:\n"
+            "- Describe the specific relationship and its direction using the cited evidence.\n"
+            "- Distinguish an observed association from a causal mechanism; do not infer causation "
+            "unless a source explicitly supports it.\n"
+            "- If the retrieved sources do not establish a connection, say so instead of treating "
+            "missing graph links as proof that no relationship exists."
+        )
+    elif intent == GraphIntent.CORPUS_THEMES:
+        prompt += (
+            "\n\nCORPUS THEME ANALYSIS:\n"
+            "- Identify recurring themes only when supported by evidence from multiple papers; "
+            "cite the supporting papers.\n"
+            "- State the scope of the papers represented in the supplied evidence.\n"
+            "- Describe a theme as recurring in this retrieved set, not as universal or "
+            "exhaustive. "
+            "Absence from retrieved evidence does not establish absence from the full literature."
+        )
     if graph_notice:
         prompt += f"\n\n[NOTE: {graph_notice}]"
     return prompt

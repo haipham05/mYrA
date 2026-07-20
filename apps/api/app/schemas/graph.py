@@ -225,7 +225,10 @@ class GraphProvenanceSchema(BaseModel):
         pattern=r"^[a-fA-F0-9]{64}$",
         description="SHA-256 hash of the authoritative paper PDF.",
     )
-    parser_version: str = Field(default="v1", description="Parser pipeline version.")
+    parser_version: str | None = Field(
+        default=None,
+        description="Parser pipeline version when supplied; omitted for legacy provenance.",
+    )
 
     @field_validator("document_sha256", mode="before")
     @classmethod

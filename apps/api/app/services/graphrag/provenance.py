@@ -225,7 +225,7 @@ def resolve_graph_source_anchor(
             )
         )
 
-    effective_parser_ver = element.parser_version or "v1"
+    effective_parser_ver = element.parser_version
 
     anchor = CitationAnchor(
         page_number=page_number,
