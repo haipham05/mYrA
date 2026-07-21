@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import ChatPanel from "@/components/ChatPanel";
 import MemoryInspector from "@/components/MemoryInspector";
+import PaperMetadataEditor from "@/components/PaperMetadataEditor";
 import PaperUploader from "@/components/PaperUploader";
 import PdfViewer from "@/components/PdfViewer";
 import ProjectSelector from "@/components/ProjectSelector";
@@ -26,9 +27,15 @@ export default function Home() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [papers, setPapers] = useState<Paper[]>([]);
+  const [paperTotal, setPaperTotal] = useState(0);
+  const [paperOffset, setPaperOffset] = useState(0);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [paperScope, setPaperScope] = useState<
+    "paper" | "selection" | "project"
+  >("project");
+  const [selectedPaperIds, setSelectedPaperIds] = useState<string[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [isAsking, setIsAsking] = useState(false);
@@ -117,6 +124,8 @@ export default function Home() {
           const pData = await papersRes.json();
           const items: Paper[] = pData.items || [];
           setPapers(items);
+          setPaperTotal(pData.total || 0);
+          setPaperOffset(pData.offset || 0);
           if (items.length > 0) {
             let matchedPaper: Paper | undefined;
             if (typeof window !== "undefined") {
@@ -132,6 +141,8 @@ export default function Home() {
           }
         } else if (!ignore) {
           setPapers([]);
+          setPaperTotal(0);
+          setPaperOffset(0);
           setSelectedPaper(null);
         }
 
@@ -204,6 +215,8 @@ export default function Home() {
           setConversations(convList);
           if (activeConv) {
             setConversation(activeConv);
+            setPaperScope(activeConv.paper_scope ?? "project");
+            setSelectedPaperIds(activeConv.selected_paper_ids ?? []);
             const msgsRes = await fetch(
               `${apiUrl}/api/v1/conversations/${activeConv.id}/messages`,
             );
@@ -234,18 +247,55 @@ export default function Home() {
     if (!selectedProject) return;
     try {
       const res = await fetch(
-        `${apiUrl}/api/v1/projects/${selectedProject.id}/papers`,
+        `${apiUrl}/api/v1/projects/${selectedProject.id}/papers?limit=50&offset=0`,
       );
       if (res.ok) {
         const data = await res.json();
         const items: Paper[] = data.items || [];
         setPapers(items);
+        setPaperTotal(data.total || 0);
+        setPaperOffset(data.offset || 0);
         if (items.length > 0 && !selectedPaper) {
           setSelectedPaper(items[0]);
         }
       }
     } catch {
       // Ignore
+    }
+  };
+
+  const searchProjectPapers = async (filters: {
+    q?: string;
+    status?: string;
+    year?: string;
+    offset: number;
+  }) => {
+    if (!selectedProject) return;
+    const params = new URLSearchParams({
+      limit: "50",
+      offset: String(filters.offset),
+    });
+    if (filters.q) params.set("q", filters.q);
+    if (filters.status) params.set("status", filters.status);
+    if (filters.year) params.set("year", filters.year);
+    const response = await fetch(
+      `${apiUrl}/api/v1/projects/${selectedProject.id}/papers?${params.toString()}`,
+    );
+    if (!response.ok) throw new Error("Could not load the paper list.");
+    const data = await response.json();
+    const items: Paper[] = data.items || [];
+    setPapers(items);
+    setPaperTotal(data.total || 0);
+    setPaperOffset(data.offset || 0);
+    if (
+      items.length > 0 &&
+      !items.some((paper) => paper.id === selectedPaper?.id)
+    ) {
+      setSelectedPaper(items[0]);
+      setActiveCitation(null);
+    } else if (items.length === 0) {
+      setSelectedPaper(null);
+      setActiveCitation(null);
     }
   };
 
@@ -266,6 +316,8 @@ export default function Home() {
   // Switch conversation
   const handleSelectConversation = async (conv: Conversation) => {
     setConversation(conv);
+    setPaperScope(conv.paper_scope ?? "project");
+    setSelectedPaperIds(conv.selected_paper_ids ?? []);
     setActiveCitation(null);
     try {
       const msgsRes = await fetch(
@@ -332,6 +384,8 @@ export default function Home() {
         const newConv: Conversation = await res.json();
         setConversations((prev) => [newConv, ...prev]);
         setConversation(newConv);
+        setPaperScope(newConv.paper_scope ?? "project");
+        setSelectedPaperIds(newConv.selected_paper_ids ?? []);
         setMessages([]);
         setActiveCitation(null);
       } else {
@@ -474,6 +528,13 @@ export default function Home() {
     const citedPaper = papers.find((p) => p.id === citation.paper_id);
     if (citedPaper) {
       setSelectedPaper(citedPaper);
+    } else {
+      fetch(`${apiUrl}/api/v1/papers/${citation.paper_id}`)
+        .then((response) => (response.ok ? response.json() : null))
+        .then((paper: Paper | null) => {
+          if (paper) setSelectedPaper(paper);
+        })
+        .catch(() => {});
     }
   };
 
@@ -484,12 +545,83 @@ export default function Home() {
     setSelectedPaper(null);
     setActiveCitation(null);
     setPapers([]);
+    setPaperTotal(0);
+    setPaperOffset(0);
     setConversations([]);
     setConversation(null);
+    setPaperScope("project");
+    setSelectedPaperIds([]);
     setMessages([]);
   };
 
-  const hasReadyPaper = papers.some((p) => p.status === "READY");
+  const saveConversationScope = async (
+    nextScope: "paper" | "selection" | "project",
+    nextPaperIds: string[],
+  ) => {
+    if (!conversation) throw new Error("Choose a conversation first.");
+    const response = await fetch(
+      `${apiUrl}/api/v1/conversations/${conversation.id}?project_id=${conversation.project_id}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paper_scope: nextScope,
+          selected_paper_ids: nextPaperIds,
+        }),
+      },
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || "Could not save the conversation scope.");
+    }
+    const updated: Conversation = await response.json();
+    setPaperScope(updated.paper_scope ?? "project");
+    setSelectedPaperIds(updated.selected_paper_ids ?? []);
+    setConversation(updated);
+    setConversations((current) =>
+      current.map((item) => (item.id === updated.id ? updated : item)),
+    );
+  };
+
+  const handlePaperScopeChange = async (
+    nextScope: "paper" | "selection" | "project",
+  ) => {
+    let nextIds = selectedPaperIds;
+    if (nextScope === "project") nextIds = [];
+    if (nextScope === "paper") {
+      nextIds = selectedPaperIds.slice(0, 1);
+      if (nextIds.length === 0 && selectedPaper) nextIds = [selectedPaper.id];
+    }
+    await saveConversationScope(nextScope, nextIds);
+  };
+
+  const handleSelectedPaperIdsChange = async (
+    paperId: string,
+    checked: boolean,
+  ) => {
+    const nextIds =
+      paperScope === "paper"
+        ? checked
+          ? [paperId]
+          : []
+        : checked
+          ? [...new Set([...selectedPaperIds, paperId])]
+          : selectedPaperIds.filter((id) => id !== paperId);
+    await saveConversationScope(paperScope, nextIds);
+  };
+
+  const handlePaperMetadataUpdated = (updatedPaper: Paper) => {
+    setPapers((current) =>
+      current.map((paper) =>
+        paper.id === updatedPaper.id ? updatedPaper : paper,
+      ),
+    );
+    setSelectedPaper(updatedPaper);
+  };
+
+  const hasReadyPaper =
+    selectedPaper?.status === "READY" ||
+    papers.some((p) => p.status === "READY");
 
   return (
     <div className="flex min-h-screen flex-col bg-zinc-50 font-sans text-zinc-900">
@@ -630,13 +762,29 @@ export default function Home() {
             {/* Paper Ingestion Section */}
             <section>
               <PaperUploader
+                key={selectedProject?.id ?? "no-project"}
                 projectId={selectedProject?.id || null}
                 apiUrl={apiUrl}
                 papers={papers}
+                total={paperTotal}
+                offset={paperOffset}
                 selectedPaper={selectedPaper}
                 onPaperSelect={setSelectedPaper}
                 onUploadSuccess={refreshPapers}
+                onSearch={searchProjectPapers}
+                paperScope={paperScope}
+                selectedPaperIds={selectedPaperIds}
+                onScopeChange={handlePaperScopeChange}
+                onSelectedPaperIdsChange={handleSelectedPaperIdsChange}
               />
+              {selectedPaper && (
+                <PaperMetadataEditor
+                  key={selectedPaper.id}
+                  paper={selectedPaper}
+                  apiUrl={apiUrl}
+                  onUpdated={handlePaperMetadataUpdated}
+                />
+              )}
             </section>
 
             {/* Split Screen QA and PDF Citation Viewer */}
@@ -651,7 +799,11 @@ export default function Home() {
                   onSendMessage={handleSendMessage}
                   onCitationClick={handleCitationClick}
                   activeCitation={activeCitation}
-                  disabled={!hasReadyPaper || !conversation}
+                  disabled={
+                    !hasReadyPaper ||
+                    !conversation ||
+                    (paperScope !== "project" && selectedPaperIds.length === 0)
+                  }
                   conversations={conversations}
                   activeConversation={conversation}
                   onSelectConversation={handleSelectConversation}

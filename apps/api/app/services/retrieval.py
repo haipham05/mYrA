@@ -9,7 +9,7 @@ from contextlib import contextmanager, nullcontext
 from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app.crud.corpus import has_pending_corpus_revision, read_corpus_revision
@@ -204,6 +204,7 @@ def _candidate_cache_key(
     strategy: str,
     candidate_limit: int,
     rrf_k: int,
+    selected_paper_ids: tuple[str, ...] | None = None,
 ) -> str:
     """Build a content-free key for the ordered pre-rerank candidate IDs."""
     return "retrieval-candidates:v1:" + json.dumps(
@@ -217,6 +218,9 @@ def _candidate_cache_key(
             "policy_revision": "hybrid-rrf-v1",
             "strategy": strategy,
             "candidate_limit": candidate_limit,
+            "selected_paper_ids": list(selected_paper_ids)
+            if selected_paper_ids is not None
+            else None,
             "fusion": {"method": "reciprocal_rank_fusion", "rrf_k": rrf_k},
         },
         sort_keys=True,
@@ -412,6 +416,7 @@ class HybridRetriever:
         db: Session,
         project_id: UUID,
         candidate_ids: list[UUID],
+        selected_paper_ids: tuple[UUID, ...] | None = None,
     ) -> list[PaperChunk] | None:
         """Hydrate only still-eligible IDs; ``None`` means invalidate the whole hit."""
         if not candidate_ids:
@@ -425,6 +430,7 @@ class HybridRetriever:
                 Paper.project_id == project_id,
                 Paper.status == "READY",
             )
+            .filter(Paper.id.in_(selected_paper_ids) if selected_paper_ids is not None else True)
             .populate_existing()
             .all()
         )
@@ -443,12 +449,14 @@ class HybridRetriever:
         embedding_version: str,
         telemetry=None,
         strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
+        selected_paper_ids: tuple[UUID, ...] | None = None,
     ) -> list[PaperChunk]:
         """Execute database-native pgvector cosine distance and PostgreSQL full-text search."""
         vec_str = "[" + ",".join(str(float(x)) for x in query_vec) + "]"
 
         # 1. Native pgvector cosine distance query
-        dense_sql = text("""
+        scope_clause = "AND p.id IN :selected_paper_ids" if selected_paper_ids is not None else ""
+        dense_sql = text(f"""
             SELECT pc.id, pc.paper_id, pc.text,
                    1.0 - (pc.embedding_vec <=> :query_vec) AS cosine_similarity
             FROM paper_chunks pc
@@ -459,9 +467,12 @@ class HybridRetriever:
               AND pc.embedding_vec IS NOT NULL
               AND pc.embedding_model = :embedding_model
               AND pc.embedding_version = :embedding_version
+              {scope_clause}
             ORDER BY pc.embedding_vec <=> :query_vec ASC
             LIMIT :limit;
         """)
+        if selected_paper_ids is not None:
+            dense_sql = dense_sql.bindparams(bindparam("selected_paper_ids", expanding=True))
         with _retrieval_observation(
             telemetry,
             "retrieval.dense_search",
@@ -472,16 +483,16 @@ class HybridRetriever:
                 "candidate_limit": self.top_candidates,
             },
         ) as observation:
-            dense_rows = db.execute(
-                dense_sql,
-                {
-                    "project_id": project_id,
-                    "query_vec": vec_str,
-                    "embedding_model": embedding_model,
-                    "embedding_version": embedding_version,
-                    "limit": self.top_candidates,
-                },
-            ).fetchall()
+            dense_params = {
+                "project_id": project_id,
+                "query_vec": vec_str,
+                "embedding_model": embedding_model,
+                "embedding_version": embedding_version,
+                "limit": self.top_candidates,
+            }
+            if selected_paper_ids is not None:
+                dense_params["selected_paper_ids"] = selected_paper_ids
+            dense_rows = db.execute(dense_sql, dense_params).fetchall()
             dense_trace = [
                 _candidate_trace_item(
                     chunk_id=row[0],
@@ -509,7 +520,7 @@ class HybridRetriever:
         # 2. PostgreSQL Full-Text Search with plainto_tsquery and ts_rank
         fts_tokens = SimpleLexicalReranker._tokens(query)
         fts_query = " ".join(fts_tokens) if fts_tokens else query
-        fts_sql = text("""
+        fts_sql = text(f"""
             SELECT pc.id, pc.paper_id, pc.text,
                    ts_rank(pc.tsv_content, plainto_tsquery('english', :query)) AS fts_score
             FROM paper_chunks pc
@@ -518,22 +529,25 @@ class HybridRetriever:
               AND p.status = 'READY'
               AND pc.chunk_type = 'child'
               AND pc.tsv_content @@ plainto_tsquery('english', :query)
+              {scope_clause}
             ORDER BY ts_rank(pc.tsv_content, plainto_tsquery('english', :query)) DESC
             LIMIT :limit;
         """)
+        if selected_paper_ids is not None:
+            fts_sql = fts_sql.bindparams(bindparam("selected_paper_ids", expanding=True))
         with _retrieval_observation(
             telemetry,
             "retrieval.fts_search",
             {"backend": "postgres_fts", "candidate_limit": self.top_candidates},
         ) as observation:
-            fts_rows = db.execute(
-                fts_sql,
-                {
-                    "project_id": project_id,
-                    "query": fts_query,
-                    "limit": self.top_candidates,
-                },
-            ).fetchall()
+            fts_params = {
+                "project_id": project_id,
+                "query": fts_query,
+                "limit": self.top_candidates,
+            }
+            if selected_paper_ids is not None:
+                fts_params["selected_paper_ids"] = selected_paper_ids
+            fts_rows = db.execute(fts_sql, fts_params).fetchall()
             fts_trace = [
                 _candidate_trace_item(
                     chunk_id=row[0],
@@ -626,9 +640,10 @@ class HybridRetriever:
         embedding_version: str,
         telemetry=None,
         strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
+        selected_paper_ids: tuple[UUID, ...] | None = None,
     ) -> list[PaperChunk]:
         """In-memory scoring fallback for SQLite / test environments."""
-        chunks = (
+        chunk_query = (
             db.query(PaperChunk)
             .join(Paper, PaperChunk.paper_id == Paper.id)
             .filter(
@@ -636,8 +651,10 @@ class HybridRetriever:
                 Paper.status == "READY",
                 PaperChunk.chunk_type == "child",
             )
-            .all()
         )
+        if selected_paper_ids is not None:
+            chunk_query = chunk_query.filter(Paper.id.in_(selected_paper_ids))
+        chunks = chunk_query.all()
         if not chunks:
             return []
 
@@ -778,6 +795,7 @@ class HybridRetriever:
         query: str,
         *,
         query_embedding: list[float] | None = None,
+        selected_paper_ids: list[UUID] | None = None,
         strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
     ) -> list[EvidenceItem]:
         """Retrieve evidence; ``strategy`` is an opt-in evaluation ablation seam.
@@ -787,6 +805,11 @@ class HybridRetriever:
         """
         if strategy not in {"dense-only", "hybrid-unreranked", "hybrid-reranked"}:
             raise ValueError(f"Unknown retrieval strategy: {strategy}")
+        normalized_paper_ids = (
+            tuple(sorted(set(selected_paper_ids), key=str))
+            if selected_paper_ids is not None
+            else None
+        )
         try:
             telemetry = get_telemetry()
         except Exception:
@@ -803,7 +826,13 @@ class HybridRetriever:
             },
         ):
             return self._retrieve_impl(
-                db, project_id, query, telemetry, strategy, query_embedding=query_embedding
+                db,
+                project_id,
+                query,
+                telemetry,
+                strategy,
+                query_embedding=query_embedding,
+                selected_paper_ids=normalized_paper_ids,
             )
 
     def _retrieve_impl(
@@ -815,7 +844,10 @@ class HybridRetriever:
         strategy: Literal["dense-only", "hybrid-unreranked", "hybrid-reranked"] = "hybrid-reranked",
         *,
         query_embedding: list[float] | None = None,
+        selected_paper_ids: tuple[UUID, ...] | None = None,
     ) -> list[EvidenceItem]:
+        if selected_paper_ids == ():
+            return []
         embed_provider = get_embedding_provider()
         with _retrieval_observation(
             telemetry,
@@ -857,6 +889,7 @@ class HybridRetriever:
                     embedding_version=embed_provider.model_version,
                     telemetry=telemetry,
                     strategy=strategy,
+                    selected_paper_ids=selected_paper_ids,
                 )
             return self._retrieve_fallback(
                 db=db,
@@ -867,6 +900,7 @@ class HybridRetriever:
                 embedding_version=embed_provider.model_version,
                 telemetry=telemetry,
                 strategy=strategy,
+                selected_paper_ids=selected_paper_ids,
             )
 
         cache = get_cache()
@@ -893,6 +927,11 @@ class HybridRetriever:
                     strategy=strategy,
                     candidate_limit=self.top_candidates,
                     rrf_k=self.rrf_k,
+                    selected_paper_ids=(
+                        tuple(str(paper_id) for paper_id in selected_paper_ids)
+                        if selected_paper_ids is not None
+                        else None
+                    ),
                 )
                 candidate_chunks = []
                 stable_revision = False
@@ -914,6 +953,11 @@ class HybridRetriever:
                             strategy=strategy,
                             candidate_limit=self.top_candidates,
                             rrf_k=self.rrf_k,
+                            selected_paper_ids=(
+                                tuple(str(paper_id) for paper_id in selected_paper_ids)
+                                if selected_paper_ids is not None
+                                else None
+                            ),
                         )
 
                     cached_ids = cache.get(
@@ -921,7 +965,12 @@ class HybridRetriever:
                         lambda value: _validate_candidate_ids(value, limit=self.top_candidates),
                     )
                     hydrated = (
-                        self._hydrate_candidate_ids(db, project_id, cached_ids)
+                        self._hydrate_candidate_ids(
+                            db,
+                            project_id,
+                            cached_ids,
+                            selected_paper_ids=selected_paper_ids,
+                        )
                         if cached_ids is not None
                         else None
                     )

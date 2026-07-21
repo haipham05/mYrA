@@ -137,6 +137,15 @@ def test_parameterization_queries_are_static() -> None:
     assert params["query"] == "transformer"
     assert params["entity_type"] == "Model"
 
+    scoped_paper_id = uuid4()
+    repo.search_nodes(project_id, limit=10, paper_ids={scoped_paper_id})
+    scoped_search_query, scoped_search_params = mock_tx.run.call_args[0]
+    assert "f.paper_id IN $paper_ids" in scoped_search_query
+    assert scoped_search_query.index("f.paper_id IN $paper_ids") < scoped_search_query.index(
+        "SKIP $skip"
+    )
+    assert scoped_search_params["paper_ids"] == [str(scoped_paper_id)]
+
     # The pagination total uses the exact same project/query/type predicates.
     mock_res.single.return_value = {"total": 11}
     assert (
@@ -173,6 +182,29 @@ def test_parameterization_queries_are_static() -> None:
     assert "$key" in neighbor_call[0][0]
     assert "$project_id" in neighbor_call[0][0]
     assert neighbor_call[0][1]["key"] == "model_bert"
+
+    repo.get_node_neighbors(project_id=project_id, key="model_bert", paper_ids={scoped_paper_id})
+    scoped_neighbor_query, scoped_neighbor_params = mock_tx.run.call_args[0]
+    assert "f.paper_id IN $paper_ids" in scoped_neighbor_query
+    assert scoped_neighbor_query.index("f.paper_id IN $paper_ids") < scoped_neighbor_query.index(
+        "LIMIT $limit"
+    )
+    assert scoped_neighbor_params["paper_ids"] == [str(scoped_paper_id)]
+
+    repo.find_relationships_between(project_id, "subject", "object", paper_ids={scoped_paper_id})
+    scoped_relationship_query, scoped_relationship_params = mock_tx.run.call_args[0]
+    assert "f.paper_id IN $paper_ids" in scoped_relationship_query
+    assert scoped_relationship_params["paper_ids"] == [str(scoped_paper_id)]
+
+    repo.get_project_facts(project_id, limit=10, paper_ids={scoped_paper_id})
+    scoped_facts_query, scoped_facts_params = mock_tx.run.call_args[0]
+    assert "f.paper_id IN $paper_ids" in scoped_facts_query
+    assert (
+        scoped_facts_query.index("f.paper_id IN $paper_ids")
+        < scoped_facts_query.index("SKIP $skip")
+        < scoped_facts_query.index("LIMIT $limit")
+    )
+    assert scoped_facts_params["paper_ids"] == [str(scoped_paper_id)]
 
     # 4. retire_older_generations
     mock_res.single.return_value = {"cnt": 0}

@@ -135,6 +135,7 @@ def retrieve_graph_candidates_for_query(
     project_id: UUID,
     query: str,
     intent: GraphIntent,
+    selected_paper_ids: set[UUID] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Retrieve raw graph candidates based on query intent.
 
@@ -166,12 +167,27 @@ def retrieve_graph_candidates_for_query(
         return ([], "Graph service is currently offline; using text retrieval.")
 
     try:
+        scope_args = (
+            {"selected_paper_ids": selected_paper_ids} if selected_paper_ids is not None else {}
+        )
+        repo_scope_args = (
+            {"paper_ids": selected_paper_ids} if selected_paper_ids is not None else {}
+        )
         if intent == GraphIntent.CONTRADICTION:
-            candidates = build_contradiction_candidates(db, repo, project_id, limit=10)
+            candidates = build_contradiction_candidates(
+                db, repo, project_id, limit=10, **scope_args
+            )
             return (candidates, None)
 
         elif intent == GraphIntent.CORPUS_THEMES:
-            candidates = build_corpus_themes(db, repo, project_id, min_papers=2, limit=10)
+            candidates = build_corpus_themes(
+                db,
+                repo,
+                project_id,
+                min_papers=2,
+                limit=10,
+                **scope_args,
+            )
             return (candidates, None)
 
         elif intent == GraphIntent.RELATIONSHIP:
@@ -179,13 +195,19 @@ def retrieve_graph_candidates_for_query(
             entity_a, entity_b = _extract_relationship_entities(query)
             if entity_a and entity_b:
                 candidates = build_relationship_candidates(
-                    db, repo, project_id, entity_a, entity_b, limit=10
+                    db,
+                    repo,
+                    project_id,
+                    entity_a,
+                    entity_b,
+                    limit=10,
+                    **scope_args,
                 )
                 if candidates:
                     return (candidates, None)
 
             # 2. Attempt node matching against graph
-            nodes = repo.search_nodes(project_id, limit=100)
+            nodes = repo.search_nodes(project_id, limit=100, **repo_scope_args)
             matched_nodes = [
                 n for n in nodes if n.get("name") and n["name"].strip().lower() in query.lower()
             ]
@@ -197,6 +219,7 @@ def retrieve_graph_candidates_for_query(
                     matched_nodes[0]["name"],
                     matched_nodes[1]["name"],
                     limit=10,
+                    **scope_args,
                 )
                 if candidates:
                     return (candidates, None)
@@ -223,7 +246,7 @@ def retrieve_graph_candidates_for_query(
                     }
                 ]
                 for tok in tokens[:3]:
-                    found = repo.search_nodes(project_id, query=tok, limit=2)
+                    found = repo.search_nodes(project_id, query=tok, limit=2, **repo_scope_args)
                     for fn in found:
                         if not any(tn.get("key") == fn.get("key") for tn in nodes_to_traverse):
                             nodes_to_traverse.append(fn)
@@ -231,7 +254,12 @@ def retrieve_graph_candidates_for_query(
             neighbor_candidates: list[dict[str, Any]] = []
             seen_fact_ids: set[str] = set()
             for node in nodes_to_traverse[:3]:
-                neighbors = repo.get_node_neighbors(project_id, node["key"], limit=10)
+                neighbors = repo.get_node_neighbors(
+                    project_id,
+                    node["key"],
+                    limit=10,
+                    **repo_scope_args,
+                )
                 for nb in neighbors:
                     fid = nb.get("fact_id")
                     if fid and fid not in seen_fact_ids:
@@ -244,7 +272,7 @@ def retrieve_graph_candidates_for_query(
             return (neighbor_candidates[:10], None)
 
         elif intent == GraphIntent.FACTUAL:
-            nodes = repo.search_nodes(project_id, limit=50)
+            nodes = repo.search_nodes(project_id, limit=50, **repo_scope_args)
             matched_nodes = [
                 n for n in nodes if n.get("name") and n["name"].strip().lower() in query.lower()
             ]
@@ -268,7 +296,7 @@ def retrieve_graph_candidates_for_query(
                     }
                 ]
                 for tok in tokens[:2]:
-                    found = repo.search_nodes(project_id, query=tok, limit=2)
+                    found = repo.search_nodes(project_id, query=tok, limit=2, **repo_scope_args)
                     for fn in found:
                         if not any(tn.get("key") == fn.get("key") for tn in matched_nodes):
                             matched_nodes.append(fn)
@@ -276,7 +304,12 @@ def retrieve_graph_candidates_for_query(
             factual_candidates: list[dict[str, Any]] = []
             seen_fact_ids = set()
             for node in matched_nodes[:2]:
-                neighbors = repo.get_node_neighbors(project_id, node["key"], limit=5)
+                neighbors = repo.get_node_neighbors(
+                    project_id,
+                    node["key"],
+                    limit=5,
+                    **repo_scope_args,
+                )
                 for nb in neighbors:
                     fid = nb.get("fact_id")
                     if fid and fid not in seen_fact_ids:
@@ -301,6 +334,7 @@ def retrieve_graph_evidence(
     project_id: UUID,
     query: str,
     intent: GraphIntent | None = None,
+    selected_paper_ids: list[UUID] | None = None,
 ) -> tuple[list[EvidenceItem], str | None]:
     """Retrieve verified EvidenceItems from graph candidates for query.
 
@@ -313,19 +347,47 @@ def retrieve_graph_evidence(
     """
     if intent is None:
         intent = route_query_intent(query)
+    if selected_paper_ids is not None and not selected_paper_ids:
+        return ([], None)
 
     telemetry = get_telemetry()
     with telemetry.stage(
         "graph.neo4j_query",
         metadata={"intent": intent.value},
     ) as query_span:
+        scope_args = (
+            {"selected_paper_ids": set(selected_paper_ids)}
+            if selected_paper_ids is not None
+            else {}
+        )
         candidates, outage_notice = retrieve_graph_candidates_for_query(
             db=db,
             repo=repo,
             project_id=project_id,
             query=query,
             intent=intent,
+            **scope_args,
         )
+        if selected_paper_ids is not None:
+            allowed_ids = {str(paper_id) for paper_id in selected_paper_ids}
+
+            def candidate_may_match_scope(candidate: dict[str, Any]) -> bool:
+                paper_id = candidate.get("paper_id")
+                if paper_id is not None:
+                    return str(paper_id) in allowed_ids
+                for key in ("fact_a", "fact_b"):
+                    fact = candidate.get(key)
+                    if isinstance(fact, dict) and fact.get("paper_id") is not None:
+                        if str(fact["paper_id"]) in allowed_ids:
+                            return True
+                paper_ids = candidate.get("paper_ids")
+                return not isinstance(paper_ids, (list, tuple, set)) or bool(
+                    allowed_ids.intersection(str(value) for value in paper_ids)
+                )
+
+            candidates = [
+                candidate for candidate in candidates if candidate_may_match_scope(candidate)
+            ]
         if query_span is not None:
             query_span.update(
                 metadata={
@@ -351,6 +413,7 @@ def retrieve_graph_evidence(
             project_id=project_id,
             facts=fact_ids,
             prefix="G",
+            selected_paper_ids=set(selected_paper_ids) if selected_paper_ids is not None else None,
         )
         if resolution_span is not None:
             resolution_span.update(

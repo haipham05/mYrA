@@ -30,6 +30,14 @@ export interface Paper {
   project_id: string;
   filename: string;
   status: PaperStatus;
+  title?: string | null;
+  authors?: string[] | null;
+  publication_year?: number | null;
+  doi?: string | null;
+  arxiv_id?: string | null;
+  abstract?: string | null;
+  source_url?: string | null;
+  metadata_provenance?: Record<string, string> | null;
   page_count?: number | null;
   error_message?: string | null;
   document_sha256?: string | null;
@@ -104,6 +112,8 @@ export interface Conversation {
   project_id: string;
   title?: string | null;
   summary?: string | null;
+  paper_scope?: "paper" | "selection" | "project";
+  selected_paper_ids?: string[];
   is_archived?: boolean;
   message_count?: number;
   created_at: string;

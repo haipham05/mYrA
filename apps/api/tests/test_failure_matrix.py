@@ -49,6 +49,9 @@ startxref
 
 
 class MockParser:
+    def __init__(self, document_title: str | None = None):
+        self.document_title = document_title
+
     def parse(self, data: bytes) -> ParseResult:
         return ParseResult(
             pages=[
@@ -70,6 +73,7 @@ class MockParser:
                     page_height=792.0,
                 )
             ],
+            document_title=self.document_title,
         )
 
 
@@ -233,3 +237,38 @@ async def test_failure_matrix_embedding_failure_and_clean_recovery(test_env):
     assert paper.status == PaperStatus.READY
     assert claimed_job.status == "COMPLETED"
     assert db.query(PaperChunk).filter(PaperChunk.paper_id == paper.id).count() > 0
+
+
+@pytest.mark.anyio
+async def test_docling_title_is_provenanced_and_never_overwrites_manual_value(test_env):
+    db, storage, _ = test_env
+    project = create_project(db, ProjectCreate(name="Metadata extraction"))
+    data_sha = hashlib.sha256(PDF_BYTES).hexdigest()
+
+    extracted_path = f"papers/{project.id}/extracted.pdf"
+    await storage.put(extracted_path, PDF_BYTES)
+    extracted = create_paper(
+        db, project.id, "extracted.pdf", extracted_path, document_sha256=data_sha
+    )
+    extracted_job = create_job(db, extracted.id)
+    await IngestionPipeline(parser=MockParser("Docling title")).process_paper(
+        db, extracted.id, extracted_job.id
+    )
+    db.refresh(extracted)
+    assert extracted.title == "Docling title"
+    assert extracted.metadata_provenance == {"title": "docling_title"}
+    assert extracted.status == PaperStatus.READY
+
+    manual_path = f"papers/{project.id}/manual.pdf"
+    await storage.put(manual_path, PDF_BYTES)
+    manual = create_paper(db, project.id, "manual.pdf", manual_path, document_sha256=data_sha)
+    manual.title = "Owner-corrected title"
+    manual.metadata_provenance = {"title": "manual"}
+    db.commit()
+    manual_job = create_job(db, manual.id)
+    await IngestionPipeline(parser=MockParser("Parsed title")).process_paper(
+        db, manual.id, manual_job.id
+    )
+    db.refresh(manual)
+    assert manual.title == "Owner-corrected title"
+    assert manual.metadata_provenance == {"title": "manual"}

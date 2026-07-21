@@ -27,6 +27,7 @@ def resolve_graph_fact_to_evidence(
     project_id: UUID,
     fact: str | dict[str, Any] | GraphFactSnapshot,
     evidence_id: str = "G1",
+    selected_paper_ids: set[UUID] | None = None,
 ) -> tuple[EvidenceItem | None, CitationAnchor | None, AnchorStatus]:
     """Resolve a single graph fact (by ID, dict candidate, or snapshot) to verified EvidenceItem.
 
@@ -188,6 +189,8 @@ def resolve_graph_fact_to_evidence(
     paper = db.query(Paper).filter(Paper.id == paper_id, Paper.project_id == project_id).first()
     if not paper or paper.status != "READY" or not paper.document_sha256:
         return (None, None, AnchorStatus.UNRESOLVED)
+    if selected_paper_ids is not None and paper.id not in selected_paper_ids:
+        return (None, None, AnchorStatus.UNRESOLVED)
 
     if prov_dict.get("document_sha256"):
         if (
@@ -311,6 +314,7 @@ def resolve_graph_facts_to_evidence(
     facts: list[str | dict[str, Any] | GraphFactSnapshot],
     prefix: str = "G",
     start_index: int = 1,
+    selected_paper_ids: set[UUID] | None = None,
 ) -> list[EvidenceItem]:
     """Resolve a batch of graph facts into verified EvidenceItems.
 
@@ -345,6 +349,7 @@ def resolve_graph_facts_to_evidence(
             project_id=project_id,
             fact=fact,
             evidence_id=assigned_id,
+            selected_paper_ids=selected_paper_ids,
         )
 
         if status != AnchorStatus.VERIFIED or item is None:

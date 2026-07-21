@@ -507,6 +507,7 @@ class Neo4jRepository:
         entity_type: str | EntityType | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
         skip: int = 0,
+        paper_ids: set[UUID] | None = None,
     ) -> list[dict[str, Any]]:
         """Search nodes within a project with strictly capped pagination.
 
@@ -526,6 +527,13 @@ class Neo4jRepository:
         cypher = """
         MATCH (n:Node {project_id: $project_id})
         WHERE ($entity_type IS NULL OR toLower(n.type) = toLower($entity_type))
+          AND ($paper_ids IS NULL OR EXISTS {
+                MATCH (n)<-[:SUBJECT]-(f:Fact {project_id: $project_id})
+                WHERE f.paper_id IN $paper_ids
+              } OR EXISTS {
+                MATCH (n)<-[:OBJECT]-(f:Fact {project_id: $project_id})
+                WHERE f.paper_id IN $paper_ids
+              })
           AND ($query IS NULL
                OR toLower(n.name) CONTAINS toLower($query)
                OR any(a IN n.aliases WHERE toLower(a) CONTAINS toLower($query)))
@@ -544,6 +552,9 @@ class Neo4jRepository:
             "project_id": pid_str,
             "query": clean_query,
             "entity_type": clean_type,
+            "paper_ids": [str(paper_id) for paper_id in paper_ids]
+            if paper_ids is not None
+            else None,
             "skip": safe_skip,
             "limit": safe_limit,
         }
@@ -622,6 +633,7 @@ class Neo4jRepository:
         direction: str = "BOTH",
         predicate: str | RelationshipPredicate | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
+        paper_ids: set[UUID] | None = None,
     ) -> list[dict[str, Any]]:
         """Traverse (s)<-[:SUBJECT]-(f)-[:OBJECT]->(o) around node key within project.
 
@@ -651,6 +663,9 @@ class Neo4jRepository:
             "key": clean_key,
             "project_id": pid_str,
             "predicate": clean_pred,
+            "paper_ids": [str(paper_id) for paper_id in paper_ids]
+            if paper_ids is not None
+            else None,
             "limit": safe_limit,
         }
 
@@ -660,6 +675,7 @@ class Neo4jRepository:
                   (f:Fact {project_id: $project_id})-[:OBJECT]->
                   (neighbor:Node {project_id: $project_id})
             WHERE ($predicate IS NULL OR toUpper(f.predicate) = toUpper($predicate))
+              AND ($paper_ids IS NULL OR f.paper_id IN $paper_ids)
             RETURN neighbor.key AS neighbor_key,
                    neighbor.name AS neighbor_name,
                    neighbor.type AS neighbor_type,
@@ -676,6 +692,7 @@ class Neo4jRepository:
                   (f:Fact {project_id: $project_id})-[:OBJECT]->
                   (o:Node {key: $key, project_id: $project_id})
             WHERE ($predicate IS NULL OR toUpper(f.predicate) = toUpper($predicate))
+              AND ($paper_ids IS NULL OR f.paper_id IN $paper_ids)
             RETURN neighbor.key AS neighbor_key,
                    neighbor.name AS neighbor_name,
                    neighbor.type AS neighbor_type,
@@ -693,6 +710,7 @@ class Neo4jRepository:
                       (f:Fact {project_id: $project_id})-[:OBJECT]->
                       (neighbor:Node {project_id: $project_id})
                 WHERE ($predicate IS NULL OR toUpper(f.predicate) = toUpper($predicate))
+                  AND ($paper_ids IS NULL OR f.paper_id IN $paper_ids)
                 RETURN neighbor.key AS neighbor_key,
                        neighbor.name AS neighbor_name,
                        neighbor.type AS neighbor_type,
@@ -705,6 +723,7 @@ class Neo4jRepository:
                       (f:Fact {project_id: $project_id})-[:OBJECT]->
                       (o:Node {key: $key, project_id: $project_id})
                 WHERE ($predicate IS NULL OR toUpper(f.predicate) = toUpper($predicate))
+                  AND ($paper_ids IS NULL OR f.paper_id IN $paper_ids)
                 RETURN neighbor.key AS neighbor_key,
                        neighbor.name AS neighbor_name,
                        neighbor.type AS neighbor_type,
@@ -809,6 +828,7 @@ class Neo4jRepository:
         subject_key: str,
         object_key: str,
         predicate: str | RelationshipPredicate | None = None,
+        paper_ids: set[UUID] | None = None,
     ) -> list[dict[str, Any]]:
         """Find facts connecting a specific subject and object within a project."""
         clean_s = subject_key.strip()
@@ -827,6 +847,7 @@ class Neo4jRepository:
               (f:Fact {project_id: $project_id})-[:OBJECT]->
               (o:Node {key: $object_key, project_id: $project_id})
         WHERE ($predicate IS NULL OR toUpper(f.predicate) = toUpper($predicate))
+          AND ($paper_ids IS NULL OR f.paper_id IN $paper_ids)
         RETURN f.id AS fact_id,
                f.project_id AS project_id,
                f.paper_id AS paper_id,
@@ -851,6 +872,9 @@ class Neo4jRepository:
             "subject_key": clean_s,
             "object_key": clean_o,
             "predicate": clean_pred,
+            "paper_ids": [str(paper_id) for paper_id in paper_ids]
+            if paper_ids is not None
+            else None,
         }
 
         def _tx_work(tx) -> list[dict[str, Any]]:
@@ -901,6 +925,7 @@ class Neo4jRepository:
         project_id: UUID,
         limit: int = DEFAULT_PAGE_LIMIT,
         skip: int = 0,
+        paper_ids: set[UUID] | None = None,
     ) -> list[dict[str, Any]]:
         """Retrieve facts within a project with linked subject and object node info.
 
@@ -914,6 +939,7 @@ class Neo4jRepository:
         MATCH (s:Node {project_id: $project_id})<-[:SUBJECT]-
               (f:Fact {project_id: $project_id})-[:OBJECT]->
               (o:Node {project_id: $project_id})
+        WHERE $paper_ids IS NULL OR f.paper_id IN $paper_ids
         RETURN f.id AS fact_id,
                f.project_id AS project_id,
                f.paper_id AS paper_id,
@@ -939,6 +965,9 @@ class Neo4jRepository:
             "project_id": pid_str,
             "skip": safe_skip,
             "limit": safe_limit,
+            "paper_ids": [str(paper_id) for paper_id in paper_ids]
+            if paper_ids is not None
+            else None,
         }
 
         def _tx_work(tx) -> list[dict[str, Any]]:

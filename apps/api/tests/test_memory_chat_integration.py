@@ -12,6 +12,7 @@ from app.db.models import (
     ChunkElement,
     Memory,
     MemorySource,
+    Message,
     Paper,
     PaperChunk,
     PaperElement,
@@ -30,7 +31,7 @@ from app.schemas.memory import (
     MemoryStatus,
     MemoryType,
 )
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, _recent_conversation_messages
 
 
 @pytest.fixture
@@ -90,6 +91,190 @@ async def test_chat_answers_from_memory_without_paper_citations(db: Session) -> 
     _, kwargs = mock_llm.generate.call_args
     assert "PROJECT MEMORY:" in kwargs["user_prompt"]
     assert "AURC over ECE" in kwargs["user_prompt"]
+
+
+@pytest.mark.anyio
+async def test_chat_forwards_persisted_paper_scope_to_all_evidence_sources(db: Session) -> None:
+    project = Project(name="Persisted chat scope")
+    db.add(project)
+    db.flush()
+    paper = Paper(
+        project_id=project.id,
+        filename="selected.pdf",
+        storage_path="selected.pdf",
+        status="READY",
+    )
+    db.add(paper)
+    db.commit()
+    conv = create_conversation(
+        db,
+        project_id=project.id,
+        title="Only one paper",
+        paper_scope="paper",
+        selected_paper_ids=[str(paper.id)],
+    )
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = []
+    llm = AsyncMock()
+    llm.generate.return_value = "I do not have a supported answer in the selected evidence."
+    llm.model_name = "test-deepseek"
+    selected_ids = [paper.id]
+
+    with (
+        patch("app.services.chat_service.get_llm_provider", return_value=llm),
+        patch("app.services.chat_service.retrieve_project_memories", return_value=[]) as memories,
+        patch(
+            "app.services.chat_service.retrieve_graph_evidence", return_value=([], None)
+        ) as graph,
+        patch(
+            "app.services.embedding.get_embedding_provider",
+            return_value=MagicMock(embed_query=MagicMock(return_value=[0.1, 0.2, 0.3])),
+        ),
+    ):
+        await ChatService(retriever=retriever).answer_question(
+            db=db,
+            conversation_id=conv.id,
+            question="What does the selected paper say?",
+        )
+
+    assert retriever.retrieve.call_args.kwargs["selected_paper_ids"] == selected_ids
+    assert memories.call_args.kwargs["selected_paper_ids"] == selected_ids
+    assert graph.call_args.kwargs["selected_paper_ids"] == selected_ids
+
+
+@pytest.mark.anyio
+async def test_short_follow_up_retrieves_against_single_selected_paper(db: Session) -> None:
+    project = Project(name="Follow-up scope")
+    db.add(project)
+    db.flush()
+    paper = Paper(
+        project_id=project.id,
+        filename="attention.pdf",
+        title="Attention Is All You Need",
+        storage_path="attention.pdf",
+        status="READY",
+    )
+    db.add(paper)
+    db.commit()
+    conv = create_conversation(
+        db,
+        project_id=project.id,
+        title="Follow-up",
+        paper_scope="paper",
+        selected_paper_ids=[str(paper.id)],
+    )
+    db.add_all(
+        [
+            Message(
+                conversation_id=conv.id,
+                role="USER",
+                content="Explain the attention mechanism.",
+                citations=[],
+                evidence=[],
+            ),
+            Message(
+                conversation_id=conv.id,
+                role="ASSISTANT",
+                content="It uses multi-head self-attention.",
+                citations=[],
+                evidence=[],
+            ),
+        ]
+    )
+    db.commit()
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = []
+    llm = AsyncMock()
+    llm.generate.return_value = (
+        "The selected paper's limitations are not established in the retrieved evidence."
+    )
+    llm.model_name = "test-deepseek"
+    with (
+        patch("app.services.chat_service.get_llm_provider", return_value=llm),
+        patch("app.services.chat_service.retrieve_project_memories", return_value=[]),
+        patch("app.services.chat_service.retrieve_graph_evidence", return_value=([], None)),
+        patch(
+            "app.services.embedding.get_embedding_provider",
+            return_value=MagicMock(embed_query=MagicMock(return_value=[0.1, 0.2, 0.3])),
+        ),
+    ):
+        await ChatService(retriever=retriever).answer_question(
+            db=db, conversation_id=conv.id, question="its limitations"
+        )
+
+    resolved = "What limitations does Attention Is All You Need report?"
+    assert retriever.retrieve.call_args.kwargs["query"] == resolved
+    assert (
+        llm.generate.call_args.kwargs["user_prompt"].find(
+            "RESOLVED RETRIEVAL QUESTION:\n" + resolved
+        )
+        >= 0
+    )
+
+
+@pytest.mark.anyio
+async def test_ambiguous_follow_up_asks_instead_of_searching(db: Session) -> None:
+    project = Project(name="Ambiguous follow-up")
+    db.add(project)
+    db.flush()
+    papers = [
+        Paper(
+            project_id=project.id,
+            filename=f"paper-{index}.pdf",
+            title=f"Paper {index}",
+            storage_path=f"paper-{index}.pdf",
+            status="READY",
+        )
+        for index in (1, 2)
+    ]
+    db.add_all(papers)
+    db.commit()
+    conv = create_conversation(db, project_id=project.id, title="Ambiguous")
+    db.add(
+        Message(
+            conversation_id=conv.id,
+            role="ASSISTANT",
+            content="Both papers were discussed.",
+            citations=[],
+            evidence=[{"paper_id": str(paper.id)} for paper in papers],
+        )
+    )
+    db.commit()
+
+    retriever = MagicMock()
+    response = await ChatService(retriever=retriever).answer_question(
+        db=db, conversation_id=conv.id, question="their limitations"
+    )
+
+    assert "more than one paper" in response.content
+    retriever.retrieve.assert_not_called()
+
+
+def test_chat_history_query_is_bounded_to_recent_messages(db: Session) -> None:
+    project = Project(name="Bounded history")
+    db.add(project)
+    db.commit()
+    conv = create_conversation(db, project_id=project.id, title="History")
+    db.add_all(
+        [
+            Message(
+                conversation_id=conv.id,
+                role="USER" if index % 2 == 0 else "ASSISTANT",
+                content=f"turn-{index}",
+                citations=[],
+                evidence=[],
+            )
+            for index in range(12)
+        ]
+    )
+    db.commit()
+
+    history = _recent_conversation_messages(db, conv.id, question="new question")
+
+    assert len(history) == 6
+    assert [message.content for message in history] == [f"turn-{index}" for index in range(6, 12)]
 
 
 @pytest.mark.anyio

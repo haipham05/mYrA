@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.crud.paper import create_paper, create_paper_with_job
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -97,10 +98,185 @@ def test_projects_crud(test_env):
         list_resp = client.get("/api/v1/projects")
         assert list_resp.status_code == 200
         assert list_resp.json()["total"] >= 1
-
-        # 404 for non-existent
         bad_resp = client.get(f"/api/v1/projects/{uuid4()}")
         assert bad_resp.status_code == 404
+
+
+def test_paper_metadata_manual_correction_round_trip(test_env):
+    with TestClient(app) as client:
+        project = client.post("/api/v1/projects", json={"name": "Metadata"}).json()
+        db = test_env["session_maker"]()
+        try:
+            paper, _job = create_paper_with_job(
+                db, UUID(project["id"]), "unknown-title.pdf", "papers/unknown-title.pdf"
+            )
+        finally:
+            db.close()
+
+        updated = client.patch(
+            f"/api/v1/papers/{paper.id}",
+            params={"project_id": project["id"]},
+            json={"title": "Corrected title", "authors": ["  Ada Lovelace  ", ""]},
+        )
+        assert updated.status_code == 200
+        payload = updated.json()
+        assert payload["title"] == "Corrected title"
+        assert payload["authors"] == ["Ada Lovelace"]
+        assert payload["metadata_provenance"] == {"title": "manual", "authors": "manual"}
+        assert payload["status"] == "PROCESSING"
+        assert payload["document_sha256"] is None
+
+        # Partial edits leave unrelated metadata unknown; an explicit null clears a value.
+        second = client.patch(
+            f"/api/v1/papers/{paper.id}",
+            params={"project_id": project["id"]},
+            json={"title": None},
+        )
+        assert second.status_code == 200
+        assert second.json()["title"] is None
+        assert second.json()["metadata_provenance"]["title"] == "unknown"
+        assert second.json()["doi"] is None
+
+        assert (
+            client.patch(
+                f"/api/v1/papers/{paper.id}",
+                params={"project_id": str(UUID(int=0))},
+                json={"title": "Must not cross project"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.patch(
+                f"/api/v1/papers/{paper.id}",
+                params={"project_id": project["id"]},
+                json={"title": "", "publication_year": 42},
+            ).status_code
+            == 422
+        )
+
+
+def test_project_paper_search_filters_and_pagination(test_env):
+    with TestClient(app) as client:
+        project_id = client.post("/api/v1/projects", json={"name": "Library"}).json()["id"]
+        db = test_env["session_maker"]()
+        try:
+            project_uuid = UUID(project_id)
+            papers = [
+                create_paper(db, project_uuid, "legacy-notes.pdf", "one", status="READY"),
+                create_paper(db, project_uuid, "second.pdf", "two", status="PROCESSING"),
+                create_paper(db, project_uuid, "third.pdf", "three", status="READY"),
+            ]
+            papers[0].title = "A Study of Retrieval"
+            papers[0].authors = ["Ada Lovelace", "Alan Turing"]
+            papers[0].publication_year = 2024
+            db.commit()
+            target_paper_id = str(papers[0].id)
+        finally:
+            db.close()
+
+        filename = client.get(
+            f"/api/v1/projects/{project_id}/papers", params={"q": "legacy-notes"}
+        ).json()
+        assert [paper["filename"] for paper in filename["items"]] == ["legacy-notes.pdf"]
+        title = client.get(
+            f"/api/v1/projects/{project_id}/papers", params={"q": "Retrieval"}
+        ).json()
+        assert title["items"][0]["id"] == target_paper_id
+        author = client.get(
+            f"/api/v1/projects/{project_id}/papers", params={"q": "Lovelace"}
+        ).json()
+        assert author["items"][0]["id"] == target_paper_id
+
+        filtered = client.get(
+            f"/api/v1/projects/{project_id}/papers",
+            params={"status": "READY", "year": 2024, "limit": 1, "offset": 0},
+        )
+        assert filtered.status_code == 200
+        assert filtered.json()["total"] == 1
+        assert filtered.json()["items"][0]["id"] == target_paper_id
+        assert (
+            client.get(f"/api/v1/projects/{project_id}/papers", params={"q": "x" * 201}).status_code
+            == 422
+        )
+        assert (
+            client.get(f"/api/v1/projects/{project_id}/papers", params={"limit": 101}).status_code
+            == 422
+        )
+
+
+def test_conversation_scope_persists_and_rejects_foreign_or_empty_dispatch(test_env):
+    with TestClient(app) as client:
+        project_id = client.post("/api/v1/projects", json={"name": "Scope owner"}).json()["id"]
+        foreign_project_id = client.post("/api/v1/projects", json={"name": "Other project"}).json()[
+            "id"
+        ]
+        db = test_env["session_maker"]()
+        try:
+            owned_paper = create_paper(db, UUID(project_id), "owned.pdf", "owned", status="READY")
+            foreign_paper = create_paper(
+                db, UUID(foreign_project_id), "foreign.pdf", "foreign", status="READY"
+            )
+            owned_paper_id = str(owned_paper.id)
+            foreign_paper_id = str(foreign_paper.id)
+        finally:
+            db.close()
+
+        created = client.post(
+            f"/api/v1/projects/{project_id}/conversations",
+            json={
+                "title": "Scoped",
+                "paper_scope": "paper",
+                "selected_paper_ids": [owned_paper_id],
+            },
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["id"]
+        assert created.json()["paper_scope"] == "paper"
+        assert created.json()["selected_paper_ids"] == [owned_paper_id]
+
+        updated = client.patch(
+            f"/api/v1/conversations/{conversation_id}?project_id={project_id}",
+            json={"paper_scope": "selection", "selected_paper_ids": [owned_paper_id]},
+        )
+        assert updated.status_code == 200
+        listed = client.get(
+            f"/api/v1/projects/{project_id}/conversations?include_archived=true"
+        ).json()
+        assert listed["items"][0]["paper_scope"] == "selection"
+        assert listed["items"][0]["selected_paper_ids"] == [owned_paper_id]
+
+        assert (
+            client.patch(
+                f"/api/v1/conversations/{conversation_id}?project_id={project_id}",
+                json={"paper_scope": "paper", "selected_paper_ids": [foreign_paper_id]},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.patch(
+                f"/api/v1/conversations/{conversation_id}?project_id={project_id}",
+                json={"paper_scope": "paper", "selected_paper_ids": []},
+            ).status_code
+            == 422
+        )
+
+        empty_selection = client.patch(
+            f"/api/v1/conversations/{conversation_id}?project_id={project_id}",
+            json={"paper_scope": "selection", "selected_paper_ids": []},
+        )
+        assert empty_selection.status_code == 200
+        refused = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages?project_id={project_id}",
+            json={"content": "Only search the selected papers"},
+        )
+        assert refused.status_code == 409
+        assert "Select at least one paper" in refused.json()["detail"]
+        assert (
+            client.get(
+                f"/api/v1/conversations/{conversation_id}/messages?project_id={project_id}"
+            ).json()
+            == []
+        )
 
 
 def test_paper_upload_and_validation(test_env):

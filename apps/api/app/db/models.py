@@ -245,6 +245,10 @@ class Conversation(Base):
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    paper_scope: Mapped[str] = mapped_column(
+        String(20), default="project", server_default="project", nullable=False
+    )
+    selected_paper_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False

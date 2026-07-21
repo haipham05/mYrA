@@ -152,6 +152,16 @@ class ParsedElement:
 class ParseResult:
     pages: list[ParsedPage]
     elements: list[ParsedElement]
+    document_title: str | None = None
+
+
+def _extract_docling_title(elements: list[ParsedElement]) -> str | None:
+    """Return only Docling's explicit, bounded title element; never infer a title."""
+    for element in elements:
+        title = element.text.strip()
+        if element.element_type.lower() == "title" and title and len(title) <= 2000:
+            return title
+    return None
 
 
 class DocumentParser:
@@ -265,7 +275,8 @@ class DocumentParser:
                 "An OCR text layer is required."
             )
 
-        return ParseResult(pages=pages, elements=elements)
+        title = _extract_docling_title(elements)
+        return ParseResult(pages=pages, elements=elements, document_title=title)
 
     def _parse_with_pypdf(self, pdf_bytes: bytes) -> ParseResult:
         reader = PdfReader(io.BytesIO(pdf_bytes))

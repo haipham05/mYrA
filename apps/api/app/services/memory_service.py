@@ -3,7 +3,8 @@ import re
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from sqlalchemy.orm import Session, joinedload
 
 from app.crud.memory import (
     atomic_create_and_supersede,
@@ -579,6 +580,7 @@ def resolve_paper_memory_source(
     db: Session,
     project_id: UUID,
     source: MemorySource | MemorySourceCreate,
+    selected_paper_ids: list[UUID] | None = None,
 ) -> tuple[EvidenceItem | None, CitationAnchor | None, AnchorStatus]:
     """Resolve a paper source and record its verification outcome without ORM serialization."""
     telemetry = get_telemetry()
@@ -586,7 +588,9 @@ def resolve_paper_memory_source(
         "memory.source_resolution",
         metadata={"source_type": str(source.source_type)},
     ) as observation:
-        result = _resolve_paper_memory_source(db, project_id, source)
+        result = _resolve_paper_memory_source(
+            db, project_id, source, selected_paper_ids=selected_paper_ids
+        )
         if observation is not None:
             evidence, anchor, status = result
             observation.update(
@@ -599,6 +603,7 @@ def _resolve_paper_memory_source(
     db: Session,
     project_id: UUID,
     source: MemorySource | MemorySourceCreate,
+    selected_paper_ids: list[UUID] | None = None,
 ) -> tuple[EvidenceItem | None, CitationAnchor | None, AnchorStatus]:
     """Deterministically resolve a paper memory source to an M1-compatible verified EvidenceItem
     and CitationAnchor.
@@ -612,6 +617,8 @@ def _resolve_paper_memory_source(
         or not source.quote_text
         or not source.quote_text.strip()
     ):
+        return None, None, AnchorStatus.UNRESOLVED
+    if selected_paper_ids is not None and source.paper_id not in selected_paper_ids:
         return None, None, AnchorStatus.UNRESOLVED
 
     # 1. Verify paper ownership, status, and document SHA-256
@@ -1043,13 +1050,18 @@ def retrieve_project_memories(
     limit: int = 5,
     record_access: bool = True,
     query_embedding: list[float] | None = None,
+    selected_paper_ids: list[UUID] | None = None,
 ) -> list[Memory]:
     """Look up project memories and trace selected query/results under retention policy."""
     telemetry = get_telemetry()
     with telemetry.stage(
         "memory.lookup",
         input={"query": query},
-        metadata={"requested_limit": limit, "record_access": record_access},
+        metadata={
+            "requested_limit": limit,
+            "record_access": record_access,
+            "selected_paper_count": len(selected_paper_ids or []),
+        },
     ) as observation:
         memories = _retrieve_project_memories(
             db,
@@ -1058,6 +1070,7 @@ def retrieve_project_memories(
             limit=limit,
             record_access=record_access,
             query_embedding=query_embedding,
+            selected_paper_ids=selected_paper_ids,
         )
         if observation is not None:
             observation.update(
@@ -1079,13 +1092,32 @@ def _retrieve_project_memories(
     limit: int = 5,
     record_access: bool = True,
     query_embedding: list[float] | None = None,
+    selected_paper_ids: list[UUID] | None = None,
 ) -> list[Memory]:
     """Retrieve top-k active memories strictly scoped to the specified project."""
-    active_memories, _ = list_memories(
-        db,
-        project_id=project_id,
-        status=MemoryStatus.ACTIVE,
-        limit=100,  # pull candidate pool for re-ranking
+    active_query = (
+        db.query(Memory)
+        .options(joinedload(Memory.sources).joinedload(MemorySource.message))
+        .filter(Memory.project_id == project_id, Memory.status == MemoryStatus.ACTIVE.value)
+    )
+    if selected_paper_ids is not None:
+        selected_fact_memory_ids = db.query(MemorySource.memory_id).filter(
+            MemorySource.paper_id.in_(selected_paper_ids)
+        )
+        active_query = active_query.filter(
+            or_(
+                Memory.memory_type != MemoryType.PAPER_FACT.value,
+                Memory.id.in_(selected_fact_memory_ids),
+            )
+        )
+    active_memories = (
+        active_query.order_by(
+            Memory.is_pinned.desc(),
+            Memory.importance.desc(),
+            Memory.created_at.desc(),
+        )
+        .limit(100)
+        .all()
     )
     if not active_memories:
         return []

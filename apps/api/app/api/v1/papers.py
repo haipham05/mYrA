@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.crud.paper import get_paper, get_paper_elements
 from app.db.session import get_db
 from app.schemas.evidence import BoundingBox, CoordinateOrigin, SourceElement
-from app.schemas.paper import PaperResponse
+from app.schemas.paper import PaperMetadataUpdate, PaperResponse
 from app.storage.factory import get_storage
 
 logger = logging.getLogger("myra.api.papers")
@@ -26,6 +26,37 @@ def get_single_paper(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Paper {paper_id} not found",
         )
+    return PaperResponse.model_validate(paper, from_attributes=True)
+
+
+@router.patch("/{paper_id}", response_model=PaperResponse)
+def update_paper_metadata(
+    paper_id: UUID,
+    update: PaperMetadataUpdate,
+    project_id: UUID,
+    db: Session = Depends(get_db),
+) -> PaperResponse:
+    """Apply explicit metadata corrections without touching the indexed document."""
+    paper = get_paper(db, paper_id)
+    if not paper or paper.project_id != project_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Paper {paper_id} not found in project {project_id}",
+        )
+    if not update.model_fields_set:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one metadata field must be supplied",
+        )
+
+    provenance = dict(paper.metadata_provenance or {})
+    for field_name in update.model_fields_set:
+        value = getattr(update, field_name)
+        setattr(paper, field_name, value)
+        provenance[field_name] = "manual" if value is not None else "unknown"
+    paper.metadata_provenance = provenance
+    db.commit()
+    db.refresh(paper)
     return PaperResponse.model_validate(paper, from_attributes=True)
 
 

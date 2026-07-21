@@ -390,6 +390,9 @@ def get_project_papers(
     project_id: UUID,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=200),
+    status_filter: PaperStatus | None = Query(default=None, alias="status"),
+    year: int | None = Query(default=None, ge=1000, le=2100),
     db: Session = Depends(get_db),
 ) -> PaperListResponse:
     project = get_project(db, project_id)
@@ -399,7 +402,31 @@ def get_project_papers(
             detail=f"Project {project_id} not found",
         )
 
-    items, total = list_papers_by_project(db, project_id, limit=limit, offset=offset)
+    search_text = q.strip() if q and q.strip() else None
+    with get_telemetry().stage(
+        "library.search",
+        input={"query": search_text} if search_text else None,
+        metadata={
+            "project_id": str(project_id),
+            "status_filter": status_filter.value if status_filter else None,
+            "year_filter": year,
+            "limit": limit,
+            "offset": offset,
+        },
+    ) as observation:
+        items, total = list_papers_by_project(
+            db,
+            project_id,
+            limit=limit,
+            offset=offset,
+            query_text=search_text,
+            status=status_filter.value if status_filter else None,
+            publication_year=year,
+        )
+        if observation is not None:
+            observation.update(
+                metadata={"outcome": "success", "result_count": len(items), "total": total}
+            )
     return PaperListResponse(
         items=[PaperResponse.model_validate(p, from_attributes=True) for p in items],
         total=total,

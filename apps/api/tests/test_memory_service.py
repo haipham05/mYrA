@@ -243,6 +243,71 @@ def test_memory_telemetry_records_selected_content_and_lookup_counts(db, monkeyp
     assert not any("embedding" in str(entry).lower() for entry in telemetry.observations)
 
 
+def test_paper_fact_memories_are_filtered_by_scope_before_candidate_limit(db: Session):
+    project = Project(name="Memory paper scope")
+    db.add(project)
+    db.flush()
+    included_paper = Paper(
+        project_id=project.id,
+        filename="included.pdf",
+        storage_path="included.pdf",
+        status="READY",
+    )
+    excluded_paper = Paper(
+        project_id=project.id,
+        filename="excluded.pdf",
+        storage_path="excluded.pdf",
+        status="READY",
+    )
+    db.add_all([included_paper, excluded_paper])
+    db.commit()
+
+    included = create_memory(
+        db,
+        project.id,
+        MemoryCreate(
+            memory_type=MemoryType.PAPER_FACT,
+            title="Attention method fact",
+            content="The included paper uses attention for sequence modeling.",
+            sources=[
+                MemorySourceCreate(
+                    source_type=MemorySourceType.PAPER_CHUNK,
+                    paper_id=included_paper.id,
+                    page_number=1,
+                    quote_text="Attention models sequence relationships.",
+                )
+            ],
+        ),
+    )
+    excluded = create_memory(
+        db,
+        project.id,
+        MemoryCreate(
+            memory_type=MemoryType.PAPER_FACT,
+            title="Attention method fact",
+            content="The excluded paper uses attention for sequence modeling.",
+            sources=[
+                MemorySourceCreate(
+                    source_type=MemorySourceType.PAPER_CHUNK,
+                    paper_id=excluded_paper.id,
+                    page_number=1,
+                    quote_text="Attention models sequence relationships.",
+                )
+            ],
+        ),
+    )
+
+    found = retrieve_project_memories(
+        db,
+        project_id=project.id,
+        query="attention sequence modeling",
+        record_access=False,
+        selected_paper_ids=[included_paper.id],
+    )
+    assert [memory.id for memory in found] == [included.id]
+    assert excluded.id not in {memory.id for memory in found}
+
+
 def test_memory_telemetry_marks_rejected_candidate_without_changing_error(db, monkeypatch):
     from app.services import memory_service
 

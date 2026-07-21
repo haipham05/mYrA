@@ -101,7 +101,10 @@ describe("Home", () => {
         ) {
           return jsonResponse({
             id: "conversation-1",
+            project_id: "project-1",
             title: "Workspace Chat",
+            paper_scope: "project",
+            selected_paper_ids: [],
           });
         }
         if (url.endsWith("/api/v1/conversations/conversation-1/messages")) {
@@ -129,6 +132,21 @@ describe("Home", () => {
           "http://127.0.0.1:8000/api/v1/papers/paper-1/translations",
         ),
         expect.anything(),
+      ),
+    );
+    fireEvent.change(screen.getByLabelText("Chat searches"), {
+      target: { value: "paper" },
+    });
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8000/api/v1/conversations/conversation-1?project_id=project-1",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({
+            paper_scope: "paper",
+            selected_paper_ids: ["paper-1"],
+          }),
+        }),
       ),
     );
   });

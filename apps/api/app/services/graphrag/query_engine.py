@@ -225,6 +225,7 @@ def build_relationship_candidates(
     entity_b_name: str,
     predicate: str | RelationshipPredicate | None = None,
     limit: int = 20,
+    selected_paper_ids: set[UUID] | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve entity names and find relationships between them within project_id.
 
@@ -247,8 +248,9 @@ def build_relationship_candidates(
     safe_limit = min(limit, MAX_RELATIONSHIP_LIMIT)
 
     # Resolve entities inside project
-    nodes_a = repo.search_nodes(project_id, query=clean_a)
-    nodes_b = repo.search_nodes(project_id, query=clean_b)
+    scope_args = {"paper_ids": selected_paper_ids} if selected_paper_ids is not None else {}
+    nodes_a = repo.search_nodes(project_id, query=clean_a, **scope_args)
+    nodes_b = repo.search_nodes(project_id, query=clean_b, **scope_args)
 
     if not nodes_a or not nodes_b:
         return []
@@ -266,6 +268,7 @@ def build_relationship_candidates(
         subject_key=node_a["key"],
         object_key=node_b["key"],
         predicate=pred_val,
+        **scope_args,
     )
 
     if node_a["key"] != node_b["key"]:
@@ -274,6 +277,7 @@ def build_relationship_candidates(
             subject_key=node_b["key"],
             object_key=node_a["key"],
             predicate=pred_val,
+            **scope_args,
         )
         seen_ids = {r.get("fact_id") or r.get("id") for r in rels}
         for r in rev_rels:
@@ -297,6 +301,7 @@ def build_contradiction_candidates(
     repo: Neo4jRepository,
     project_id: UUID,
     limit: int = 20,
+    selected_paper_ids: set[UUID] | None = None,
 ) -> list[dict[str, Any]]:
     """Discover candidate contradiction pairs within project_id.
 
@@ -321,7 +326,8 @@ def build_contradiction_candidates(
     skip = 0
     page_size = 100
     while True:
-        batch = repo.get_project_facts(project_id, limit=page_size, skip=skip)
+        scope_args = {"paper_ids": selected_paper_ids} if selected_paper_ids is not None else {}
+        batch = repo.get_project_facts(project_id, limit=page_size, skip=skip, **scope_args)
         if not batch:
             break
         all_facts.extend(batch)
@@ -437,6 +443,7 @@ def build_corpus_themes(
     project_id: UUID,
     min_papers: int = 2,
     limit: int = 10,
+    selected_paper_ids: set[UUID] | None = None,
 ) -> list[dict[str, Any]]:
     """Group recurring project entities and relations appearing across multiple papers.
 
@@ -457,7 +464,8 @@ def build_corpus_themes(
     skip = 0
     page_size = 100
     while True:
-        batch = repo.get_project_facts(project_id, limit=page_size, skip=skip)
+        scope_args = {"paper_ids": selected_paper_ids} if selected_paper_ids is not None else {}
+        batch = repo.get_project_facts(project_id, limit=page_size, skip=skip, **scope_args)
         if not batch:
             break
         all_facts.extend(batch)

@@ -270,6 +270,11 @@ class IngestionPipeline:
 
             paper.document_sha256 = document_sha256
             paper.page_count = len(parse_result.pages)
+            if parse_result.document_title and not paper.title:
+                paper.title = parse_result.document_title
+                provenance = dict(paper.metadata_provenance or {})
+                provenance["title"] = "docling_title"
+                paper.metadata_provenance = provenance
             paper.status = PaperStatus.READY
             paper.error_message = None
             bump_corpus_revision(db, paper.project_id)

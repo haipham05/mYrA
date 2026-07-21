@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.crud.chat import add_message, get_conversation
-from app.db.models import Memory, Message, PaperPage
+from app.db.models import Memory, Message, Paper, PaperPage
 from app.observability.telemetry import Observation, TelemetryAdapter, get_telemetry
 from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import (
@@ -43,6 +43,100 @@ from app.services.retrieval import HybridRetriever
 from app.services.source_resolution import resolve_exact_source_anchor
 
 logger = logging.getLogger("myra.chat")
+
+FOLLOW_UP_QUESTION = re.compile(
+    r"^(?:(?:what\s+(?:are|is)|tell\s+me\s+about|explain)\s+)?"
+    r"(?:its|their)\s+(?P<topic>[a-z][a-z\s-]{1,60})\??$|"
+    r"^(?:what\s+about|and\s+what\s+about)\s+"
+    r"(?:(?:its|their)\s+)?(?P<about>[a-z][a-z\s-]{1,60})\??$",
+    re.IGNORECASE,
+)
+
+
+def _recent_conversation_messages(
+    db: Session, conversation_id: UUID, question: str, limit: int = 6
+) -> list[Message]:
+    """Load only the latest context window, excluding this request's saved user turn."""
+    recent = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit + 1)
+        .all()
+    )
+    recent.reverse()
+    if recent and recent[-1].role == MessageRole.USER and recent[-1].content == question:
+        recent.pop()
+    return recent[-limit:]
+
+
+def _paper_reference_from_history(
+    db: Session,
+    project_id: UUID,
+    selected_paper_ids: list[UUID] | None,
+    history: list[Message],
+) -> tuple[Paper | None, bool]:
+    """Return a single clearly referenced paper, or flag ambiguous paper context."""
+    paper_ids: list[UUID] = []
+    if selected_paper_ids is not None and len(selected_paper_ids) == 1:
+        paper_ids = selected_paper_ids
+    else:
+        for message in reversed(history):
+            if message.role != MessageRole.ASSISTANT:
+                continue
+            for evidence in message.evidence or []:
+                if isinstance(evidence, dict) and evidence.get("paper_id"):
+                    try:
+                        candidate_id = UUID(str(evidence["paper_id"]))
+                    except (TypeError, ValueError):
+                        continue
+                    if selected_paper_ids is None or candidate_id in selected_paper_ids:
+                        paper_ids.append(candidate_id)
+            break
+
+    paper_ids = list(dict.fromkeys(paper_ids))
+    if len(paper_ids) > 1:
+        return None, True
+    if not paper_ids:
+        return None, False
+    paper = db.query(Paper).filter(Paper.id == paper_ids[0], Paper.project_id == project_id).first()
+    return paper, paper is None
+
+
+def _resolve_follow_up_question(
+    db: Session,
+    project_id: UUID,
+    question: str,
+    selected_paper_ids: list[UUID] | None,
+    history: list[Message],
+) -> tuple[str | None, str | None]:
+    """Expand a compact topic follow-up only when one in-scope paper is unambiguous."""
+    match = FOLLOW_UP_QUESTION.fullmatch(question.strip())
+    if not match:
+        return question, None
+    topic = (match.group("topic") or match.group("about") or "").strip(" ?.!\t\n")
+    paper, ambiguous = _paper_reference_from_history(db, project_id, selected_paper_ids, history)
+    if paper is None:
+        if ambiguous:
+            return (
+                None,
+                "I found more than one paper in the recent context. Which paper should I use?",
+            )
+        return (
+            None,
+            "Which paper or topic do you mean? Select a paper or restate its name, "
+            "and I’ll look it up.",
+        )
+    title = paper.title or paper.filename
+    if not title:
+        return (
+            None,
+            "I can’t identify the paper title from the current context. Which paper do you mean?",
+        )
+    if topic.casefold() in {"limitations", "method", "methods", "results", "findings"}:
+        return f"What {topic} does {title} report?", None
+    return f"What does {title} report about {topic}?", None
+
 
 STOPWORDS = {
     "a",
@@ -642,8 +736,28 @@ class ChatService:
             raise ValueError(f"Conversation {conversation_id} not found")
 
         project_id = conv.project_id
-        intent = route_query_intent(question)
-
+        selected_paper_ids = (
+            [UUID(paper_id) for paper_id in (conv.selected_paper_ids or [])]
+            if conv.paper_scope != "project"
+            else None
+        )
+        with telemetry.stage(
+            "scope.resolve",
+            metadata={
+                "scope": conv.paper_scope,
+                "selected_paper_count": len(selected_paper_ids or []),
+                "outcome": "project" if selected_paper_ids is None else "selected_papers",
+            },
+        ) as scope_observation:
+            if scope_observation is not None:
+                scope_observation.update(
+                    output={
+                        "selected_paper_ids": [str(paper_id) for paper_id in selected_paper_ids]
+                        if selected_paper_ids is not None
+                        else [],
+                        "project_wide": selected_paper_ids is None,
+                    }
+                )
         # 1. Save user message if not an immediate duplicate of prior unanswered message
         last_msg = (
             db.query(Message)
@@ -661,13 +775,63 @@ class ChatService:
                 evidence=[],
             )
 
+        history_msgs = _recent_conversation_messages(db, conversation_id, question)
+        with telemetry.stage(
+            "chat.follow_up_resolution",
+            input={"question": question},
+            metadata={"history_message_count": len(history_msgs)},
+        ) as follow_up_observation:
+            retrieval_question, clarification = _resolve_follow_up_question(
+                db,
+                project_id,
+                question,
+                selected_paper_ids,
+                history_msgs,
+            )
+            if follow_up_observation is not None:
+                follow_up_observation.update(
+                    output={"retrieval_question": retrieval_question},
+                    metadata={
+                        "history_message_count": len(history_msgs),
+                        "outcome": "needs_clarification"
+                        if clarification
+                        else "resolved"
+                        if retrieval_question != question
+                        else "not_a_follow_up",
+                    },
+                )
+        if clarification is not None:
+            clarification_message = add_message(
+                db=db,
+                conversation_id=conversation_id,
+                role=MessageRole.ASSISTANT,
+                content=clarification,
+                citations=[],
+                evidence=[],
+            )
+            return MessageResponse(
+                id=clarification_message.id,
+                conversation_id=conversation_id,
+                role=MessageRole.ASSISTANT,
+                content=clarification_message.content,
+                citations=[],
+                evidence=[],
+                model_name=None,
+                token_count=None,
+                created_at=clarification_message.created_at,
+            )
+        retrieval_question = retrieval_question or question
+        intent = route_query_intent(retrieval_question)
+        history_turns = [f"{msg.role}: {msg.content}" for msg in history_msgs]
+        history_block = "\n".join(history_turns)
+
         # Share one query embedding between retrieval and semantic memory lookup.
         query_embedding = None
         try:
             from app.services.embedding import get_embedding_provider
 
             embed_provider = get_embedding_provider()
-            query_embedding = embed_provider.embed_query(question)
+            query_embedding = embed_provider.embed_query(retrieval_question)
         except Exception:
             # Retrieval retains its existing behavior and computes the vector itself
             # if a memory-specific embedding attempt is unavailable.
@@ -677,8 +841,9 @@ class ChatService:
         evidence_items: list[EvidenceItem] = self.retriever.retrieve(
             db=db,
             project_id=project_id,
-            query=question,
+            query=retrieval_question,
             query_embedding=query_embedding,
+            selected_paper_ids=selected_paper_ids,
         )
         supplementary_evidence: list[EvidenceItem] = []
 
@@ -686,10 +851,11 @@ class ChatService:
         raw_project_memories = retrieve_project_memories(
             db=db,
             project_id=project_id,
-            query=question,
+            query=retrieval_question,
             limit=5,
             record_access=True,
             query_embedding=query_embedding,
+            selected_paper_ids=selected_paper_ids,
         )
 
         decision_preference_memories: list[Memory] = []
@@ -708,7 +874,11 @@ class ChatService:
         # Resolve PAPER_FACT memory sources to verified EvidenceItem and CitationAnchor
         for p_mem in paper_fact_memories:
             for src in p_mem.sources:
-                ev_item, anchor, status = resolve_paper_memory_source(db, project_id, src)
+                if selected_paper_ids is not None and src.paper_id not in selected_paper_ids:
+                    continue
+                ev_item, anchor, status = resolve_paper_memory_source(
+                    db, project_id, src, selected_paper_ids=selected_paper_ids
+                )
                 if status == AnchorStatus.VERIFIED and ev_item and anchor:
                     supplementary_evidence.append(ev_item.model_copy(update={"anchors": [anchor]}))
 
@@ -717,8 +887,9 @@ class ChatService:
             db=db,
             repo=self.graph_repo,
             project_id=project_id,
-            query=question,
+            query=retrieval_question,
             intent=intent,
+            selected_paper_ids=selected_paper_ids,
         )
         for g_item in graph_evidence_items:
             supplementary_evidence.append(g_item)
@@ -729,21 +900,6 @@ class ChatService:
         memory_block = format_memories_for_prompt(
             decision_preference_memories, db=db, include_paper_facts=False
         )
-
-        # 3. Retrieve prior conversation history (bounded to last 6 messages)
-        history_msgs = (
-            db.query(Message)
-            .filter(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at.asc())
-            .all()
-        )
-        history_turns = []
-        for msg in history_msgs:
-            if msg.role == MessageRole.USER and msg.content == question and msg == history_msgs[-1]:
-                continue
-            history_turns.append(f"{msg.role}: {msg.content}")
-
-        history_block = "\n".join(history_turns[-6:]) if history_turns else ""
 
         system_prompt = build_chat_system_prompt(
             intent, graph_notice if intent != GraphIntent.FACTUAL else None
@@ -773,6 +929,7 @@ class ChatService:
             evidence_block=evidence_block,
             memory_block=memory_block,
             history_block=history_block,
+            resolved_question=retrieval_question,
         )
 
         # 4. Generate answer with LLM

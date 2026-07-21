@@ -54,6 +54,7 @@ def build_chat_user_prompt(
     evidence_block: str,
     memory_block: str = "",
     history_block: str = "",
+    resolved_question: str | None = None,
 ) -> str:
     parts: list[str] = []
     if memory_block:
@@ -62,4 +63,6 @@ def build_chat_user_prompt(
     if history_block:
         parts.append(f"CONVERSATION HISTORY:\n{history_block}")
     parts.append(f"QUESTION:\n{question}")
+    if resolved_question and resolved_question != question:
+        parts.append(f"RESOLVED RETRIEVAL QUESTION:\n{resolved_question}")
     return "\n\n".join(parts)

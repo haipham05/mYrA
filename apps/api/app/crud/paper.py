@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from sqlalchemy import Text, cast, or_
 from sqlalchemy.orm import Session
 
 from app.crud.corpus import bump_corpus_revision
@@ -79,8 +80,25 @@ def list_papers_by_project(
     project_id: UUID,
     limit: int = 50,
     offset: int = 0,
+    query_text: str | None = None,
+    status: str | None = None,
+    publication_year: int | None = None,
 ) -> tuple[list[Paper], int]:
-    query = db.query(Paper).filter(Paper.project_id == project_id).order_by(Paper.created_at.desc())
+    query = db.query(Paper).filter(Paper.project_id == project_id)
+    if query_text:
+        pattern = f"%{query_text}%"
+        query = query.filter(
+            or_(
+                Paper.filename.ilike(pattern),
+                Paper.title.ilike(pattern),
+                cast(Paper.authors, Text).ilike(pattern),
+            )
+        )
+    if status:
+        query = query.filter(Paper.status == status)
+    if publication_year is not None:
+        query = query.filter(Paper.publication_year == publication_year)
+    query = query.order_by(Paper.created_at.desc(), Paper.id.asc())
     total = query.count()
     items = query.offset(offset).limit(limit).all()
     return items, total

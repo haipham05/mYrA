@@ -12,7 +12,7 @@ from app.crud.chat import (
     update_conversation,
 )
 from app.crud.project import get_project
-from app.db.models import Conversation
+from app.db.models import Conversation, Paper
 from app.db.session import get_db
 from app.schemas.chat import (
     ConversationCreate,
@@ -22,6 +22,7 @@ from app.schemas.chat import (
     MessageCreate,
     MessageResponse,
     MessageRole,
+    PaperScope,
 )
 from app.schemas.evidence import Citation, EvidenceItem
 from app.services.chat_service import ChatService
@@ -40,11 +41,52 @@ def _to_conversation_response(
         project_id=conv.project_id,
         title=conv.title,
         summary=conv.summary,
+        paper_scope=PaperScope(conv.paper_scope),
+        selected_paper_ids=conv.selected_paper_ids or [],
         is_archived=conv.is_archived,
         message_count=count,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
     )
+
+
+def _validate_paper_scope(
+    db: Session,
+    project_id: UUID,
+    paper_scope: PaperScope,
+    selected_paper_ids: list[UUID],
+) -> None:
+    if len(set(selected_paper_ids)) != len(selected_paper_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Selected paper IDs must be unique",
+        )
+    if paper_scope == PaperScope.PROJECT and selected_paper_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Project scope must not include selected paper IDs",
+        )
+    if paper_scope == PaperScope.PAPER and len(selected_paper_ids) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Paper scope requires exactly one selected paper",
+        )
+    if len(selected_paper_ids) > 50:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At most 50 papers can be selected",
+        )
+    if selected_paper_ids:
+        valid_count = (
+            db.query(Paper.id)
+            .filter(Paper.project_id == project_id, Paper.id.in_(selected_paper_ids))
+            .count()
+        )
+        if valid_count != len(selected_paper_ids):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="One or more selected papers were not found in this project",
+            )
 
 
 @router.post(
@@ -65,7 +107,16 @@ def create_new_conversation(
         )
 
     title = conversation_in.title if conversation_in else None
-    conv = create_conversation(db, project_id=project_id, title=title)
+    paper_scope = conversation_in.paper_scope if conversation_in else PaperScope.PROJECT
+    selected_paper_ids = conversation_in.selected_paper_ids if conversation_in else []
+    _validate_paper_scope(db, project_id, paper_scope, selected_paper_ids)
+    conv = create_conversation(
+        db,
+        project_id=project_id,
+        title=title,
+        paper_scope=paper_scope.value,
+        selected_paper_ids=[str(paper_id) for paper_id in selected_paper_ids],
+    )
     return _to_conversation_response(conv, message_count=0)
 
 
@@ -136,12 +187,27 @@ def update_single_conversation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation {conversation_id} not found",
         )
+    scope_fields = {"paper_scope", "selected_paper_ids"} & conv_update.model_fields_set
+    if scope_fields:
+        next_scope = conv_update.paper_scope or PaperScope(existing.paper_scope)
+        if "selected_paper_ids" in conv_update.model_fields_set:
+            next_ids = conv_update.selected_paper_ids or []
+        else:
+            next_ids = [UUID(paper_id) for paper_id in (existing.selected_paper_ids or [])]
+        _validate_paper_scope(db, existing.project_id, next_scope, next_ids)
+    else:
+        next_scope = None
+        next_ids = None
     conv = update_conversation(
         db,
         conversation_id=conversation_id,
         title=conv_update.title,
         summary=conv_update.summary,
         is_archived=conv_update.is_archived,
+        paper_scope=next_scope.value if next_scope is not None else None,
+        selected_paper_ids=(
+            [str(paper_id) for paper_id in next_ids] if next_ids is not None else None
+        ),
     )
     if not conv:
         raise HTTPException(
@@ -224,6 +290,11 @@ async def send_message(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation {conversation_id} not found",
+        )
+    if conv.paper_scope != PaperScope.PROJECT.value and not conv.selected_paper_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Select at least one paper before asking a scoped question",
         )
 
     try:

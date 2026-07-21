@@ -1278,3 +1278,45 @@ def test_empty_facts_scenarios() -> None:
 
     assert build_contradiction_candidates(db=None, repo=mock_repo, project_id=p_id) == []
     assert build_corpus_themes(db=None, repo=mock_repo, project_id=p_id) == []
+
+
+def test_graph_aggregate_queries_pass_paper_scope_before_pagination() -> None:
+    from unittest.mock import MagicMock
+
+    mock_repo = MagicMock(spec=Neo4jRepository)
+    mock_repo.get_project_facts.return_value = []
+    project_id = uuid4()
+    selected_paper_id = uuid4()
+
+    assert (
+        build_contradiction_candidates(
+            db=None,
+            repo=mock_repo,
+            project_id=project_id,
+            selected_paper_ids={selected_paper_id},
+        )
+        == []
+    )
+    mock_repo.get_project_facts.assert_called_once_with(
+        project_id,
+        limit=100,
+        skip=0,
+        paper_ids={selected_paper_id},
+    )
+
+    mock_repo.get_project_facts.reset_mock()
+    assert (
+        build_corpus_themes(
+            db=None,
+            repo=mock_repo,
+            project_id=project_id,
+            selected_paper_ids={selected_paper_id},
+        )
+        == []
+    )
+    mock_repo.get_project_facts.assert_called_once_with(
+        project_id,
+        limit=100,
+        skip=0,
+        paper_ids={selected_paper_id},
+    )

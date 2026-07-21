@@ -7,8 +7,19 @@ from sqlalchemy.orm import Session
 from app.db.models import Conversation, Message
 
 
-def create_conversation(db: Session, project_id: UUID, title: str | None = None) -> Conversation:
-    conv = Conversation(project_id=project_id, title=title)
+def create_conversation(
+    db: Session,
+    project_id: UUID,
+    title: str | None = None,
+    paper_scope: str = "project",
+    selected_paper_ids: list[str] | None = None,
+) -> Conversation:
+    conv = Conversation(
+        project_id=project_id,
+        title=title,
+        paper_scope=paper_scope,
+        selected_paper_ids=selected_paper_ids or [],
+    )
     db.add(conv)
     db.commit()
     db.refresh(conv)
@@ -48,6 +59,8 @@ def update_conversation(
     title: str | None = None,
     summary: str | None = None,
     is_archived: bool | None = None,
+    paper_scope: str | None = None,
+    selected_paper_ids: list[str] | None = None,
 ) -> Conversation | None:
     conv = get_conversation(db, conversation_id)
     if not conv:
@@ -58,6 +71,10 @@ def update_conversation(
         conv.summary = summary
     if is_archived is not None:
         conv.is_archived = is_archived
+    if paper_scope is not None:
+        conv.paper_scope = paper_scope
+    if selected_paper_ids is not None:
+        conv.selected_paper_ids = selected_paper_ids
     conv.updated_at = datetime.now(UTC)
     db.commit()
     db.refresh(conv)

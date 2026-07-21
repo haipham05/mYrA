@@ -47,13 +47,16 @@ def test_retrieve_forwards_shared_query_embedding(monkeypatch):
     retriever = HybridRetriever()
     observed = {}
 
-    def fake_impl(db, project_id, query, telemetry, strategy, *, query_embedding=None):
+    def fake_impl(
+        db, project_id, query, telemetry, strategy, *, query_embedding=None, selected_paper_ids=None
+    ):
         observed.update(
             db=db,
             project_id=project_id,
             query=query,
             strategy=strategy,
             query_embedding=query_embedding,
+            selected_paper_ids=selected_paper_ids,
         )
         return []
 
@@ -228,6 +231,7 @@ def test_candidate_cache_key_scopes_query_project_revision_model_and_policy():
         ("query", "different query"),
         ("embedding_version", "rev-2"),
         ("embedding_model", "other-model"),
+        ("selected_paper_ids", (str(uuid4()),)),
     ):
         variant = {**common, field: changed}
         assert retrieval_module._candidate_cache_key(**variant) != key
@@ -261,6 +265,12 @@ def test_candidate_cache_hit_hydrates_current_rows_and_misses_ineligible_ids():
 
     hydrated = HybridRetriever._hydrate_candidate_ids(db, project.id, [chunk.id])
     assert hydrated is not None and [item.id for item in hydrated] == [chunk.id]
+    assert (
+        HybridRetriever._hydrate_candidate_ids(
+            db, project.id, [chunk.id], selected_paper_ids=(uuid4(),)
+        )
+        is None
+    )
 
     paper.status = "PROCESSING"
     db.commit()
@@ -791,6 +801,35 @@ def test_postgres_dense_search_filters_embedding_space():
     assert stages["retrieval.fts_search"]["output"] == {"candidates": []}
 
 
+def test_postgres_scope_is_applied_to_dense_and_fts_before_limits():
+    selected_id = uuid4()
+    calls = []
+
+    class EmptyResult:
+        def fetchall(self):
+            return []
+
+    class RecordingSession:
+        def execute(self, statement, params):
+            calls.append((str(statement), params))
+            return EmptyResult()
+
+    result = HybridRetriever()._retrieve_postgres(
+        RecordingSession(),
+        uuid4(),
+        "question",
+        [0.1] * 1024,
+        "BAAI/bge-m3",
+        "revision-1",
+        selected_paper_ids=(selected_id,),
+    )
+    assert result == []
+    assert len(calls) == 2
+    for sql, params in calls:
+        assert "p.id IN" in sql
+        assert params["selected_paper_ids"] == (selected_id,)
+
+
 def test_postgres_trace_reports_native_scores_in_search_order():
     dense_id, fts_id = uuid4(), uuid4()
     paper_id = uuid4()
@@ -908,6 +947,48 @@ def test_sqlite_dense_search_ignores_incompatible_vectors(monkeypatch):
     )
     assert len(result) == 2  # Both remain eligible for lexical retrieval.
     assert len(calls) == 1  # Only a compatible embedding enters cosine ranking.
+    db.close()
+
+
+def test_sqlite_scope_filters_before_candidate_ranking():
+    create_tables()
+    db = SessionLocal()
+    project = create_project(db, ProjectCreate(name="Scoped retrieval"))
+    included = create_paper(db, project.id, "included.pdf", "included")
+    excluded = create_paper(db, project.id, "excluded.pdf", "excluded")
+    included.status = excluded.status = PaperStatus.READY
+    embedder = DeterministicEmbeddingProvider(dimension=1024)
+    included_chunk = PaperChunk(
+        paper_id=included.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="selected paper contains answer",
+        embedding_vec=embedder.embed_query("selected paper answer"),
+        embedding_model="deterministic-fake",
+        embedding_version="v1",
+    )
+    excluded_chunk = PaperChunk(
+        paper_id=excluded.id,
+        chunk_type="child",
+        chunk_index=0,
+        text="excluded paper contains answer",
+        embedding_vec=embedder.embed_query("selected paper answer"),
+        embedding_model="deterministic-fake",
+        embedding_version="v1",
+    )
+    db.add_all([included_chunk, excluded_chunk])
+    db.commit()
+
+    result = HybridRetriever(top_candidates=10)._retrieve_fallback(
+        db,
+        project.id,
+        "answer",
+        embedder.embed_query("answer"),
+        "deterministic-fake",
+        "v1",
+        selected_paper_ids=(included.id,),
+    )
+    assert [chunk.id for chunk in result] == [included_chunk.id]
     db.close()
 
 
