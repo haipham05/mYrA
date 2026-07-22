@@ -589,8 +589,9 @@ export default function Home() {
     let nextIds = selectedPaperIds;
     if (nextScope === "project") nextIds = [];
     if (nextScope === "paper") {
-      nextIds = selectedPaperIds.slice(0, 1);
-      if (nextIds.length === 0 && selectedPaper) nextIds = [selectedPaper.id];
+      nextIds = selectedPaper
+        ? [selectedPaper.id]
+        : selectedPaperIds.slice(0, 1);
     }
     await saveConversationScope(nextScope, nextIds);
   };

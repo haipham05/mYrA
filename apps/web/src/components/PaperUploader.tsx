@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Paper } from "@/types";
 
 interface PaperUploaderProps {
@@ -43,8 +43,7 @@ export default function PaperUploader({
   onSelectedPaperIdsChange,
 }: PaperUploaderProps) {
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadStage, setUploadStage] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
+  const [isRetrying, setIsRetrying] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -52,6 +51,45 @@ export default function PaperUploader({
   const [searching, setSearching] = useState(false);
   const [scopeSaving, setScopeSaving] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const refreshPapersRef = useRef(onUploadSuccess);
+  const activeJobs = papers.filter(
+    (paper) =>
+      paper.latest_job &&
+      ["PENDING", "PROCESSING"].includes(paper.latest_job.status),
+  );
+  const activeJobKey = activeJobs
+    .map((paper) => paper.latest_job?.id)
+    .filter(Boolean)
+    .sort()
+    .join(",");
+
+  useEffect(() => {
+    refreshPapersRef.current = onUploadSuccess;
+  }, [onUploadSuccess]);
+
+  useEffect(() => {
+    if (!activeJobKey) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = () => {
+      timer = setTimeout(async () => {
+        if (stopped) return;
+        try {
+          await refreshPapersRef.current();
+        } catch {
+          setErrorMessage(
+            "Connection interrupted; ingestion status checks will continue.",
+          );
+        }
+        if (!stopped) poll();
+      }, 2000);
+    };
+    poll();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [activeJobKey]);
 
   const runSearch = async (nextOffset = 0) => {
     setSearching(true);
@@ -86,47 +124,25 @@ export default function PaperUploader({
     }
   };
 
-  const pollJobStatus = async (jobId: string) => {
-    let attempts = 0;
-    const maxAttempts = 60;
-
-    const interval = setInterval(async () => {
-      attempts += 1;
-      try {
-        const res = await fetch(`${apiUrl}/api/v1/jobs/${jobId}`);
-        if (!res.ok) throw new Error("Failed to check job status");
-        const job = await res.json();
-
-        setUploadStage(job.stage);
-        setProgress(Math.round(job.progress * 100));
-
-        if (job.status === "COMPLETED") {
-          clearInterval(interval);
-          setIsUploading(false);
-          setUploadStage(null);
-          setQuery("");
-          setStatusFilter("");
-          setYearFilter("");
-          onUploadSuccess();
-        } else if (job.status === "FAILED") {
-          clearInterval(interval);
-          setIsUploading(false);
-          setErrorMessage(job.error_message || "Ingestion pipeline failed");
-          setQuery("");
-          setStatusFilter("");
-          setYearFilter("");
-          onUploadSuccess();
-        } else if (attempts >= maxAttempts) {
-          clearInterval(interval);
-          setIsUploading(false);
-          setErrorMessage("Ingestion timed out polling job");
-        }
-      } catch {
-        clearInterval(interval);
-        setIsUploading(false);
-        setErrorMessage("Network error while checking job progress");
+  const retryJob = async (jobId: string) => {
+    setIsRetrying(jobId);
+    setErrorMessage(null);
+    try {
+      const response = await fetch(`${apiUrl}/api/v1/jobs/${jobId}/retry`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || "Could not retry ingestion.");
       }
-    }, 1500);
+      await onUploadSuccess();
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Could not retry ingestion.",
+      );
+    } finally {
+      setIsRetrying(null);
+    }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -139,8 +155,6 @@ export default function PaperUploader({
     }
 
     setIsUploading(true);
-    setUploadStage("UPLOADING");
-    setProgress(10);
     setErrorMessage(null);
 
     const formData = new FormData();
@@ -157,11 +171,9 @@ export default function PaperUploader({
         throw new Error(err.detail || "Upload failed");
       }
 
-      const data = await res.json();
-      pollJobStatus(data.job_id);
+      await onUploadSuccess();
     } catch (err: unknown) {
       setIsUploading(false);
-      setUploadStage(null);
       setErrorMessage(
         err instanceof Error ? err.message : "Failed to upload PDF",
       );
@@ -169,6 +181,7 @@ export default function PaperUploader({
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
+      setIsUploading(false);
     }
   };
 
@@ -199,22 +212,32 @@ export default function PaperUploader({
             disabled={!projectId || isUploading}
             className="rounded-lg bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-800 disabled:opacity-40 cursor-pointer"
           >
-            {isUploading ? "Processing…" : "Upload PDF"}
+            {isUploading ? "Uploading…" : "Upload PDF"}
           </button>
         </div>
       </div>
 
       {/* Uploading progress banner */}
-      {isUploading && (
+      {activeJobs.length > 0 && (
         <div className="mt-3 rounded-lg bg-zinc-50 border border-zinc-200 p-3">
           <div className="flex justify-between text-xs text-zinc-700 font-medium">
-            <span>Stage: {uploadStage}</span>
-            <span>{progress}%</span>
+            <span>
+              {activeJobs.length} ingestion job
+              {activeJobs.length === 1 ? "" : "s"} still processing
+              {activeJobs[0]?.latest_job?.stage
+                ? ` · ${activeJobs[0].latest_job.stage}`
+                : ""}
+            </span>
+            <span>
+              {Math.round((activeJobs[0]?.latest_job?.progress ?? 0) * 100)}%
+            </span>
           </div>
           <div className="mt-1.5 h-1.5 w-full rounded-full bg-zinc-200 overflow-hidden">
             <div
               className="h-full bg-blue-600 transition-all duration-300"
-              style={{ width: `${progress}%` }}
+              style={{
+                width: `${Math.round((activeJobs[0]?.latest_job?.progress ?? 0) * 100)}%`,
+              }}
             />
           </div>
         </div>
@@ -346,6 +369,26 @@ export default function PaperUploader({
                     {paper.status}
                   </span>
                 </button>
+                {paper.latest_job?.status === "FAILED" && (
+                  <div className="max-w-48 px-1 text-[10px] text-rose-700">
+                    {paper.latest_job.is_retryable
+                      ? "Ingestion failed; retry is available."
+                      : "Ingestion failed and cannot be retried."}
+                  </div>
+                )}
+                {paper.latest_job?.status === "FAILED" &&
+                  paper.latest_job.is_retryable && (
+                    <button
+                      type="button"
+                      className="rounded bg-rose-50 px-2 py-1 text-[10px] font-medium text-rose-800 disabled:opacity-50"
+                      disabled={isRetrying !== null}
+                      onClick={() => void retryJob(paper.latest_job!.id)}
+                    >
+                      {isRetrying === paper.latest_job.id
+                        ? "Retrying…"
+                        : "Retry"}
+                    </button>
+                  )}
                 <label className="flex items-center gap-1 text-[10px] text-zinc-500">
                   <input
                     type="checkbox"

@@ -201,7 +201,7 @@ async def test_short_follow_up_retrieves_against_single_selected_paper(db: Sessi
         ),
     ):
         await ChatService(retriever=retriever).answer_question(
-            db=db, conversation_id=conv.id, question="its limitations"
+            db=db, conversation_id=conv.id, question="What are its limitations?"
         )
 
     resolved = "What limitations does Attention Is All You Need report?"

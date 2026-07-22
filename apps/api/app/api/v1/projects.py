@@ -27,7 +27,13 @@ from app.db.models import Job, Paper
 from app.db.session import get_db
 from app.observability.context import get_operation_context
 from app.observability.telemetry import TelemetryAdapter, get_telemetry
-from app.schemas.paper import PaperListResponse, PaperResponse, PaperStatus, PaperUploadResponse
+from app.schemas.paper import (
+    IngestionJobSummary,
+    PaperListResponse,
+    PaperResponse,
+    PaperStatus,
+    PaperUploadResponse,
+)
 from app.schemas.project import ProjectCreate, ProjectListResponse, ProjectResponse
 from app.storage.factory import get_storage
 
@@ -428,7 +434,20 @@ def get_project_papers(
                 metadata={"outcome": "success", "result_count": len(items), "total": total}
             )
     return PaperListResponse(
-        items=[PaperResponse.model_validate(p, from_attributes=True) for p in items],
+        items=[
+            PaperResponse.model_validate(
+                {
+                    **PaperResponse.model_validate(p, from_attributes=True).model_dump(),
+                    "latest_job": IngestionJobSummary.model_validate(
+                        max(p.jobs, key=lambda job: (job.created_at, str(job.id))),
+                        from_attributes=True,
+                    )
+                    if p.jobs
+                    else None,
+                }
+            )
+            for p in items
+        ],
         total=total,
         limit=limit,
         offset=offset,

@@ -80,4 +80,117 @@ describe("PaperUploader library controls", () => {
     });
     expect(onScopeChange).toHaveBeenCalledWith("paper");
   });
+
+  it("shows recovered processing work rather than timing it out", async () => {
+    const onUploadSuccess = vi.fn().mockResolvedValue(undefined);
+    const processingPaper: Paper = {
+      ...paper,
+      status: "PROCESSING",
+      latest_job: {
+        id: "job-1",
+        status: "PROCESSING",
+        stage: "EMBEDDING",
+        progress: 0.45,
+        is_retryable: false,
+        retry_count: 0,
+      },
+    };
+    render(
+      <PaperUploader
+        projectId="project-1"
+        apiUrl="http://127.0.0.1:8000"
+        papers={[processingPaper]}
+        total={1}
+        offset={0}
+        selectedPaper={processingPaper}
+        onPaperSelect={vi.fn()}
+        onUploadSuccess={onUploadSuccess}
+        onSearch={vi.fn().mockResolvedValue(undefined)}
+        paperScope="project"
+        selectedPaperIds={[]}
+        onScopeChange={vi.fn().mockResolvedValue(undefined)}
+        onSelectedPaperIdsChange={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    expect(
+      await screen.findByText(/1 ingestion job still processing · EMBEDDING/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("45%")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload PDF" })).toBeEnabled();
+  });
+
+  it("offers retry only for a retryable failed job", async () => {
+    const onUploadSuccess = vi.fn().mockResolvedValue(undefined);
+    const failedPaper: Paper = {
+      ...paper,
+      status: "FAILED",
+      latest_job: {
+        id: "job-failed",
+        status: "FAILED",
+        stage: "FAILED",
+        progress: 0,
+        error_message: "temporary provider error",
+        is_retryable: true,
+        retry_count: 1,
+      },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+    const { rerender } = render(
+      <PaperUploader
+        projectId="project-1"
+        apiUrl="http://127.0.0.1:8000"
+        papers={[failedPaper]}
+        total={1}
+        offset={0}
+        selectedPaper={failedPaper}
+        onPaperSelect={vi.fn()}
+        onUploadSuccess={onUploadSuccess}
+        onSearch={vi.fn().mockResolvedValue(undefined)}
+        paperScope="project"
+        selectedPaperIds={[]}
+        onScopeChange={vi.fn().mockResolvedValue(undefined)}
+        onSelectedPaperIdsChange={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8000/api/v1/jobs/job-failed/retry",
+        { method: "POST" },
+      ),
+    );
+    expect(onUploadSuccess).toHaveBeenCalledOnce();
+
+    rerender(
+      <PaperUploader
+        projectId="project-1"
+        apiUrl="http://127.0.0.1:8000"
+        papers={[
+          {
+            ...failedPaper,
+            latest_job: { ...failedPaper.latest_job!, is_retryable: false },
+          },
+        ]}
+        total={1}
+        offset={0}
+        selectedPaper={failedPaper}
+        onPaperSelect={vi.fn()}
+        onUploadSuccess={onUploadSuccess}
+        onSearch={vi.fn().mockResolvedValue(undefined)}
+        paperScope="project"
+        selectedPaperIds={[]}
+        onScopeChange={vi.fn().mockResolvedValue(undefined)}
+        onSelectedPaperIdsChange={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Retry" }),
+    ).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
 });

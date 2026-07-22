@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from sqlalchemy import Text, cast, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.crud.corpus import bump_corpus_revision
 from app.db.models import Job, Paper, PaperElement, PaperPage
@@ -84,7 +84,7 @@ def list_papers_by_project(
     status: str | None = None,
     publication_year: int | None = None,
 ) -> tuple[list[Paper], int]:
-    query = db.query(Paper).filter(Paper.project_id == project_id)
+    query = db.query(Paper).options(selectinload(Paper.jobs)).filter(Paper.project_id == project_id)
     if query_text:
         pattern = f"%{query_text}%"
         query = query.filter(

@@ -19,11 +19,21 @@ class PaperUploadResponse(BaseModel):
     status: PaperStatus = PaperStatus.PROCESSING
 
 
+class IngestionJobSummary(BaseModel):
+    id: UUID
+    status: str
+    stage: str
+    progress: float = Field(ge=0.0, le=1.0)
+    is_retryable: bool = False
+    retry_count: int = 0
+
+
 class PaperResponse(BaseModel):
     id: UUID
     project_id: UUID
     filename: str
     status: PaperStatus
+    latest_job: IngestionJobSummary | None = None
     title: str | None = None
     authors: list[str] | None = None
     publication_year: int | None = None

@@ -1080,3 +1080,43 @@ def test_postgres_live_vector_and_fts():
             assert fts_res is True
     finally:
         live_engine.dispose()
+
+
+def test_project_12_attention_scoped_postgres_retrieval():
+    """Opt-in, read-only native retrieval smoke scoped to the approved paper."""
+    if os.getenv("MYRA_RUN_PROJECT12_POSTGRES_SCOPE_SMOKE") != "1":
+        pytest.skip("Set MYRA_RUN_PROJECT12_POSTGRES_SCOPE_SMOKE=1 for the bounded live read")
+
+    project_id = UUID("0f726c17-4f23-4914-ab0a-aefb31f05745")
+    attention_paper_id = UUID("0a9a9b4f-b0cd-4326-ac8e-b28d19577f18")
+    database_url = os.getenv("LIVE_DATABASE_URL")
+    if not database_url:
+        env_file = Path(__file__).resolve().parents[3] / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("DATABASE_URL="):
+                    database_url = line.split("=", 1)[1].strip().strip("\"'")
+                    break
+    if not database_url or "postgres" not in database_url:
+        pytest.skip("A PostgreSQL LIVE_DATABASE_URL is required for this read-only smoke")
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    live_engine = create_engine(database_url)
+    try:
+        with sessionmaker(bind=live_engine)() as live_db:
+            results = HybridRetriever(top_candidates=20)._retrieve_postgres(
+                db=live_db,
+                project_id=project_id,
+                query="attention self-attention transformer",
+                query_vec=[0.001] * 1024,
+                embedding_model="phase-c-smoke-no-dense-match",
+                embedding_version="phase-c-smoke-only",
+                strategy="hybrid-unreranked",
+                selected_paper_ids=(attention_paper_id,),
+            )
+        assert results, "The approved Attention paper should match the bounded FTS query"
+        assert {chunk.paper_id for chunk in results} == {attention_paper_id}
+    finally:
+        live_engine.dispose()

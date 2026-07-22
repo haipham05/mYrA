@@ -150,4 +150,90 @@ describe("Home", () => {
       ),
     );
   });
+
+  it("uses the viewed paper when switching from a multi-paper selection", async () => {
+    const papers = ["paper-a", "paper-b", "paper-c"].map((id) => ({
+      id,
+      project_id: "project-1",
+      filename: `${id}.pdf`,
+      status: "READY",
+    }));
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/health")) return jsonResponse({ status: "ok" });
+        if (url.endsWith("/api/v1/system/status")) {
+          return jsonResponse({ deepseek_configured: true });
+        }
+        if (url.endsWith("/api/v1/budget/usage")) {
+          return jsonResponse({ status: "unavailable" });
+        }
+        if (url.endsWith("/api/v1/projects")) {
+          return jsonResponse({
+            items: [{ id: "project-1", name: "Research" }],
+          });
+        }
+        if (url.endsWith("/api/v1/projects/project-1/papers")) {
+          return jsonResponse({
+            items: papers,
+            total: papers.length,
+            offset: 0,
+          });
+        }
+        if (url.includes("/api/v1/projects/project-1/conversations?")) {
+          return jsonResponse({
+            items: [
+              {
+                id: "conversation-1",
+                project_id: "project-1",
+                title: "Workspace Chat",
+                paper_scope: "selection",
+                selected_paper_ids: ["paper-a", "paper-b"],
+              },
+            ],
+          });
+        }
+        if (url.endsWith("/api/v1/conversations/conversation-1/messages")) {
+          return jsonResponse([]);
+        }
+        if (
+          url.endsWith(
+            "/api/v1/conversations/conversation-1?project_id=project-1",
+          ) &&
+          init?.method === "PATCH"
+        ) {
+          const body = JSON.parse(String(init.body));
+          return jsonResponse({
+            id: "conversation-1",
+            project_id: "project-1",
+            title: "Workspace Chat",
+            ...body,
+          });
+        }
+        return jsonResponse({});
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<Home />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /paper-c\.pdf/ }),
+    );
+    fireEvent.change(screen.getByLabelText("Chat searches"), {
+      target: { value: "paper" },
+    });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8000/api/v1/conversations/conversation-1?project_id=project-1",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({
+            paper_scope: "paper",
+            selected_paper_ids: ["paper-c"],
+          }),
+        }),
+      ),
+    );
+  });
 });

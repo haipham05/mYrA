@@ -25,11 +25,22 @@ export interface ProviderBudgetUsage {
 
 export type PaperStatus = "PROCESSING" | "READY" | "FAILED";
 
+export interface IngestionJobSummary {
+  id: string;
+  status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED";
+  stage: string;
+  progress: number;
+  error_message?: string | null;
+  is_retryable: boolean;
+  retry_count: number;
+}
+
 export interface Paper {
   id: string;
   project_id: string;
   filename: string;
   status: PaperStatus;
+  latest_job?: IngestionJobSummary | null;
   title?: string | null;
   authors?: string[] | null;
   publication_year?: number | null;

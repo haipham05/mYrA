@@ -37,7 +37,7 @@ def create_sqlite_fk_engine(db_url: str):
 
 
 def test_migration_lifecycle_upgrade_downgrade():
-    """Verify alembic migration g1a2b3c4d5e6 applies cleanly, defines tables/indexes,
+    """Verify current Alembic head applies cleanly, defines tables/indexes,
     downgrades back to f1a2b3c4d5e6, and upgrades back to head.
     """
     with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
@@ -49,7 +49,7 @@ def test_migration_lifecycle_upgrade_downgrade():
 
         engine = create_engine(db_url)
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "l2c4e6a8b0d1"
+        assert current_rev == "o5d7f9a1b3c5"
         assert current_rev in heads
         check_schema_compatibility(engine)
 
@@ -64,6 +64,10 @@ def test_migration_lifecycle_upgrade_downgrade():
         tables = inspector.get_table_names()
         assert "graph_events" in tables
         assert "graph_fact_snapshots" in tables
+        paper_cols = {col["name"] for col in inspector.get_columns("papers")}
+        assert {"title", "authors", "publication_year", "doi", "arxiv_id"} <= paper_cols
+        conversation_cols = {col["name"] for col in inspector.get_columns("conversations")}
+        assert {"paper_scope", "selected_paper_ids"} <= conversation_cols
         assert {
             "translation_documents",
             "translation_segments",
@@ -154,7 +158,7 @@ def test_migration_lifecycle_upgrade_downgrade():
         # 4. Re-upgrade back to head
         command.upgrade(cfg, "head")
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "l2c4e6a8b0d1"
+        assert current_rev == "o5d7f9a1b3c5"
         check_schema_compatibility(engine)
 
 

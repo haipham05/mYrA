@@ -329,6 +329,9 @@ def test_paper_upload_and_validation(test_env):
         assert listed_paper["title"] is None
         assert listed_paper["authors"] is None
         assert listed_paper["metadata_provenance"] is None
+        assert listed_paper["latest_job"]["id"] == job_id
+        assert listed_paper["latest_job"]["status"] == "PENDING"
+        assert listed_paper["latest_job"]["is_retryable"] is False
 
         detail_resp = client.get(f"/api/v1/papers/{paper_id}")
         assert detail_resp.status_code == 200
