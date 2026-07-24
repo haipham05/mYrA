@@ -110,6 +110,8 @@ class ToolContext:
     db: Session
     chat_service: ChatService
     assistant_run_id: UUID | None = None
+    worker_id: str | None = None
+    attempt_count: int | None = None
 
 
 ToolHandler = Callable[[ToolContext, AssistantToolInput], Awaitable[AssistantToolResult]]
@@ -160,12 +162,19 @@ async def _clarify(_context: ToolContext, tool_input: AssistantToolInput) -> Ass
 
 
 async def _qa(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    resolved_paper_ids = tool_input.decision.resolved_paper_ids
+    requested_paper_ids = resolved_paper_ids or tool_input.request.selected_paper_ids or []
+    requested_scope = "selection" if resolved_paper_ids else tool_input.request.scope
     response = await context.chat_service.answer_question(
         context.db,
         tool_input.request.conversation_id,
         tool_input.request.message,
         assistant_run_id=context.assistant_run_id,
         retrieval_question=tool_input.decision.standalone_question,
+        paper_scope=requested_scope,
+        selected_paper_ids=requested_paper_ids,
+        run_worker_id=context.worker_id,
+        run_attempt_count=context.attempt_count,
     )
     return AssistantToolResult(
         status=ToolStatus.SUCCEEDED,

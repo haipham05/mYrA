@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine
@@ -8,17 +8,23 @@ from sqlalchemy.orm import Session
 from app.crud.assistant_run import (
     IdempotencyConflict,
     RunLeaseLost,
+    begin_assistant_run_publication,
     claim_next_assistant_run,
+    create_assistant_approval,
     create_assistant_run,
+    decide_assistant_approval,
     finish_assistant_run,
+    get_valid_approved_assistant_action,
     release_assistant_run,
     renew_assistant_run_lease,
+    request_assistant_run_cancel,
+    resume_assistant_run,
     save_assistant_step,
     start_assistant_step,
 )
 from app.crud.chat import add_message
 from app.db.base import Base
-from app.db.models import AssistantRun, Conversation, Paper, Project
+from app.db.models import AssistantRun, Conversation, Message, Paper, Project
 from app.schemas.assistant import AssistantRunRequest
 from app.services.chat_service import ChatService
 
@@ -252,6 +258,237 @@ def test_needs_input_releases_run_for_a_later_resume(session: Session) -> None:
     assert waiting.status == "NEEDS_INPUT"
     assert waiting.finished_at is None
     assert waiting.lease_owner is None
+
+
+def test_approval_proposal_is_exact_idempotent_and_bound_to_source_revision(
+    session: Session,
+) -> None:
+    project, conversation, paper = _seed(session)
+    run, _ = create_assistant_run(session, _request(project, conversation, paper))
+    claim = claim_next_assistant_run(session, worker_id="worker-a")
+    assert claim is not None
+    arguments = {
+        "message": "Translate the selected paper",
+        "scope": "paper",
+        "paper_ids": [str(paper.id)],
+        "tool_arguments": {"target_language": "vi"},
+    }
+    action = create_assistant_approval(
+        session,
+        run.id,
+        worker_id="worker-a",
+        attempt_count=claim.attempt_count,
+        action_type="translate",
+        arguments=arguments,
+        paper_ids=[paper.id],
+    )
+    repeated = create_assistant_approval(
+        session,
+        run.id,
+        worker_id="worker-a",
+        attempt_count=claim.attempt_count,
+        action_type="translate",
+        arguments=arguments,
+        paper_ids=[paper.id],
+    )
+    assert repeated.id == action.id
+    assert action.arguments == arguments
+    assert action.status == "PENDING"
+    assert action.source_fingerprint != ""
+
+    project.corpus_revision += 1
+    session.commit()
+    changed_source = create_assistant_approval(
+        session,
+        run.id,
+        worker_id="worker-a",
+        attempt_count=claim.attempt_count,
+        action_type="translate",
+        arguments=arguments,
+        paper_ids=[paper.id],
+    )
+    assert changed_source.id != action.id
+    assert changed_source.source_fingerprint != action.source_fingerprint
+
+
+def _pending_approval(session: Session):
+    project, conversation, paper = _seed(session)
+    run, _ = create_assistant_run(session, _request(project, conversation, paper))
+    claim = claim_next_assistant_run(session, worker_id="worker-a")
+    assert claim is not None
+    action = create_assistant_approval(
+        session,
+        run.id,
+        worker_id="worker-a",
+        attempt_count=claim.attempt_count,
+        action_type="translate",
+        arguments={"paper_ids": [str(paper.id)], "tool_arguments": {"language": "vi"}},
+        paper_ids=[paper.id],
+    )
+    finish_assistant_run(
+        session,
+        run.id,
+        worker_id="worker-a",
+        attempt_count=claim.attempt_count,
+        status="AWAITING_APPROVAL",
+        result_payload={"result_type": "approval_required"},
+    )
+    return project, run, action
+
+
+def test_approval_decision_is_idempotent_and_requeues_exact_proposal(session: Session) -> None:
+    project, run, action = _pending_approval(session)
+    approved = decide_assistant_approval(session, action.id, approve=True)
+    assert approved is not None and approved.status == "APPROVED"
+    assert decide_assistant_approval(session, action.id, approve=True).id == action.id
+    session.refresh(run)
+    assert run.status == "QUEUED"
+    assert run.result_payload is None
+    exact_action = get_valid_approved_assistant_action(
+        session,
+        run.id,
+        action_type="translate",
+        expected_arguments=action.arguments,
+        paper_ids=[UUID(action.arguments["paper_ids"][0])],
+    )
+    assert exact_action is not None and exact_action.id == action.id
+
+    project.corpus_revision += 1
+    session.commit()
+    with pytest.raises(ValueError, match="no_longer_matches"):
+        get_valid_approved_assistant_action(
+            session,
+            run.id,
+            action_type="translate",
+            expected_arguments=action.arguments,
+            paper_ids=[UUID(action.arguments["paper_ids"][0])],
+        )
+    session.refresh(action)
+    assert action.status == "STALE"
+
+
+def test_rejection_cancels_without_queueing_mutation(session: Session) -> None:
+    _, run, action = _pending_approval(session)
+    rejected = decide_assistant_approval(session, action.id, approve=False)
+    assert rejected is not None and rejected.status == "REJECTED"
+    session.refresh(run)
+    assert run.status == "CANCELLED"
+    assert run.safe_error == "ACTION_REJECTED"
+    with pytest.raises(ValueError, match="already_decided"):
+        decide_assistant_approval(session, action.id, approve=True)
+
+
+def test_approval_refuses_changed_source_and_expires_stale_proposal(session: Session) -> None:
+    project, run, action = _pending_approval(session)
+    project.corpus_revision += 1
+    session.commit()
+    stale = decide_assistant_approval(session, action.id, approve=True)
+    assert stale is not None and stale.status == "STALE"
+    session.refresh(run)
+    assert run.status == "FAILED"
+    assert run.safe_error == "APPROVAL_SOURCE_CHANGED"
+
+    _, expired_run, expired_action = _pending_approval(session)
+    expired_action.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.commit()
+    expired = decide_assistant_approval(session, expired_action.id, approve=True)
+    assert expired is not None and expired.status == "EXPIRED"
+    session.refresh(expired_run)
+    assert expired_run.status == "FAILED"
+    assert expired_run.safe_error == "APPROVAL_EXPIRED"
+
+
+def test_cancel_and_clarification_resume_use_safe_lifecycle_states(session: Session) -> None:
+    project, conversation, paper = _seed(session)
+    cancelled_run, _ = create_assistant_run(
+        session,
+        _request(project, conversation, paper, idempotency_key="cancel-request-123"),
+    )
+    cancelled = request_assistant_run_cancel(session, cancelled_run.id)
+    assert cancelled is not None and cancelled.status == "CANCELLED"
+    assert cancelled.cancel_requested is True
+
+    resumed_run, _ = create_assistant_run(
+        session,
+        _request(project, conversation, paper, idempotency_key="resume-request-123"),
+    )
+    claim = claim_next_assistant_run(session, worker_id="worker-resume")
+    assert claim is not None and claim.id == resumed_run.id
+    waiting = finish_assistant_run(
+        session,
+        resumed_run.id,
+        worker_id="worker-resume",
+        attempt_count=claim.attempt_count,
+        status="NEEDS_INPUT",
+        result_payload={"result_type": "clarification"},
+    )
+    previous_hash = waiting.request_hash
+    queued = resume_assistant_run(
+        session,
+        waiting.id,
+        additional_input="The Attention Is All You Need paper.",
+    )
+    assert queued is not None
+    assert queued.status == "QUEUED"
+    assert queued.resume_count == 1
+    assert queued.request_hash != previous_hash
+    assert "Additional user input" in queued.request_payload["message"]
+    with pytest.raises(ValueError, match="not_waiting_for_input"):
+        resume_assistant_run(session, queued.id, additional_input="again")
+
+
+def test_publication_and_cancellation_have_one_winner(session: Session) -> None:
+    project, conversation, paper = _seed(session)
+    run, _ = create_assistant_run(
+        session,
+        _request(project, conversation, paper, idempotency_key="publish-race-123"),
+    )
+    claim = claim_next_assistant_run(session, worker_id="worker-publish")
+    assert claim is not None and claim.id == run.id
+
+    assert begin_assistant_run_publication(
+        session,
+        run.id,
+        worker_id="worker-publish",
+        attempt_count=claim.attempt_count,
+    )
+    message = add_message(
+        session,
+        conversation.id,
+        role="ASSISTANT",
+        content="Published answer",
+        citations=[],
+        evidence=[],
+        assistant_run_id=run.id,
+    )
+    cancellation = request_assistant_run_cancel(session, run.id)
+
+    assert cancellation is not None
+    assert cancellation.status == "RUNNING"
+    assert cancellation.cancel_requested is False
+    assert session.get(Message, message.id) is not None
+
+
+def test_cancellation_winning_before_publication_prevents_assistant_message(
+    session: Session,
+) -> None:
+    project, conversation, paper = _seed(session)
+    run, _ = create_assistant_run(
+        session,
+        _request(project, conversation, paper, idempotency_key="cancel-wins-123"),
+    )
+    claim = claim_next_assistant_run(session, worker_id="worker-cancel")
+    assert claim is not None and claim.id == run.id
+
+    cancellation = request_assistant_run_cancel(session, run.id)
+    assert cancellation is not None and cancellation.cancel_requested is True
+    assert not begin_assistant_run_publication(
+        session,
+        run.id,
+        worker_id="worker-cancel",
+        attempt_count=claim.attempt_count,
+    )
+    assert session.query(Message).filter(Message.assistant_run_id == run.id).count() == 0
 
 
 @pytest.mark.anyio

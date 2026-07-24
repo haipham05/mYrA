@@ -43,6 +43,9 @@ def test_assistant_run_migration_is_additive_and_creates_durable_tables() -> Non
             column["name"] for column in inspector.get_columns("messages")
         }
         assert "provider_usage" in {column["name"] for column in inspector.get_columns("messages")}
+        assert "resume_count" in {
+            column["name"] for column in inspector.get_columns("assistant_runs")
+        }
         with engine.connect() as connection:
             assert (
                 connection.execute(

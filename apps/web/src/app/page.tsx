@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import ChatPanel from "@/components/ChatPanel";
 import MemoryInspector from "@/components/MemoryInspector";
@@ -12,6 +12,9 @@ import TranslationPanel from "@/components/TranslationPanel";
 import type {
   Citation,
   Conversation,
+  AssistantIntent,
+  AssistantApprovalResponse,
+  AssistantRunResponse,
   MemorySource,
   Message,
   Paper,
@@ -39,6 +42,12 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
   const [isAsking, setIsAsking] = useState(false);
+  const [routedIntent, setRoutedIntent] = useState<AssistantIntent | null>(
+    null,
+  );
+  const [activeRun, setActiveRun] = useState<AssistantRunResponse | null>(null);
+  const [pendingAction, setPendingAction] =
+    useState<AssistantApprovalResponse | null>(null);
   const [deepseekStatus, setDeepseekStatus] = useState<string | null>(null);
   const [budgetUsage, setBudgetUsage] = useState<ProviderBudgetUsage | null>(
     null,
@@ -47,6 +56,150 @@ export default function Home() {
 
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
   const apiUrl = rawApiUrl.replace("localhost", "127.0.0.1");
+
+  const handleCitationClick = useCallback(
+    (citation: Citation) => {
+      setActiveCitation(citation);
+      const citedPaper = papers.find((paper) => paper.id === citation.paper_id);
+      if (citedPaper) {
+        setSelectedPaper(citedPaper);
+      } else {
+        fetch(`${apiUrl}/api/v1/papers/${citation.paper_id}`)
+          .then((response) => (response.ok ? response.json() : null))
+          .then((paper: Paper | null) => {
+            if (paper) setSelectedPaper(paper);
+          })
+          .catch(() => {});
+      }
+    },
+    [apiUrl, papers],
+  );
+
+  const pollAssistantRun = useCallback(
+    async (initialRun: AssistantRunResponse) => {
+      let run = initialRun;
+      const runKey = `myra.activeRun.${run.conversation_id}`;
+      const isCurrentConversation = () =>
+        conversation?.id === run.conversation_id;
+      const updateRun = (next: AssistantRunResponse) => {
+        run = next;
+        if (isCurrentConversation()) {
+          setActiveRun(next);
+          setRoutedIntent(next.intent);
+        }
+      };
+      const loadPendingAction = async () => {
+        const response = await fetch(
+          `${apiUrl}/api/v1/runs/${run.id}/actions`,
+          {
+            cache: "no-store",
+          },
+        );
+        if (!response.ok)
+          throw new Error("Could not load the proposed action.");
+        const actions: AssistantApprovalResponse[] = await response.json();
+        if (isCurrentConversation()) {
+          setPendingAction(
+            actions.find((action) => action.status === "PENDING") ?? null,
+          );
+        }
+      };
+
+      updateRun(run);
+      for (let poll = 0; poll < 240; poll += 1) {
+        if (run.status !== "QUEUED" && run.status !== "RUNNING") break;
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const response = await fetch(`${apiUrl}/api/v1/runs/${run.id}`, {
+          cache: "no-store",
+        });
+        if (!response.ok)
+          throw new Error("Could not read research run status.");
+        updateRun(await response.json());
+      }
+
+      if (run.status === "AWAITING_APPROVAL") await loadPendingAction();
+      else if (isCurrentConversation()) setPendingAction(null);
+
+      if (run.status === "QUEUED" || run.status === "RUNNING") {
+        if (isCurrentConversation()) {
+          setChatError(`This request is still processing (run ${run.id}).`);
+        }
+        return;
+      }
+      if (run.status === "NEEDS_INPUT" || run.status === "AWAITING_APPROVAL")
+        return;
+
+      window.localStorage.removeItem(runKey);
+      if (isCurrentConversation()) {
+        setActiveRun(null);
+        if (run.result) {
+          const payloadMessageId = run.result.structured_payload.message_id;
+          const assistantMessage: Message = {
+            id:
+              typeof payloadMessageId === "string" ? payloadMessageId : run.id,
+            conversation_id: run.conversation_id,
+            role: "ASSISTANT",
+            content: run.result.display_text,
+            citations: run.result.citations ?? [],
+            evidence: [],
+            model_name:
+              typeof run.result.usage.model_name === "string"
+                ? run.result.usage.model_name
+                : null,
+            created_at: run.updated_at,
+          };
+          setMessages((previous) =>
+            previous.some((message) => message.id === assistantMessage.id)
+              ? previous
+              : [...previous, assistantMessage],
+          );
+          if (assistantMessage.citations.length > 0) {
+            handleCitationClick(assistantMessage.citations[0]);
+          }
+        } else if (run.status === "CANCELLED") {
+          setChatError("The research request was cancelled.");
+        } else if (run.status === "FAILED") {
+          setChatError(
+            `The research request could not be completed${run.safe_error ? ` (${run.safe_error})` : ""}.`,
+          );
+        }
+      }
+    },
+    [apiUrl, conversation?.id, handleCitationClick],
+  );
+
+  useEffect(() => {
+    if (!conversation) return;
+    const runId = window.localStorage.getItem(
+      `myra.activeRun.${conversation.id}`,
+    );
+    if (!runId) {
+      return;
+    }
+    let ignore = false;
+    fetch(`${apiUrl}/api/v1/runs/${runId}`, { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Saved run is unavailable.");
+        const run: AssistantRunResponse = await response.json();
+        if (!ignore) {
+          setIsAsking(true);
+          await pollAssistantRun(run);
+        }
+      })
+      .catch(() => {
+        if (!ignore) {
+          window.localStorage.removeItem(`myra.activeRun.${conversation.id}`);
+          setActiveRun(null);
+          setPendingAction(null);
+        }
+      })
+      .finally(() => {
+        if (!ignore) setIsAsking(false);
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [apiUrl, conversation, pollAssistantRun]);
 
   // 1. Health check & system status
   useEffect(() => {
@@ -478,41 +631,49 @@ export default function Home() {
 
   // Send QA Question
   const handleSendMessage = async (content: string) => {
-    if (!conversation || isAsking) return;
+    if (!conversation || !selectedProject || isAsking) return;
     setIsAsking(true);
     setChatError(null);
+    setRoutedIntent(null);
     try {
-      const res = await fetch(
-        `${apiUrl}/api/v1/conversations/${conversation.id}/messages`,
+      const submitted = await fetch(
+        `${apiUrl}/api/v1/conversations/${conversation.id}/runs`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content }),
+          body: JSON.stringify({
+            message: content,
+            conversation_id: conversation.id,
+            project_id: selectedProject.id,
+            scope: paperScope,
+            selected_paper_ids:
+              paperScope === "project" ? [] : selectedPaperIds,
+            idempotency_key: `web-${crypto.randomUUID()}`,
+          }),
         },
       );
-      if (res.ok) {
-        const assistantMsg: Message = await res.json();
-        const userMsg: Message = {
-          id: `usr-${assistantMsg.id}`,
-          conversation_id: conversation.id,
-          role: "USER",
-          content,
-          citations: [],
-          evidence: [],
-          created_at: assistantMsg.created_at,
-        };
-        setMessages((prev) => [...prev, userMsg, assistantMsg]);
-
-        // Auto-select first citation if available
-        if (assistantMsg.citations && assistantMsg.citations.length > 0) {
-          handleCitationClick(assistantMsg.citations[0]);
-        }
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        setChatError(
-          errData.detail || "Failed to generate answer. Please try again.",
+      if (!submitted.ok) {
+        const errData = await submitted.json().catch(() => ({}));
+        throw new Error(
+          errData.detail || "Could not submit the research request.",
         );
       }
+
+      const run: AssistantRunResponse = await submitted.json();
+      window.localStorage.setItem(`myra.activeRun.${conversation.id}`, run.id);
+      setActiveRun(run);
+      setRoutedIntent(run.intent);
+      const userMessage: Message = {
+        id: `usr-${run.id}`,
+        conversation_id: conversation.id,
+        role: "USER",
+        content,
+        citations: [],
+        evidence: [],
+        created_at: run.created_at,
+      };
+      setMessages((previous) => [...previous, userMessage]);
+      await pollAssistantRun(run);
     } catch (err: unknown) {
       setChatError(
         err instanceof Error ? err.message : "Network error. Please try again.",
@@ -522,19 +683,65 @@ export default function Home() {
     }
   };
 
-  // Handle Citation click
-  const handleCitationClick = (citation: Citation) => {
-    setActiveCitation(citation);
-    const citedPaper = papers.find((p) => p.id === citation.paper_id);
-    if (citedPaper) {
-      setSelectedPaper(citedPaper);
-    } else {
-      fetch(`${apiUrl}/api/v1/papers/${citation.paper_id}`)
-        .then((response) => (response.ok ? response.json() : null))
-        .then((paper: Paper | null) => {
-          if (paper) setSelectedPaper(paper);
-        })
-        .catch(() => {});
+  const handleCancelRun = async (runId: string) => {
+    try {
+      const response = await fetch(`${apiUrl}/api/v1/runs/${runId}/cancel`, {
+        method: "POST",
+      });
+      if (!response.ok) throw new Error("Could not cancel the research run.");
+      await pollAssistantRun(await response.json());
+    } catch (err) {
+      setChatError(
+        err instanceof Error ? err.message : "Could not cancel the run.",
+      );
+    }
+  };
+
+  const handleResumeRun = async (runId: string, additionalInput: string) => {
+    if (!conversation) return;
+    setIsAsking(true);
+    try {
+      const response = await fetch(`${apiUrl}/api/v1/runs/${runId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ additional_input: additionalInput }),
+      });
+      if (!response.ok)
+        throw new Error("Could not continue this research run.");
+      const run: AssistantRunResponse = await response.json();
+      window.localStorage.setItem(`myra.activeRun.${conversation.id}`, run.id);
+      await pollAssistantRun(run);
+    } catch (err) {
+      setChatError(
+        err instanceof Error ? err.message : "Could not continue the run.",
+      );
+    } finally {
+      setIsAsking(false);
+    }
+  };
+
+  const handleDecideAction = async (actionId: string, approve: boolean) => {
+    if (!activeRun) return;
+    setIsAsking(true);
+    try {
+      const response = await fetch(
+        `${apiUrl}/api/v1/actions/${actionId}/${approve ? "approve" : "reject"}`,
+        { method: "POST" },
+      );
+      if (!response.ok)
+        throw new Error("The proposed action could not be updated.");
+      setPendingAction(null);
+      const runResponse = await fetch(`${apiUrl}/api/v1/runs/${activeRun.id}`, {
+        cache: "no-store",
+      });
+      if (!runResponse.ok) throw new Error("Could not read the updated run.");
+      await pollAssistantRun(await runResponse.json());
+    } catch (err) {
+      setChatError(
+        err instanceof Error ? err.message : "Could not update the action.",
+      );
+    } finally {
+      setIsAsking(false);
     }
   };
 
@@ -795,6 +1002,7 @@ export default function Home() {
                 <ChatPanel
                   messages={messages}
                   isLoading={isAsking}
+                  routedIntent={routedIntent}
                   error={chatError}
                   onDismissError={() => setChatError(null)}
                   onSendMessage={handleSendMessage}
@@ -812,6 +1020,19 @@ export default function Home() {
                   onRenameConversation={handleRenameConversation}
                   onArchiveConversation={handleArchiveConversation}
                   onDeleteConversation={handleDeleteConversation}
+                  activeRun={
+                    activeRun?.conversation_id === conversation?.id
+                      ? activeRun
+                      : null
+                  }
+                  pendingAction={
+                    pendingAction?.run_id === activeRun?.id
+                      ? pendingAction
+                      : null
+                  }
+                  onCancelRun={handleCancelRun}
+                  onResumeRun={handleResumeRun}
+                  onDecideAction={handleDecideAction}
                 />
               </div>
 

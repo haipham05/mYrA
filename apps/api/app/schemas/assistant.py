@@ -154,5 +154,28 @@ class AssistantRunResponse(BaseModel):
     stage: str | None = None
     result: AssistantRunResult | None = None
     safe_error: str | None = None
+    usage: dict[str, int | float | str | None] | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class AssistantApprovalResponse(BaseModel):
+    id: UUID
+    run_id: UUID
+    action_type: str = Field(min_length=1, max_length=80)
+    arguments: dict[str, Any]
+    source_fingerprint: str = Field(min_length=64, max_length=64)
+    status: str = Field(min_length=1, max_length=24)
+    expires_at: datetime
+    decided_at: datetime | None = None
+
+
+class AssistantRunResumeRequest(BaseModel):
+    additional_input: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("additional_input")
+    @classmethod
+    def resume_input_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("additional_input must not be blank")
+        return value

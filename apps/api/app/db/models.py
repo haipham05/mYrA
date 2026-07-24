@@ -300,6 +300,7 @@ class AssistantRun(Base):
     usage: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    resume_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lease_owner: Mapped[str | None] = mapped_column(String(100), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

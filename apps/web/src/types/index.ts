@@ -118,6 +118,67 @@ export interface Message {
   created_at: string;
 }
 
+export type AssistantIntent =
+  | "help"
+  | "qa"
+  | "read_paper"
+  | "compare"
+  | "verify_claim"
+  | "discover"
+  | "notes"
+  | "report"
+  | "research"
+  | "gap_analysis"
+  | "experiment_plan"
+  | "translate"
+  | "vision"
+  | "graph"
+  | "clarify";
+
+export interface AssistantRunResult {
+  result_type: string;
+  display_text: string;
+  structured_payload: Record<string, unknown>;
+  citations: Citation[];
+  warnings: string[];
+  usage: Record<string, number | string | null>;
+  available_actions: string[];
+  artifact_ids: string[];
+}
+
+export interface AssistantRunResponse {
+  id: string;
+  project_id: string;
+  conversation_id: string;
+  status:
+    | "QUEUED"
+    | "RUNNING"
+    | "NEEDS_INPUT"
+    | "AWAITING_APPROVAL"
+    | "SUCCEEDED"
+    | "FAILED"
+    | "CANCELLED";
+  intent: AssistantIntent | null;
+  action_summary: string | null;
+  stage: string | null;
+  result: AssistantRunResult | null;
+  safe_error: string | null;
+  usage: Record<string, number | string | null> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AssistantApprovalResponse {
+  id: string;
+  run_id: string;
+  action_type: string;
+  arguments: Record<string, unknown>;
+  source_fingerprint: string;
+  status: string;
+  expires_at: string;
+  decided_at: string | null;
+}
+
 export interface Conversation {
   id: string;
   project_id: string;

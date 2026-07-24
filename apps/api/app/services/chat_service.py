@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.crud.assistant_run import begin_assistant_run_publication
 from app.crud.chat import add_message, get_conversation
 from app.db.models import Memory, Message, Paper, PaperPage
 from app.observability.telemetry import Observation, TelemetryAdapter, get_telemetry
@@ -44,6 +45,11 @@ from app.services.retrieval import HybridRetriever
 from app.services.source_resolution import resolve_exact_source_anchor
 
 logger = logging.getLogger("myra.chat")
+
+
+class AssistantRunCancelled(RuntimeError):
+    """Raised when a cancellable assistant run stops before publishing its answer."""
+
 
 FOLLOW_UP_QUESTION = re.compile(
     r"^(?:(?:what\s+(?:are|is)|tell\s+me\s+about|explain)\s+)?"
@@ -715,6 +721,10 @@ class ChatService:
         *,
         assistant_run_id: UUID | None = None,
         retrieval_question: str | None = None,
+        paper_scope: str | None = None,
+        selected_paper_ids: list[UUID] | None = None,
+        run_worker_id: str | None = None,
+        run_attempt_count: int | None = None,
     ) -> MessageResponse:
         if assistant_run_id is not None:
             existing = (
@@ -749,6 +759,10 @@ class ChatService:
                 observation,
                 assistant_run_id,
                 retrieval_question,
+                paper_scope,
+                selected_paper_ids,
+                run_worker_id,
+                run_attempt_count,
             )
 
     async def _answer_question(
@@ -760,6 +774,10 @@ class ChatService:
         observation: Observation | None,
         assistant_run_id: UUID | None = None,
         routed_retrieval_question: str | None = None,
+        paper_scope: str | None = None,
+        requested_paper_ids: list[UUID] | None = None,
+        run_worker_id: str | None = None,
+        run_attempt_count: int | None = None,
     ) -> MessageResponse:
         start_time = time.perf_counter()
         conv = get_conversation(db, conversation_id)
@@ -767,15 +785,23 @@ class ChatService:
             raise ValueError(f"Conversation {conversation_id} not found")
 
         project_id = conv.project_id
-        selected_paper_ids = (
-            [UUID(paper_id) for paper_id in (conv.selected_paper_ids or [])]
-            if conv.paper_scope != "project"
-            else None
-        )
+        effective_scope = paper_scope or conv.paper_scope
+        if paper_scope is not None:
+            selected_paper_ids = requested_paper_ids or []
+            if effective_scope == "paper" and not selected_paper_ids:
+                effective_scope = "selection"
+        else:
+            selected_paper_ids = (
+                [UUID(paper_id) for paper_id in (conv.selected_paper_ids or [])]
+                if conv.paper_scope != "project"
+                else None
+            )
+        if effective_scope == "project":
+            selected_paper_ids = None
         with telemetry.stage(
             "scope.resolve",
             metadata={
-                "scope": conv.paper_scope,
+                "scope": effective_scope,
                 "selected_paper_count": len(selected_paper_ids or []),
                 "outcome": "project" if selected_paper_ids is None else "selected_papers",
             },
@@ -1326,6 +1352,16 @@ class ChatService:
             if generation.usage is not None
             else None
         )
+        if assistant_run_id is not None:
+            if run_worker_id is None or run_attempt_count is None:
+                raise ValueError("Assistant-run QA requires its worker lease context")
+            if not begin_assistant_run_publication(
+                db,
+                assistant_run_id,
+                worker_id=run_worker_id,
+                attempt_count=run_attempt_count,
+            ):
+                raise AssistantRunCancelled
         token_count_estimate = max(1, len(formatted_answer.split()))
         assistant_msg: Message = add_message(
             db=db,

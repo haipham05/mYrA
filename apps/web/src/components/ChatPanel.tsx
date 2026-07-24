@@ -2,11 +2,19 @@
 
 import { useState } from "react";
 import ConversationNavigator from "@/components/ConversationNavigator";
-import type { Citation, Conversation, Message } from "@/types";
+import type {
+  AssistantApprovalResponse,
+  AssistantIntent,
+  AssistantRunResponse,
+  Citation,
+  Conversation,
+  Message,
+} from "@/types";
 
 interface ChatPanelProps {
   messages: Message[];
   isLoading: boolean;
+  routedIntent?: AssistantIntent | null;
   error?: string | null;
   onDismissError?: () => void;
   onSendMessage: (content: string) => Promise<void>;
@@ -20,11 +28,17 @@ interface ChatPanelProps {
   onRenameConversation?: (id: string, newTitle: string) => Promise<void>;
   onArchiveConversation?: (id: string, isArchived: boolean) => Promise<void>;
   onDeleteConversation?: (id: string) => Promise<void>;
+  activeRun?: AssistantRunResponse | null;
+  pendingAction?: AssistantApprovalResponse | null;
+  onCancelRun?: (runId: string) => Promise<void>;
+  onResumeRun?: (runId: string, input: string) => Promise<void>;
+  onDecideAction?: (actionId: string, approve: boolean) => Promise<void>;
 }
 
 export default function ChatPanel({
   messages,
   isLoading,
+  routedIntent,
   error,
   onDismissError,
   onSendMessage,
@@ -38,8 +52,14 @@ export default function ChatPanel({
   onRenameConversation,
   onArchiveConversation,
   onDeleteConversation,
+  activeRun,
+  pendingAction,
+  onCancelRun,
+  onResumeRun,
+  onDecideAction,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
+  const [resumeInput, setResumeInput] = useState("");
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -86,12 +106,17 @@ export default function ChatPanel({
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
       <div className="border-b border-zinc-200 px-4 py-3">
         <h2 className="text-sm font-semibold text-zinc-900">
-          Research QA Chat
+          Research Assistant
         </h2>
         <p className="text-xs text-zinc-500">
-          Grounded answers citing uploaded papers. Click any [n] chip to jump to
-          evidence.
+          Ask naturally to read, compare, verify, or question your research.
+          Click any [n] chip to jump to evidence.
         </p>
+        {routedIntent && (
+          <p className="mt-2 text-xs text-blue-700" role="status">
+            Using: {intentLabel(routedIntent)}
+          </p>
+        )}
       </div>
 
       {conversations &&
@@ -129,6 +154,94 @@ export default function ChatPanel({
         </div>
       )}
 
+      {activeRun && (
+        <section
+          className="border-b border-zinc-200 bg-zinc-50 px-4 py-3 text-xs text-zinc-700"
+          aria-label="Active research run"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="font-medium">
+                {activeRun.action_summary ||
+                  activeRun.intent ||
+                  "Research request"}
+              </p>
+              <p role="status">
+                {activeRun.status.replaceAll("_", " ")}
+                {activeRun.stage ? ` · ${activeRun.stage}` : ""}
+              </p>
+            </div>
+            {(activeRun.status === "QUEUED" ||
+              activeRun.status === "RUNNING") &&
+              onCancelRun && (
+                <button
+                  type="button"
+                  onClick={() => void onCancelRun(activeRun.id)}
+                  className="rounded border border-zinc-300 px-2 py-1 hover:bg-white"
+                >
+                  Cancel run
+                </button>
+              )}
+          </div>
+          {activeRun.status === "NEEDS_INPUT" && onResumeRun && (
+            <form
+              className="mt-3 flex gap-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (resumeInput.trim()) {
+                  void onResumeRun(activeRun.id, resumeInput.trim());
+                  setResumeInput("");
+                }
+              }}
+            >
+              <input
+                aria-label="Clarification"
+                value={resumeInput}
+                onChange={(event) => setResumeInput(event.target.value)}
+                placeholder="Answer the clarification…"
+                className="min-w-0 flex-1 rounded border border-zinc-300 px-2 py-1.5"
+              />
+              <button
+                type="submit"
+                disabled={!resumeInput.trim()}
+                className="rounded bg-zinc-900 px-3 py-1.5 text-white disabled:opacity-40"
+              >
+                Continue
+              </button>
+            </form>
+          )}
+          {activeRun.status === "AWAITING_APPROVAL" &&
+            pendingAction &&
+            onDecideAction && (
+              <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-3">
+                <p className="font-medium">
+                  Review proposed action:{" "}
+                  {pendingAction.action_type.replaceAll("_", " ")}
+                </p>
+                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[11px]">
+                  {JSON.stringify(pendingAction.arguments, null, 2)}
+                </pre>
+                <div className="mt-2 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void onDecideAction(pendingAction.id, true)}
+                    className="rounded bg-emerald-700 px-3 py-1.5 text-white"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onDecideAction(pendingAction.id, false)}
+                    className="rounded border border-zinc-300 px-3 py-1.5"
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            )}
+        </section>
+      )}
+
       {/* Messages Scroll Area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 ? (
@@ -164,7 +277,9 @@ export default function ChatPanel({
         {isLoading && (
           <div className="flex items-start">
             <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-2.5 text-sm text-zinc-600 animate-pulse">
-              Retrieving evidence & generating grounded answer…
+              {routedIntent
+                ? `${intentLabel(routedIntent)} in progress…`
+                : "Routing your research request…"}
             </div>
           </div>
         )}
@@ -198,4 +313,25 @@ export default function ChatPanel({
       </form>
     </div>
   );
+}
+
+function intentLabel(intent: AssistantIntent): string {
+  const labels: Record<AssistantIntent, string> = {
+    help: "Help",
+    qa: "Question answering",
+    read_paper: "Paper reading",
+    compare: "Paper comparison",
+    verify_claim: "Claim verification",
+    discover: "Paper discovery",
+    notes: "Research notes",
+    report: "Report drafting",
+    research: "Research workflow",
+    gap_analysis: "Gap analysis",
+    experiment_plan: "Experiment planning",
+    translate: "PDF translation",
+    vision: "Figure understanding",
+    graph: "Graph exploration",
+    clarify: "Clarification",
+  };
+  return labels[intent];
 }

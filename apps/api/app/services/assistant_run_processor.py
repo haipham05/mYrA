@@ -11,7 +11,9 @@ from app.crud.assistant_run import (
     RunLeaseLost,
     assert_assistant_run_lease,
     assistant_run_cancel_requested,
+    create_assistant_approval,
     finish_assistant_run,
+    get_valid_approved_assistant_action,
     save_assistant_step,
     start_assistant_step,
 )
@@ -28,6 +30,7 @@ from app.schemas.assistant import (
 )
 from app.services.assistant_router import AssistantRouter
 from app.services.assistant_tools import (
+    AssistantToolInput,
     ToolContext,
     ToolStatus,
     build_tool_registry,
@@ -35,7 +38,7 @@ from app.services.assistant_tools import (
     tool_requires_approval,
     validate_tool_input,
 )
-from app.services.chat_service import ChatService
+from app.services.chat_service import AssistantRunCancelled, ChatService
 
 logger = logging.getLogger("myra.assistant_run")
 
@@ -141,11 +144,53 @@ class AssistantRunProcessor:
                     )
                     return
 
-                if tool_requires_approval(definition, tool_input):
-                    self._finish_approval_wait(
-                        db, run_id, worker_id, attempt_count, decision, route_result
-                    )
-                    return
+                if definition.available and tool_requires_approval(definition, tool_input):
+                    approved_arguments = {
+                        "message": request.message,
+                        "scope": request.scope.value,
+                        "paper_ids": [
+                            str(item)
+                            for item in (decision.resolved_paper_ids or request.selected_paper_ids)
+                        ],
+                        "action_summary": decision.action_summary,
+                        "tool_arguments": tool_input.arguments.model_dump(mode="json"),
+                    }
+                    try:
+                        approved_action = get_valid_approved_assistant_action(
+                            db,
+                            run_id,
+                            action_type=decision.intent.value,
+                            expected_arguments=approved_arguments,
+                            paper_ids=decision.resolved_paper_ids or request.selected_paper_ids,
+                        )
+                    except ValueError:
+                        self._finish_failure(
+                            db,
+                            run_id,
+                            worker_id,
+                            attempt_count,
+                            code="APPROVAL_NO_LONGER_VALID",
+                            result_type="approval_invalidated",
+                            message=(
+                                "The approved action no longer matches the current request or "
+                                "source. Please review and submit it again."
+                            ),
+                            decision=decision,
+                            route_result=route_result,
+                        )
+                        return
+                    if approved_action is None:
+                        self._finish_approval_wait(
+                            db,
+                            run_id,
+                            worker_id,
+                            attempt_count,
+                            request,
+                            decision,
+                            route_result,
+                            tool_input,
+                        )
+                        return
 
                 tool_fingerprint = _fingerprint(
                     {"request_hash": request_hash, "decision": decision.model_dump(mode="json")}
@@ -228,13 +273,21 @@ class AssistantRunProcessor:
                                     db=db,
                                     chat_service=self._chat_service,
                                     assistant_run_id=run_id,
+                                    worker_id=worker_id,
+                                    attempt_count=attempt_count,
                                 ),
                                 tool_input,
                             )
                         except RunLeaseLost:
                             raise
+                        except AssistantRunCancelled:
+                            self._finish_cancelled(db, run_id, worker_id, attempt_count)
+                            return
                         except Exception:
                             tool_result = None
+                        if self._cancelled(db, run_id, worker_id, attempt_count):
+                            self._finish_cancelled(db, run_id, worker_id, attempt_count)
+                            return
                         if tool_result is None:
                             tool_result_payload = AssistantRunResult(
                                 result_type="tool_error",
@@ -302,12 +355,17 @@ class AssistantRunProcessor:
         worker_id: str,
         attempt_count: int,
     ) -> tuple[RouteDecision | None, dict[str, object], str | None]:
+        route_step_key = (
+            "assistant.route"
+            if run.resume_count == 0
+            else f"assistant.route.resume.{run.resume_count}"
+        )
         step, should_execute = start_assistant_step(
             db,
             run.id,
             worker_id=worker_id,
             attempt_count=attempt_count,
-            step_key="assistant.route",
+            step_key=route_step_key,
             ordinal=1,
             input_fingerprint=request_hash,
             tool_name="route",
@@ -369,7 +427,7 @@ class AssistantRunProcessor:
             run.id,
             worker_id=worker_id,
             attempt_count=attempt_count,
-            step_key="assistant.route",
+            step_key=route_step_key,
             ordinal=1,
             input_fingerprint=request_hash,
             output_payload=route_output,
@@ -430,13 +488,31 @@ class AssistantRunProcessor:
         run_id: UUID,
         worker_id: str,
         attempt: int,
+        request: AssistantRunRequest,
         decision: RouteDecision,
         route_result: dict[str, object],
+        tool_input: AssistantToolInput,
     ) -> None:
+        action = create_assistant_approval(
+            db,
+            run_id,
+            worker_id=worker_id,
+            attempt_count=attempt,
+            action_type=decision.intent.value,
+            arguments={
+                "message": request.message,
+                "scope": request.scope.value,
+                "paper_ids": [str(item) for item in decision.resolved_paper_ids],
+                "action_summary": decision.action_summary,
+                "tool_arguments": tool_input.arguments.model_dump(mode="json"),
+            },
+            paper_ids=decision.resolved_paper_ids or request.selected_paper_ids,
+        )
         result = AssistantRunResult(
             result_type="approval_required",
             display_text="This action needs your approval before it can run.",
             available_actions=["approve", "reject"],
+            structured_payload={"approval_action_id": str(action.id)},
         )
         self._finish(
             db,

@@ -5,10 +5,17 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session
 
-from app.db.models import AssistantRun, AssistantRunStep, Conversation, Paper
+from app.db.models import (
+    AssistantApprovalAction,
+    AssistantRun,
+    AssistantRunStep,
+    Conversation,
+    Paper,
+    Project,
+)
 from app.schemas.assistant import AssistantRunRequest
 
 
@@ -18,6 +25,9 @@ class IdempotencyConflict(ValueError):
 
 class RunLeaseLost(RuntimeError):
     """The caller no longer owns the current run attempt."""
+
+
+ASSISTANT_PUBLISH_STAGE = "assistant.publish"
 
 
 def _request_hash(request: AssistantRunRequest) -> tuple[str, dict[str, object]]:
@@ -113,6 +123,300 @@ def create_assistant_run(db: Session, request: AssistantRunRequest) -> tuple[Ass
 
 def get_assistant_run(db: Session, run_id: UUID) -> AssistantRun | None:
     return db.query(AssistantRun).filter(AssistantRun.id == run_id).first()
+
+
+def request_assistant_run_cancel(db: Session, run_id: UUID) -> AssistantRun | None:
+    run = get_assistant_run(db, run_id)
+    if run is None:
+        return None
+    if run.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        return run
+    now = datetime.now(UTC)
+    if run.status == "RUNNING":
+        db.execute(
+            update(AssistantRun)
+            .where(
+                AssistantRun.id == run_id,
+                AssistantRun.status == "RUNNING",
+                AssistantRun.cancel_requested.is_(False),
+                or_(
+                    AssistantRun.current_stage.is_(None),
+                    AssistantRun.current_stage != ASSISTANT_PUBLISH_STAGE,
+                ),
+            )
+            .values(cancel_requested=True, updated_at=now)
+        )
+        db.commit()
+        db.refresh(run)
+        return run
+    run.cancel_requested = True
+    run.updated_at = now
+    run.status = "CANCELLED"
+    run.finished_at = now
+    db.query(AssistantApprovalAction).filter(
+        AssistantApprovalAction.run_id == run_id,
+        AssistantApprovalAction.status == "PENDING",
+    ).update(
+        {AssistantApprovalAction.status: "CANCELLED", AssistantApprovalAction.decided_at: now},
+        synchronize_session=False,
+    )
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def begin_assistant_run_publication(
+    db: Session, run_id: UUID, *, worker_id: str, attempt_count: int
+) -> bool:
+    """Atomically win the cancellation race before persisting a QA assistant message."""
+    result = db.execute(
+        update(AssistantRun)
+        .where(
+            AssistantRun.id == run_id,
+            AssistantRun.status == "RUNNING",
+            AssistantRun.lease_owner == worker_id,
+            AssistantRun.attempt_count == attempt_count,
+            AssistantRun.cancel_requested.is_(False),
+        )
+        .values(current_stage=ASSISTANT_PUBLISH_STAGE, updated_at=datetime.now(UTC))
+    )
+    return result.rowcount == 1
+
+
+def resume_assistant_run(
+    db: Session, run_id: UUID, *, additional_input: str
+) -> AssistantRun | None:
+    run = get_assistant_run(db, run_id)
+    if run is None:
+        return None
+    if run.status != "NEEDS_INPUT":
+        raise ValueError("assistant_run_not_waiting_for_input")
+    clarification = additional_input.strip()
+    if not clarification or len(clarification) > 4000:
+        raise ValueError("assistant_resume_input_invalid")
+    payload = dict(run.request_payload)
+    previous_message = str(payload.get("message", ""))
+    combined_message = f"{previous_message}\n\nAdditional user input: {clarification}"
+    if len(combined_message) > 10_000:
+        raise ValueError("assistant_resume_input_too_long")
+    payload["message"] = combined_message
+    request = AssistantRunRequest.model_validate(payload)
+    request_hash, normalized_payload = _request_hash(request)
+    run.request_payload = normalized_payload
+    run.request_hash = request_hash
+    run.resume_count += 1
+    run.status = "QUEUED"
+    run.current_stage = None
+    run.result_payload = None
+    run.safe_error = None
+    run.cancel_requested = False
+    run.finished_at = None
+    run.updated_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def create_assistant_approval(
+    db: Session,
+    run_id: UUID,
+    *,
+    worker_id: str,
+    attempt_count: int,
+    action_type: str,
+    arguments: dict[str, object],
+    paper_ids: list[UUID],
+    expires_in_seconds: int = 1800,
+) -> AssistantApprovalAction:
+    """Persist an exact proposal against the current project/corpus/source identities."""
+    if expires_in_seconds <= 0 or expires_in_seconds > 86_400:
+        raise ValueError("assistant_approval_expiry_out_of_range")
+    run = assert_assistant_run_lease(db, run_id, worker_id=worker_id, attempt_count=attempt_count)
+    source_fingerprint = _approval_source_fingerprint(db, run.project_id, paper_ids)
+    if source_fingerprint is None:
+        raise ValueError("assistant_approval_source_missing")
+    action_payload = {"action_type": action_type, "arguments": arguments}
+    idempotency_key = hashlib.sha256(
+        json.dumps(
+            {"run_id": str(run_id), **action_payload, "source": source_fingerprint},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing = (
+        db.query(AssistantApprovalAction)
+        .filter(
+            AssistantApprovalAction.run_id == run_id,
+            AssistantApprovalAction.idempotency_key == idempotency_key,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+    action = AssistantApprovalAction(
+        run_id=run_id,
+        action_type=action_type,
+        arguments=action_payload["arguments"],
+        source_fingerprint=source_fingerprint,
+        idempotency_key=idempotency_key,
+        status="PENDING",
+        expires_at=datetime.now(UTC) + timedelta(seconds=expires_in_seconds),
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+def _approval_source_fingerprint(
+    db: Session, project_id: UUID, paper_ids: list[UUID]
+) -> str | None:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project is None:
+        return None
+    rows = []
+    if paper_ids:
+        papers = (
+            db.query(Paper)
+            .filter(Paper.project_id == project_id, Paper.id.in_(paper_ids))
+            .order_by(Paper.id.asc())
+            .all()
+        )
+        if len(papers) != len(set(paper_ids)):
+            return None
+        rows = [
+            {"paper_id": str(paper.id), "sha256": paper.document_sha256, "status": paper.status}
+            for paper in papers
+        ]
+    identity = {
+        "project_id": str(project.id),
+        "corpus_revision": project.corpus_revision,
+        "papers": rows,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def list_assistant_approvals(db: Session, run_id: UUID) -> list[AssistantApprovalAction]:
+    return (
+        db.query(AssistantApprovalAction)
+        .filter(AssistantApprovalAction.run_id == run_id)
+        .order_by(AssistantApprovalAction.created_at.asc(), AssistantApprovalAction.id.asc())
+        .all()
+    )
+
+
+def get_valid_approved_assistant_action(
+    db: Session,
+    run_id: UUID,
+    *,
+    action_type: str,
+    expected_arguments: dict[str, object],
+    paper_ids: list[UUID],
+) -> AssistantApprovalAction | None:
+    """Return the exact approved proposal, invalidating it if scope or sources changed."""
+    action = (
+        db.query(AssistantApprovalAction)
+        .filter(
+            AssistantApprovalAction.run_id == run_id,
+            AssistantApprovalAction.action_type == action_type,
+            AssistantApprovalAction.status == "APPROVED",
+        )
+        .order_by(AssistantApprovalAction.decided_at.desc(), AssistantApprovalAction.id.desc())
+        .first()
+    )
+    if action is None:
+        return None
+    run = db.query(AssistantRun).filter(AssistantRun.id == run_id).first()
+    expected_fingerprint = (
+        _approval_source_fingerprint(db, run.project_id, paper_ids) if run is not None else None
+    )
+    if (
+        action.arguments != expected_arguments
+        or expected_fingerprint is None
+        or expected_fingerprint != action.source_fingerprint
+    ):
+        action.status = "STALE"
+        action.decided_at = datetime.now(UTC)
+        db.commit()
+        raise ValueError("assistant_approval_no_longer_matches_current_request")
+    return action
+
+
+def decide_assistant_approval(
+    db: Session, action_id: UUID, *, approve: bool
+) -> AssistantApprovalAction | None:
+    """Approve the exact pending proposal only while its source fingerprint is current."""
+    action = (
+        db.query(AssistantApprovalAction)
+        .filter(AssistantApprovalAction.id == action_id)
+        .with_for_update()
+        .first()
+    )
+    if action is None:
+        return None
+    desired_status = "APPROVED" if approve else "REJECTED"
+    if action.status == desired_status:
+        return action
+    if action.status != "PENDING":
+        raise ValueError("assistant_approval_already_decided")
+    run = db.query(AssistantRun).filter(AssistantRun.id == action.run_id).first()
+    if run is None or run.status != "AWAITING_APPROVAL":
+        raise ValueError("assistant_run_not_awaiting_approval")
+
+    now = datetime.now(UTC)
+    expiry = action.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=UTC)
+    if expiry <= now:
+        action.status = "EXPIRED"
+        action.decided_at = now
+        run.status = "FAILED"
+        run.safe_error = "APPROVAL_EXPIRED"
+        run.finished_at = now
+        run.updated_at = now
+        db.commit()
+        db.refresh(action)
+        return action
+
+    if approve:
+        raw_paper_ids = action.arguments.get("paper_ids", [])
+        try:
+            paper_ids = [UUID(str(value)) for value in raw_paper_ids]
+        except (TypeError, ValueError):
+            paper_ids = []
+            source_fingerprint = None
+        else:
+            source_fingerprint = _approval_source_fingerprint(db, run.project_id, paper_ids)
+        if source_fingerprint != action.source_fingerprint:
+            action.status = "STALE"
+            action.decided_at = now
+            run.status = "FAILED"
+            run.safe_error = "APPROVAL_SOURCE_CHANGED"
+            run.finished_at = now
+            run.updated_at = now
+            db.commit()
+            db.refresh(action)
+            return action
+        run.status = "QUEUED"
+        run.current_stage = None
+        run.result_payload = None
+        run.safe_error = None
+        run.finished_at = None
+        run.cancel_requested = False
+        run.lease_owner = None
+        run.lease_expires_at = None
+    else:
+        run.status = "CANCELLED"
+        run.safe_error = "ACTION_REJECTED"
+        run.finished_at = now
+    action.status = desired_status
+    action.decided_at = now
+    run.updated_at = now
+    db.commit()
+    db.refresh(action)
+    return action
 
 
 def claim_next_assistant_run(
