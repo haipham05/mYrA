@@ -382,12 +382,16 @@ class Message(Base):
     conversation_id: Mapped[UUID] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    assistant_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("assistant_runs.id", ondelete="SET NULL"), nullable=True, unique=True, index=True
+    )
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     citations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     model_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_usage: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

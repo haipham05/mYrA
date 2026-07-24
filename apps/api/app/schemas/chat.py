@@ -67,4 +67,5 @@ class MessageResponse(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     model_name: str | None = None
     token_count: int | None = None
+    provider_usage: dict[str, int | None] | None = None
     created_at: datetime

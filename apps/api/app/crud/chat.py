@@ -103,6 +103,8 @@ def add_message(
     evidence: list[dict[str, Any]],
     model_name: str | None = None,
     token_count: int | None = None,
+    assistant_run_id: UUID | None = None,
+    provider_usage: dict[str, int | None] | None = None,
 ) -> Message:
     msg = Message(
         conversation_id=conversation_id,
@@ -112,13 +114,25 @@ def add_message(
         evidence=evidence,
         model_name=model_name,
         token_count=token_count,
+        assistant_run_id=assistant_run_id,
+        provider_usage=provider_usage,
     )
     db.add(msg)
     # Touch conversation updated_at
     conv = db.get(Conversation, conversation_id)
     if conv:
         conv.updated_at = datetime.now(UTC)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        if assistant_run_id is not None:
+            existing = (
+                db.query(Message).filter(Message.assistant_run_id == assistant_run_id).first()
+            )
+            if existing is not None:
+                return existing
+        raise
     db.refresh(msg)
     return msg
 

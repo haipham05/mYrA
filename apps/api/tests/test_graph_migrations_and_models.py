@@ -49,7 +49,7 @@ def test_migration_lifecycle_upgrade_downgrade():
 
         engine = create_engine(db_url)
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "o5d7f9a1b3c5"
+        assert current_rev == "r7f9b1d3e5a7"
         assert current_rev in heads
         check_schema_compatibility(engine)
 
@@ -158,7 +158,7 @@ def test_migration_lifecycle_upgrade_downgrade():
         # 4. Re-upgrade back to head
         command.upgrade(cfg, "head")
         current_rev, heads = get_schema_revisions(engine)
-        assert current_rev == "o5d7f9a1b3c5"
+        assert current_rev == "r7f9b1d3e5a7"
         check_schema_compatibility(engine)
 
 

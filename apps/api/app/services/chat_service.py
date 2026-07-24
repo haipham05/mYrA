@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -711,7 +712,29 @@ class ChatService:
         db: Session,
         conversation_id: UUID,
         question: str,
+        *,
+        assistant_run_id: UUID | None = None,
+        retrieval_question: str | None = None,
     ) -> MessageResponse:
+        if assistant_run_id is not None:
+            existing = (
+                db.query(Message).filter(Message.assistant_run_id == assistant_run_id).first()
+            )
+            if existing is not None:
+                return MessageResponse(
+                    id=existing.id,
+                    conversation_id=existing.conversation_id,
+                    role=MessageRole(existing.role),
+                    content=existing.content,
+                    citations=[Citation.model_validate(item) for item in existing.citations or []],
+                    evidence=[
+                        EvidenceItem.model_validate(item) for item in existing.evidence or []
+                    ],
+                    model_name=existing.model_name,
+                    token_count=existing.token_count,
+                    provider_usage=existing.provider_usage,
+                    created_at=existing.created_at,
+                )
         telemetry = get_telemetry()
         with telemetry.operation(
             "chat.answer",
@@ -719,7 +742,13 @@ class ChatService:
             metadata={"conversation_id": str(conversation_id)},
         ) as observation:
             return await self._answer_question(
-                db, conversation_id, question, telemetry, observation
+                db,
+                conversation_id,
+                question,
+                telemetry,
+                observation,
+                assistant_run_id,
+                retrieval_question,
             )
 
     async def _answer_question(
@@ -729,6 +758,8 @@ class ChatService:
         question: str,
         telemetry: TelemetryAdapter,
         observation: Observation | None,
+        assistant_run_id: UUID | None = None,
+        routed_retrieval_question: str | None = None,
     ) -> MessageResponse:
         start_time = time.perf_counter()
         conv = get_conversation(db, conversation_id)
@@ -773,6 +804,7 @@ class ChatService:
                 content=question,
                 citations=[],
                 evidence=[],
+                assistant_run_id=assistant_run_id,
             )
 
         history_msgs = _recent_conversation_messages(db, conversation_id, question)
@@ -820,6 +852,8 @@ class ChatService:
                 token_count=None,
                 created_at=clarification_message.created_at,
             )
+        if routed_retrieval_question and routed_retrieval_question.strip():
+            retrieval_question = routed_retrieval_question.strip()
         retrieval_question = retrieval_question or question
         intent = route_query_intent(retrieval_question)
         history_turns = [f"{msg.role}: {msg.content}" for msg in history_msgs]
@@ -831,7 +865,9 @@ class ChatService:
             from app.services.embedding import get_embedding_provider
 
             embed_provider = get_embedding_provider()
-            query_embedding = embed_provider.embed_query(retrieval_question)
+            query_embedding = await asyncio.to_thread(
+                embed_provider.embed_query, retrieval_question
+            )
         except Exception:
             # Retrieval retains its existing behavior and computes the vector itself
             # if a memory-specific embedding attempt is unavailable.
@@ -1279,6 +1315,17 @@ class ChatService:
             or getattr(llm, "model_name", None)
             or getattr(llm, "provider_name", "unknown")
         )
+        provider_usage = (
+            {
+                "prompt_tokens": generation.usage.prompt_tokens,
+                "completion_tokens": generation.usage.completion_tokens,
+                "total_tokens": generation.usage.total_tokens,
+                "prompt_cache_hit_tokens": generation.usage.prompt_cache_hit_tokens,
+                "prompt_cache_miss_tokens": generation.usage.prompt_cache_miss_tokens,
+            }
+            if generation.usage is not None
+            else None
+        )
         token_count_estimate = max(1, len(formatted_answer.split()))
         assistant_msg: Message = add_message(
             db=db,
@@ -1289,6 +1336,8 @@ class ChatService:
             evidence=[e.model_dump(mode="json") for e in evidence_items],
             model_name=model_name,
             token_count=token_count_estimate,
+            assistant_run_id=assistant_run_id,
+            provider_usage=provider_usage,
         )
 
         # 7. Post-turn memory capture (extract decisions/preferences from turns)
@@ -1334,6 +1383,7 @@ class ChatService:
             evidence=evidence_items,
             model_name=assistant_msg.model_name,
             token_count=assistant_msg.token_count,
+            provider_usage=assistant_msg.provider_usage,
             created_at=assistant_msg.created_at,
         )
 

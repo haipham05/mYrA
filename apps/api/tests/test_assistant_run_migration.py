@@ -39,6 +39,10 @@ def test_assistant_run_migration_is_additive_and_creates_durable_tables() -> Non
             "assistant_run_steps",
             "assistant_approval_actions",
         }.issubset(inspector.get_table_names())
+        assert "assistant_run_id" in {
+            column["name"] for column in inspector.get_columns("messages")
+        }
+        assert "provider_usage" in {column["name"] for column in inspector.get_columns("messages")}
         with engine.connect() as connection:
             assert (
                 connection.execute(

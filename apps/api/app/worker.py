@@ -7,6 +7,11 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from app.config import Settings
+from app.crud.assistant_run import (
+    claim_next_assistant_run,
+    release_assistant_run,
+    renew_assistant_run_lease,
+)
 from app.crud.graph import (
     claim_next_graph_event,
     release_graph_event,
@@ -17,6 +22,7 @@ from app.db.session import SessionLocal
 from app.logging import configure_logging
 from app.observability.context import OperationContext, use_operation_context
 from app.observability.telemetry import get_telemetry
+from app.services.assistant_run_processor import AssistantRunProcessor
 from app.services.graphrag.processor import GraphEventProcessor
 from app.services.ingestion import IngestionPipeline
 
@@ -86,6 +92,7 @@ async def run_worker(
     processor = GraphEventProcessor(settings=settings)
     running = True
     active_processing_task: asyncio.Task | None = None
+    assistant_lane_task: asyncio.Task | None = None
 
     def _sig_handler(sig, frame):
         nonlocal running
@@ -93,6 +100,8 @@ async def run_worker(
         running = False
         if active_processing_task and not active_processing_task.done():
             active_processing_task.cancel()
+        if assistant_lane_task and not assistant_lane_task.done():
+            assistant_lane_task.cancel()
 
     try:
         signal.signal(signal.SIGINT, _sig_handler)
@@ -127,6 +136,106 @@ async def run_worker(
                         return
             except Exception:
                 pass
+
+    async def _assistant_heartbeat(
+        run_id: UUID,
+        worker_id: str,
+        attempt_count: int,
+        processing_task: asyncio.Task,
+        interval: float = 60.0,
+    ) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                with SessionLocal() as h_db:
+                    renewed = renew_assistant_run_lease(
+                        h_db,
+                        run_id,
+                        worker_id=worker_id,
+                        attempt_count=attempt_count,
+                    )
+                if not renewed:
+                    logger.warning("assistant_run_lease_lost", extra={"run_id": str(run_id)})
+                    processing_task.cancel()
+                    return
+            except Exception:
+                logger.warning("assistant_run_heartbeat_failed", extra={"run_id": str(run_id)})
+
+    async def _assistant_worker_lane() -> None:
+        assistant_worker_id = f"{worker_id}-assistant"
+        run_processor = AssistantRunProcessor(session_factory=SessionLocal)
+        while running:
+            claimed_id = None
+            attempt_count = None
+            try:
+                with SessionLocal() as assistant_db:
+                    run = claim_next_assistant_run(assistant_db, worker_id=assistant_worker_id)
+                    if run is not None:
+                        claimed_id = run.id
+                        attempt_count = run.attempt_count
+                if claimed_id is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                logger.info("assistant_run_claimed", extra={"run_id": str(claimed_id)})
+                processing_task = asyncio.create_task(
+                    run_processor.process(
+                        claimed_id,
+                        worker_id=assistant_worker_id,
+                        attempt_count=attempt_count,
+                    )
+                )
+                heartbeat_task = asyncio.create_task(
+                    _assistant_heartbeat(
+                        claimed_id,
+                        assistant_worker_id,
+                        attempt_count,
+                        processing_task,
+                        heartbeat_interval,
+                    )
+                )
+                try:
+                    await processing_task
+                except asyncio.CancelledError:
+                    if not running:
+                        raise
+                except Exception as exc:
+                    # Keep raw exception text/tracebacks out of routine worker logs.
+                    logger.error(
+                        "assistant_run_processing_failed",
+                        extra={
+                            "run_id": str(claimed_id),
+                            "error_type": type(exc).__name__[:80],
+                        },
+                    )
+                finally:
+                    if not processing_task.done():
+                        processing_task.cancel()
+                        try:
+                            await processing_task
+                        except asyncio.CancelledError:
+                            pass
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                    if not running:
+                        with SessionLocal() as release_db:
+                            release_assistant_run(
+                                release_db,
+                                claimed_id,
+                                worker_id=assistant_worker_id,
+                                attempt_count=attempt_count,
+                            )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error(
+                    "assistant_worker_lane_failed",
+                    extra={"error_type": type(exc).__name__[:80]},
+                )
+                await asyncio.sleep(poll_interval)
 
     async def _process_job_with_context(db, job):
         context = OperationContext.validated(
@@ -193,6 +302,7 @@ async def run_worker(
                 if observation is not None:
                     observation.update(metadata={"outcome": outcome})
 
+    assistant_lane_task = asyncio.create_task(_assistant_worker_lane())
     while running:
         db = SessionLocal()
         try:
@@ -318,6 +428,13 @@ async def run_worker(
         if once:
             break
         await asyncio.sleep(poll_interval)
+
+    if assistant_lane_task is not None and not assistant_lane_task.done():
+        assistant_lane_task.cancel()
+        try:
+            await assistant_lane_task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:
