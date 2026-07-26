@@ -2,12 +2,13 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import type { Citation, Paper } from "@/types";
+import type { Citation, Paper, SourceSelection } from "@/types";
 
 interface PdfViewerProps {
   paper: Paper | null;
   activeCitation: Citation | null;
   apiUrl: string;
+  onExplainSelection?: (selection: SourceSelection | null) => void;
 }
 
 export interface HighlightRect {
@@ -132,6 +133,7 @@ export default function PdfViewer({
   paper,
   activeCitation,
   apiUrl,
+  onExplainSelection,
 }: PdfViewerProps) {
   const [userPage, setUserPage] = useState<number | null>(null);
   const [scale, setScale] = useState<number>(1.2);
@@ -173,6 +175,30 @@ export default function PdfViewer({
   const paperId = paper?.id;
   const paperHash = paper?.document_sha256;
   const renderKey = `${paperId ?? "none"}:${currentPage}:${scale}:${rotation}`;
+
+  const captureTextSelection = useCallback(() => {
+    const selection = window.getSelection();
+    const selectedText = selection?.toString().trim() ?? "";
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (
+      !paperId ||
+      !paperHash ||
+      !range ||
+      !textLayerRef.current?.contains(range.commonAncestorContainer)
+    ) {
+      return;
+    }
+    onExplainSelection?.(
+      selectedText.length > 0 && selectedText.length <= 2000
+        ? {
+            paper_id: paperId,
+            page_number: currentPage,
+            quote: selectedText,
+            document_sha256: paperHash,
+          }
+        : null,
+    );
+  }, [currentPage, onExplainSelection, paperHash, paperId]);
 
   // Handle PDF document rendering with PDF.js
   useEffect(() => {
@@ -570,6 +596,8 @@ export default function PdfViewer({
           <div
             ref={textLayerRef}
             data-testid="pdf-text-layer"
+            onMouseUp={captureTextSelection}
+            onKeyUp={captureTextSelection}
             className="textLayer absolute inset-0 select-text overflow-hidden opacity-0 pointer-events-auto"
           />
 

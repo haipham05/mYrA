@@ -2,9 +2,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
-from app.db.models import Paper, PaperElement, PaperPage, Project
+from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage, Project
 from app.schemas.evidence import AnchorStatus
-from app.services.source_resolution import resolve_exact_source_anchor
+from app.services.source_resolution import (
+    build_selected_passage_evidence,
+    resolve_exact_source_anchor,
+)
 
 
 def _source_rows(db: Session, *, page_text: str = "Alpha evidence. Beta evidence."):
@@ -192,6 +195,52 @@ def test_resolver_does_not_invent_version_for_legacy_elements(tmp_path):
 
         assert anchor is not None
         assert anchor.parser_version is None
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+
+
+def test_selected_passage_evidence_uses_verified_quote_and_linked_chunk(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'selected-evidence.db'}")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project, paper = _source_rows(db)
+        paper.title = "A source paper"
+        element = db.query(PaperElement).filter_by(paper_id=paper.id).one()
+        chunk = PaperChunk(
+            paper_id=paper.id,
+            chunk_type="child",
+            chunk_index=0,
+            text=element.text,
+        )
+        db.add(chunk)
+        db.flush()
+        db.add(ChunkElement(chunk_id=chunk.id, element_id=element.id, order_index=0))
+        db.commit()
+
+        anchor = resolve_exact_source_anchor(
+            db,
+            project_id=project.id,
+            paper_id=paper.id,
+            page_number=1,
+            exact_quote="Beta evidence.",
+            document_sha256=paper.document_sha256,
+        )
+        assert anchor is not None
+        evidence = build_selected_passage_evidence(
+            db,
+            project_id=project.id,
+            paper_id=paper.id,
+            anchor=anchor,
+        )
+
+        assert evidence is not None
+        assert evidence.quote == anchor.exact_quote
+        assert evidence.chunk_id == chunk.id
+        assert evidence.paper_title == "A source paper"
+        assert evidence.anchors == [anchor]
+        assert "Alpha evidence. Beta evidence." == evidence.parent_context
     finally:
         db.close()
         Base.metadata.drop_all(engine)

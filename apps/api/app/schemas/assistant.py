@@ -38,6 +38,20 @@ class RunStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class SourceSelection(BaseModel):
+    paper_id: UUID
+    page_number: int = Field(ge=1)
+    quote: str = Field(min_length=1, max_length=2000)
+    document_sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+
+    @field_validator("quote")
+    @classmethod
+    def quote_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("selected passage must not be blank")
+        return value
+
+
 class AssistantRunRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
     conversation_id: UUID
@@ -46,6 +60,7 @@ class AssistantRunRequest(BaseModel):
     selected_paper_ids: list[UUID] = Field(default_factory=list, max_length=6)
     intent_override: AssistantIntent | None = None
     parent_run_id: UUID | None = None
+    source_selection: SourceSelection | None = None
     idempotency_key: str = Field(min_length=8, max_length=128)
 
     @field_validator("message")
@@ -77,6 +92,11 @@ class AssistantRunRequest(BaseModel):
             raise ValueError("paper scope requires exactly one selected paper")
         if self.scope is PaperScope.SELECTION and not self.selected_paper_ids:
             raise ValueError("selection scope requires at least one selected paper")
+        if self.source_selection is not None and (
+            self.scope is not PaperScope.PAPER
+            or self.selected_paper_ids != [self.source_selection.paper_id]
+        ):
+            raise ValueError("selected passage requires its single paper as the run scope")
         return self
 
 

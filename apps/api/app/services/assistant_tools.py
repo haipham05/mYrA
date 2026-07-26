@@ -14,9 +14,18 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from app.observability.telemetry import get_telemetry
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
 from app.schemas.evidence import Citation
 from app.services.chat_service import ChatService
+from app.services.reading_brief import (
+    READING_BRIEF_GUIDANCE,
+    parse_reading_brief_sections,
+)
+from app.services.source_resolution import (
+    build_selected_passage_evidence,
+    resolve_exact_source_anchor,
+)
 
 
 class ToolStatus(StrEnum):
@@ -162,25 +171,130 @@ async def _clarify(_context: ToolContext, tool_input: AssistantToolInput) -> Ass
 
 
 async def _qa(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    source_selection = tool_input.request.source_selection
     resolved_paper_ids = tool_input.decision.resolved_paper_ids
     requested_paper_ids = resolved_paper_ids or tool_input.request.selected_paper_ids or []
     requested_scope = "selection" if resolved_paper_ids else tool_input.request.scope
+    retrieval_question = tool_input.decision.standalone_question
+    response_guidance = None
+    if source_selection is not None:
+        requested_paper_ids = [source_selection.paper_id]
+        requested_scope = "selection"
+        retrieval_question = (
+            f"{tool_input.request.message}\nSelected passage: {source_selection.quote}"
+        )
+        response_guidance = (
+            "Explain the user's selected passage using only the supplied source evidence. "
+            "Separate what the paper states from your explanation, preserve equations and "
+            "technical meaning, and define symbols only when the surrounding source supports "
+            "the definition. Say when evidence is insufficient and cite factual claims."
+        )
+        with get_telemetry().stage(
+            "reading.explain_passage",
+            input={"question": tool_input.request.message, "selected_text": source_selection.quote},
+            metadata={
+                "paper_id": str(source_selection.paper_id),
+                "page_number": source_selection.page_number,
+                "document_sha256": source_selection.document_sha256,
+                "cache": "none",
+            },
+        ) as observation:
+            anchor = resolve_exact_source_anchor(
+                context.db,
+                project_id=tool_input.request.project_id,
+                paper_id=source_selection.paper_id,
+                page_number=source_selection.page_number,
+                exact_quote=source_selection.quote,
+                document_sha256=source_selection.document_sha256,
+            )
+            if anchor is None:
+                if observation is not None:
+                    observation.update(metadata={"outcome": "source_not_verified"})
+                return AssistantToolResult(
+                    status=ToolStatus.NEEDS_INPUT,
+                    result_type="source_selection_unavailable",
+                    display_text=(
+                        "I couldn't verify that exact passage in the current paper. "
+                        "Select a shorter or unique passage and try again."
+                    ),
+                )
+            selected_evidence = build_selected_passage_evidence(
+                context.db,
+                project_id=tool_input.request.project_id,
+                paper_id=source_selection.paper_id,
+                anchor=anchor,
+            )
+            if selected_evidence is None:
+                if observation is not None:
+                    observation.update(metadata={"outcome": "indexed_source_unavailable"})
+                return AssistantToolResult(
+                    status=ToolStatus.NEEDS_INPUT,
+                    result_type="source_selection_unavailable",
+                    display_text=(
+                        "I verified the passage in the PDF, but it isn't connected to the "
+                        "current indexed evidence. Reprocess the paper before asking about it."
+                    ),
+                )
+            if observation is not None:
+                observation.update(
+                    output={
+                        "outcome": "source_verified",
+                        "page_number": anchor.page_number,
+                        "source_char_start": anchor.source_char_start,
+                        "source_char_end": anchor.source_char_end,
+                    }
+                )
     response = await context.chat_service.answer_question(
         context.db,
         tool_input.request.conversation_id,
         tool_input.request.message,
         assistant_run_id=context.assistant_run_id,
-        retrieval_question=tool_input.decision.standalone_question,
+        retrieval_question=retrieval_question,
         paper_scope=requested_scope,
         selected_paper_ids=requested_paper_ids,
         run_worker_id=context.worker_id,
         run_attempt_count=context.attempt_count,
+        response_guidance=response_guidance,
+        additional_evidence=[selected_evidence] if source_selection is not None else None,
     )
     return AssistantToolResult(
         status=ToolStatus.SUCCEEDED,
         result_type="answer",
         display_text=response.content,
         structured_payload={"message_id": str(response.id), "model_name": response.model_name},
+        citations=response.citations,
+        evidence=[item.model_dump(mode="json") for item in response.evidence],
+        usage=response.provider_usage,
+    )
+
+
+async def _read_paper(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    retrieval_question = (
+        "What research question, contributions, method, assumptions, evaluation setup, results, "
+        "and limitations does this paper report?"
+    )
+    response = await context.chat_service.answer_question(
+        context.db,
+        tool_input.request.conversation_id,
+        tool_input.request.message,
+        assistant_run_id=context.assistant_run_id,
+        retrieval_question=retrieval_question,
+        paper_scope="selection",
+        selected_paper_ids=paper_ids,
+        run_worker_id=context.worker_id,
+        run_attempt_count=context.attempt_count,
+        response_guidance=READING_BRIEF_GUIDANCE,
+    )
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="reading_brief",
+        display_text=response.content,
+        structured_payload={
+            "message_id": str(response.id),
+            "model_name": response.model_name,
+            "sections": parse_reading_brief_sections(response.content),
+        },
         citations=response.citations,
         evidence=[item.model_dump(mode="json") for item in response.evidence],
         usage=response.provider_usage,
@@ -197,6 +311,7 @@ def build_tool_registry() -> Mapping[AssistantIntent, ToolDefinition]:
         *,
         approval: bool = False,
         min_papers: int = 0,
+        max_papers: int = 6,
         available: bool = False,
     ) -> None:
         definitions[intent] = ToolDefinition(
@@ -207,13 +322,21 @@ def build_tool_registry() -> Mapping[AssistantIntent, ToolDefinition]:
             handler=handler,
             requires_approval=approval,
             min_papers=min_papers,
+            max_papers=max_papers,
             available=available,
         )
 
     register(AssistantIntent.HELP, EmptyArguments, _help, available=True)
     register(AssistantIntent.QA, EmptyArguments, _qa, available=True)
     register(AssistantIntent.CLARIFY, EmptyArguments, _clarify, available=True)
-    register(AssistantIntent.READ_PAPER, ReadPaperArguments)
+    register(
+        AssistantIntent.READ_PAPER,
+        ReadPaperArguments,
+        _read_paper,
+        min_papers=1,
+        max_papers=1,
+        available=True,
+    )
     register(AssistantIntent.COMPARE, CompareArguments, min_papers=2)
     register(AssistantIntent.VERIFY_CLAIM, VerifyClaimArguments, min_papers=1)
     register(AssistantIntent.DISCOVER, DiscoverArguments)

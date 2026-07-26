@@ -95,6 +95,13 @@ export interface Citation {
   anchors?: CitationAnchor[];
 }
 
+export interface SourceSelection {
+  paper_id: string;
+  page_number: number;
+  quote: string;
+  document_sha256: string;
+}
+
 export interface EvidenceItem {
   id: string;
   paper_id: string;

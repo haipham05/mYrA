@@ -28,6 +28,27 @@ def _request(**overrides: object) -> AssistantRunRequest:
     )
 
 
+def _selected_passage_request(**overrides: object) -> AssistantRunRequest:
+    paper_id = uuid4()
+    return AssistantRunRequest.model_validate(
+        {
+            "message": "Explain this passage",
+            "conversation_id": uuid4(),
+            "project_id": uuid4(),
+            "scope": "paper",
+            "selected_paper_ids": [paper_id],
+            "source_selection": {
+                "paper_id": paper_id,
+                "page_number": 1,
+                "quote": "A verified scientific passage.",
+                "document_sha256": "a" * 64,
+            },
+            "idempotency_key": "selected-passage-123",
+            **overrides,
+        }
+    )
+
+
 class _StubProvider:
     def __init__(self, response: str) -> None:
         self.response = response
@@ -165,6 +186,35 @@ async def test_explicit_intent_override_skips_paid_routing_call() -> None:
     assert result.outcome is RouteOutcome.ROUTED
     assert result.decision.intent is AssistantIntent.COMPARE
     assert result.decision.resolved_paper_ids == request.selected_paper_ids
+
+
+@pytest.mark.anyio
+async def test_selected_passage_routes_to_qa_without_provider_call() -> None:
+    class MustNotCall:
+        async def generate(self, **kwargs: object) -> str:
+            raise AssertionError("selected passage must not call the router model")
+
+    request = _selected_passage_request()
+    result = await AssistantRouter(provider=MustNotCall()).route(request)
+
+    assert result.outcome is RouteOutcome.ROUTED
+    assert result.decision.intent is AssistantIntent.QA
+    assert result.decision.resolved_paper_ids == [request.source_selection.paper_id]
+    assert result.decision.standalone_question == request.message
+
+
+@pytest.mark.anyio
+async def test_selected_passage_rejects_conflicting_explicit_action() -> None:
+    class MustNotCall:
+        async def generate(self, **kwargs: object) -> str:
+            raise AssertionError("conflicting selected passage must not call the model")
+
+    result = await AssistantRouter(provider=MustNotCall()).route(
+        _selected_passage_request(intent_override="compare")
+    )
+
+    assert result.outcome is RouteOutcome.NEEDS_CLARIFICATION
+    assert result.decision.intent is AssistantIntent.CLARIFY
 
 
 @pytest.mark.anyio

@@ -133,9 +133,19 @@ async function routeOnlyToIsolatedApi(page: Page): Promise<void> {
       return;
     }
     if (url.pathname === "/health" || url.pathname.startsWith("/api/v1/")) {
-      const response = await route.fetch({
+      const options: Parameters<typeof route.fetch>[0] = {
         url: `${apiOrigin}${url.pathname}${url.search}`,
-      });
+      };
+      if (
+        url.pathname.endsWith("/runs") &&
+        route.request().method() === "POST"
+      ) {
+        options.postData = {
+          ...route.request().postDataJSON(),
+          intent_override: "qa",
+        };
+      }
+      const response = await route.fetch(options);
       await route.fulfill({ response });
       return;
     }
@@ -216,9 +226,39 @@ async function assertHighlightMatchesQuote(
   }
 }
 
+interface AssistantRunPoll {
+  status: string;
+  safe_error?: string | null;
+  result?: {
+    display_text: string;
+    citations: Array<{ quote: string; paper_id: string; page_number: number }>;
+  } | null;
+}
+
+async function waitForAssistantRun(
+  request: APIRequestContext,
+  runId: string,
+): Promise<AssistantRunPoll> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await request.get(`${apiOrigin}/api/v1/runs/${runId}`);
+    const run = await response.json();
+    if (run.status === "SUCCEEDED") return run;
+    if (["FAILED", "CANCELLED"].includes(run.status)) {
+      throw new Error(
+        `Assistant run ended as ${run.status}: ${run.safe_error}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(
+    "Assistant run did not finish within the isolated test window",
+  );
+}
+
 test.describe("isolated citation browser regression", () => {
   let sharedProjectId: string;
   let sharedCitationQuote: string;
+  let sharedAnswerText: string;
 
   test.beforeAll(async ({ request }) => {
     try {
@@ -293,22 +333,42 @@ test.describe("isolated citation browser regression", () => {
       .getByRole("button", { name: /devlin2018_bert\.pdf/ })
       .click({ timeout: 10000 });
 
-    const answerResponse = page.waitForResponse(
+    const runResponse = page.waitForResponse(
       (response) =>
-        response.url().includes("/messages") &&
+        response.url().includes("/conversations/") &&
+        response.url().endsWith("/runs") &&
         response.request().method() === "POST",
     );
     await page
       .getByPlaceholder(/Ask a grounded research question/i)
       .fill("What score did BERT obtain on the GLUE benchmark?");
     await page.keyboard.press("Enter");
-    const answer = await (await answerResponse).json();
+    const submittedRun = await (await runResponse).json();
+    const completedRun = await waitForAssistantRun(request, submittedRun.id);
+    const answer = completedRun.result;
+    if (!answer) {
+      throw new Error(
+        `Run succeeded without a parsed result: ${JSON.stringify(completedRun)}`,
+      );
+    }
     expect(answer.citations).toHaveLength(1);
     const citation = answer.citations[0];
     sharedCitationQuote = citation.quote;
+    sharedAnswerText = answer.display_text;
     expect(citation.paper_id).toBe(upload.paper_id);
     expect(citation.page_number).toBe(5);
     expect(citation.quote).toContain("overall score of 80.5%");
+    const persistedMessages = await request.get(
+      `${apiOrigin}/api/v1/conversations/${submittedRun.conversation_id}/messages`,
+    );
+    const messageList = (await persistedMessages.json()) as Array<{
+      role: string;
+      content: string;
+    }>;
+    expect(
+      messageList.find((message) => message.role === "ASSISTANT")?.content,
+      `Persisted messages: ${JSON.stringify(messageList)}`,
+    ).toBe(sharedAnswerText);
 
     await page.getByRole("button", { name: "[1]" }).click();
     await expect(page.getByText(/Page 5 of/)).toBeVisible();
@@ -341,7 +401,7 @@ test.describe("isolated citation browser regression", () => {
     await expect(highlights.first()).toBeVisible();
     await assertHighlightMatchesQuote(page, citation.quote);
 
-    await page.getByRole("button", { name: "Previous" }).click();
+    await page.getByRole("button", { name: "Previous" }).last().click();
     await expect(page.getByText(/Page 4 of/)).toBeVisible();
     await expect(highlights).toHaveCount(0);
   });
@@ -365,7 +425,9 @@ test.describe("isolated citation browser regression", () => {
     await expect(
       page.getByText("What score did BERT obtain on the GLUE benchmark?"),
     ).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText(/overall score of 80.5%/)).toBeVisible();
+    await expect(
+      page.getByText(sharedAnswerText, { exact: true }),
+    ).toBeVisible();
 
     const initialConvId = await page
       .locator("#conversation-select")
@@ -382,7 +444,7 @@ test.describe("isolated citation browser regression", () => {
     await page.getByRole("button", { name: "Rename conversation" }).click();
     const titleInput = page.getByPlaceholder("Chat title");
     await titleInput.fill("BERT GLUE Discussion");
-    await page.getByRole("button", { name: "Save" }).click();
+    await page.getByRole("button", { name: "Save", exact: true }).click();
     await expect(page.locator("#conversation-select")).toContainText(
       "BERT GLUE Discussion",
     );
@@ -400,7 +462,9 @@ test.describe("isolated citation browser regression", () => {
     await expect(
       page.getByText("What score did BERT obtain on the GLUE benchmark?"),
     ).toBeVisible();
-    await expect(page.getByText(/overall score of 80.5%/)).toBeVisible();
+    await expect(
+      page.getByText(sharedAnswerText, { exact: true }),
+    ).toBeVisible();
 
     // 7. Verify citation chip still highlights after page reload
     await page.getByRole("button", { name: "[1]" }).click();
@@ -430,7 +494,9 @@ test.describe("isolated citation browser regression", () => {
     await expect(
       page.getByText("What score did BERT obtain on the GLUE benchmark?"),
     ).toBeVisible();
-    await expect(page.getByText(/overall score of 80.5%/)).toBeVisible();
+    await expect(
+      page.getByText(sharedAnswerText, { exact: true }),
+    ).toBeVisible();
 
     // 10. Switch back to new conversation and delete it
     await page.locator("#conversation-select").selectOption(newConvId);

@@ -725,6 +725,8 @@ class ChatService:
         selected_paper_ids: list[UUID] | None = None,
         run_worker_id: str | None = None,
         run_attempt_count: int | None = None,
+        response_guidance: str | None = None,
+        additional_evidence: list[EvidenceItem] | None = None,
     ) -> MessageResponse:
         if assistant_run_id is not None:
             existing = (
@@ -763,6 +765,8 @@ class ChatService:
                 selected_paper_ids,
                 run_worker_id,
                 run_attempt_count,
+                response_guidance,
+                additional_evidence,
             )
 
     async def _answer_question(
@@ -778,6 +782,8 @@ class ChatService:
         requested_paper_ids: list[UUID] | None = None,
         run_worker_id: str | None = None,
         run_attempt_count: int | None = None,
+        response_guidance: str | None = None,
+        additional_evidence: list[EvidenceItem] | None = None,
     ) -> MessageResponse:
         start_time = time.perf_counter()
         conv = get_conversation(db, conversation_id)
@@ -830,7 +836,6 @@ class ChatService:
                 content=question,
                 citations=[],
                 evidence=[],
-                assistant_run_id=assistant_run_id,
             )
 
         history_msgs = _recent_conversation_messages(db, conversation_id, question)
@@ -956,7 +961,9 @@ class ChatService:
         for g_item in graph_evidence_items:
             supplementary_evidence.append(g_item)
 
-        evidence_items = assemble_evidence_items(evidence_items + supplementary_evidence)
+        evidence_items = assemble_evidence_items(
+            (additional_evidence or []) + evidence_items + supplementary_evidence
+        )
 
         evidence_map: dict[str, EvidenceItem] = {e.id: e for e in evidence_items}
         memory_block = format_memories_for_prompt(
@@ -992,6 +999,7 @@ class ChatService:
             memory_block=memory_block,
             history_block=history_block,
             resolved_question=retrieval_question,
+            response_guidance=response_guidance,
         )
 
         # 4. Generate answer with LLM

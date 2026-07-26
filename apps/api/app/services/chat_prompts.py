@@ -55,6 +55,7 @@ def build_chat_user_prompt(
     memory_block: str = "",
     history_block: str = "",
     resolved_question: str | None = None,
+    response_guidance: str | None = None,
 ) -> str:
     parts: list[str] = []
     if memory_block:
@@ -65,4 +66,6 @@ def build_chat_user_prompt(
     parts.append(f"QUESTION:\n{question}")
     if resolved_question and resolved_question != question:
         parts.append(f"RESOLVED RETRIEVAL QUESTION:\n{resolved_question}")
+    if response_guidance:
+        parts.append(f"RESPONSE FORMAT:\n{response_guidance}")
     return "\n\n".join(parts)

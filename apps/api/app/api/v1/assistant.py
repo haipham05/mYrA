@@ -31,7 +31,13 @@ def _run_response(run: AssistantRun) -> AssistantRunResponse:
     result = None
     if run.result_payload is not None:
         try:
-            result = AssistantRunResult.model_validate(run.result_payload)
+            payload = dict(run.result_payload)
+            # Tool payloads also persist their execution status; public run results
+            # use a compact schema and represent unknown usage as an empty object.
+            payload.pop("status", None)
+            if payload.get("usage") is None:
+                payload["usage"] = {}
+            result = AssistantRunResult.model_validate(payload)
         except ValueError:
             # Persisted JSON is internal state, but malformed content must not break polling.
             result = None

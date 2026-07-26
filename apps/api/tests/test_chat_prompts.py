@@ -49,3 +49,14 @@ def test_user_prompt_includes_only_relevant_supplied_sections():
     assert "EVIDENCE:\n[E1] evidence" in prompt
     assert "PROJECT MEMORY:\nSaved preference" in prompt
     assert "CONVERSATION HISTORY" not in prompt
+
+
+def test_user_prompt_keeps_task_specific_response_format_separate():
+    prompt = build_chat_user_prompt(
+        question="Help me understand this paper.",
+        evidence_block="[E1] source text",
+        response_guidance="Use a cited reading brief format.",
+    )
+
+    assert "QUESTION:\nHelp me understand this paper." in prompt
+    assert "RESPONSE FORMAT:\nUse a cited reading brief format." in prompt

@@ -85,6 +85,34 @@ def test_submit_poll_cancel_and_resume_assistant_run(assistant_api_context):
     assert resumed.json()["status"] == "QUEUED"
 
 
+def test_successful_run_poll_returns_tool_result_with_unknown_usage(assistant_api_context):
+    client, session, project, conversation, paper = assistant_api_context
+    submitted = client.post(
+        f"/api/v1/conversations/{conversation.id}/runs",
+        json=_request_body(project, conversation, paper),
+    )
+    run = session.get(AssistantRun, UUID(submitted.json()["id"]))
+    assert run is not None
+    run.status = "SUCCEEDED"
+    run.result_payload = {
+        "status": "SUCCEEDED",
+        "result_type": "answer",
+        "display_text": "Grounded answer.",
+        "structured_payload": {"model_name": "test-model"},
+        "citations": [],
+        "evidence": [],
+        "warnings": [],
+        "usage": None,
+    }
+    session.commit()
+
+    result = client.get(f"/api/v1/runs/{run.id}")
+
+    assert result.status_code == 200
+    assert result.json()["result"]["display_text"] == "Grounded answer."
+    assert result.json()["result"]["usage"] == {}
+
+
 def test_run_submit_rejects_path_mismatch_and_idempotency_conflict(assistant_api_context):
     client, _, project, conversation, paper = assistant_api_context
     body = _request_body(project, conversation, paper)

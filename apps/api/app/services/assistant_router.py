@@ -99,6 +99,30 @@ class AssistantRouter:
         known_ids = {paper.id for paper in paper_context}
         allowed_ids = set(selected_ids) if request.scope.value != "project" else known_ids
 
+        # A source selection is already an explicit, verified QA request. Avoid
+        # spending a routing call or letting the model send it to another tool.
+        if request.source_selection is not None:
+            if request.intent_override not in (None, AssistantIntent.QA):
+                decision = RouteDecision(
+                    intent=AssistantIntent.CLARIFY,
+                    missing_information=["conflicting_action_and_source_selection"],
+                    clarification=(
+                        "A selected-passage request can only use the question-answering action. "
+                        "Clear the passage selection or choose QA."
+                    ),
+                    action_summary="Clarify the selected-passage action",
+                )
+                return AssistantRouteResult(
+                    outcome=RouteOutcome.NEEDS_CLARIFICATION, decision=decision
+                )
+            decision = RouteDecision(
+                intent=AssistantIntent.QA,
+                resolved_paper_ids=[request.source_selection.paper_id],
+                standalone_question=request.message,
+                action_summary="Explain the selected passage",
+            )
+            return AssistantRouteResult(outcome=RouteOutcome.ROUTED, decision=decision)
+
         # An explicit user action is authoritative and requires no paid routing call.
         if request.intent_override is not None:
             decision = RouteDecision(

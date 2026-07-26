@@ -56,6 +56,37 @@ describe("ChatPanel", () => {
     expect(screen.getByRole("button", { name: "[1]" })).toBeInTheDocument();
   });
 
+  it("renders tables and math, keeps citations interactive, and ignores raw HTML", () => {
+    const onCitationClick = vi.fn();
+    const message: Message = {
+      id: "markdown-answer",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content:
+        "**Supported result** [1]\n\n| Metric | Value |\n| --- | ---: |\n| Accuracy | 92% |\n\nInline $x^2$ and display:\n\n$$y = mx + b$$\n\n<script>alert('unsafe')</script>",
+      citations: [mockCitation],
+      evidence: [],
+      created_at: new Date().toISOString(),
+    };
+    const { container } = render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText("Supported result").tagName).toBe("STRONG");
+    expect(container.querySelector("table")).toBeInTheDocument();
+    expect(container.querySelectorAll(".katex").length).toBeGreaterThan(0);
+    expect(container.querySelector("script")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "[1]" }));
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
   it("calls onCitationClick when citation chip is clicked", () => {
     const onCitationClick = vi.fn();
     render(
@@ -94,6 +125,33 @@ describe("ChatPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(onSendMessage).toHaveBeenCalledWith("How many layers?");
+  });
+
+  it("shows the selected passage scope and lets the user clear it", () => {
+    const onClearSourceSelection = vi.fn();
+    render(
+      <ChatPanel
+        messages={[]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+        sourceSelection={{
+          paper_id: "paper-123",
+          page_number: 4,
+          quote: "A selected passage.",
+          document_sha256: "aa".repeat(32),
+        }}
+        onClearSourceSelection={onClearSourceSelection}
+      />,
+    );
+
+    expect(
+      screen.getByText(/Selected passage from page 4/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(onClearSourceSelection).toHaveBeenCalled();
   });
 
   it("renders error banner and calls onDismissError when dismissed", () => {

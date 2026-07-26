@@ -1,6 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import { visit } from "unist-util-visit";
+import type { PhrasingContent, Root } from "mdast";
 import ConversationNavigator from "@/components/ConversationNavigator";
 import type {
   AssistantApprovalResponse,
@@ -9,6 +15,7 @@ import type {
   Citation,
   Conversation,
   Message,
+  SourceSelection,
 } from "@/types";
 
 interface ChatPanelProps {
@@ -33,6 +40,8 @@ interface ChatPanelProps {
   onCancelRun?: (runId: string) => Promise<void>;
   onResumeRun?: (runId: string, input: string) => Promise<void>;
   onDecideAction?: (actionId: string, approve: boolean) => Promise<void>;
+  sourceSelection?: SourceSelection | null;
+  onClearSourceSelection?: () => void;
 }
 
 export default function ChatPanel({
@@ -57,6 +66,8 @@ export default function ChatPanel({
   onCancelRun,
   onResumeRun,
   onDecideAction,
+  sourceSelection,
+  onClearSourceSelection,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [resumeInput, setResumeInput] = useState("");
@@ -69,38 +80,100 @@ export default function ChatPanel({
     await onSendMessage(content);
   };
 
-  const renderContentWithCitations = (
-    content: string,
-    citations: Citation[],
-  ) => {
-    const parts = content.split(/(\[\d+\])/g);
-    return parts.map((part, index) => {
-      const match = part.match(/\[(\d+)\]/);
-      if (match) {
-        const citeIndex = parseInt(match[1], 10);
-        const citation = citations.find((c) => c.citation_index === citeIndex);
-        if (citation) {
-          const isSelected = activeCitation?.citation_index === citeIndex;
+  const renderContent = (content: string, citations: Citation[]) => (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath, remarkCitationLinks]}
+      rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+      skipHtml
+      urlTransform={(url) =>
+        url.startsWith("myra-citation:") ? url : defaultUrlTransform(url)
+      }
+      components={{
+        h1: ({ children }) => (
+          <h1 className="my-3 text-lg font-semibold">{children}</h1>
+        ),
+        h2: ({ children }) => (
+          <h2 className="my-3 text-base font-semibold">{children}</h2>
+        ),
+        h3: ({ children }) => (
+          <h3 className="my-2 font-semibold">{children}</h3>
+        ),
+        p: ({ children }) => (
+          <p className="my-2 whitespace-pre-wrap">{children}</p>
+        ),
+        ul: ({ children }) => (
+          <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>
+        ),
+        ol: ({ children }) => (
+          <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>
+        ),
+        blockquote: ({ children }) => (
+          <blockquote className="my-2 border-l-2 border-zinc-300 pl-3 text-zinc-600">
+            {children}
+          </blockquote>
+        ),
+        table: ({ children }) => (
+          <div className="my-3 overflow-x-auto">
+            <table className="min-w-full border-collapse text-left">
+              {children}
+            </table>
+          </div>
+        ),
+        th: ({ children }) => (
+          <th className="border border-zinc-300 bg-zinc-50 px-2 py-1">
+            {children}
+          </th>
+        ),
+        td: ({ children }) => (
+          <td className="border border-zinc-300 px-2 py-1 align-top">
+            {children}
+          </td>
+        ),
+        code: ({ children }) => (
+          <code className="rounded bg-zinc-200 px-1 py-0.5 font-mono text-[0.9em]">
+            {children}
+          </code>
+        ),
+        a: ({ href, children }) => {
+          const citationMatch = href?.match(/^myra-citation:(\d+)$/);
+          if (!citationMatch) {
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                className="text-blue-700 underline"
+              >
+                {children}
+              </a>
+            );
+          }
+          const citationIndex = Number(citationMatch[1]);
+          const citation = citations.find(
+            (item) => item.citation_index === citationIndex,
+          );
+          if (!citation) return <>{children}</>;
+          const isSelected = activeCitation?.citation_index === citationIndex;
           return (
             <button
-              key={`cite-${index}`}
               type="button"
               onClick={() => onCitationClick(citation)}
-              className={`inline-flex items-center justify-center rounded px-1.5 py-0.5 text-xs font-semibold transition-colors mx-0.5 cursor-pointer ${
+              className={`mx-0.5 inline-flex cursor-pointer items-center rounded px-1.5 py-0.5 text-xs font-semibold ${
                 isSelected
                   ? "bg-amber-400 text-amber-950 ring-2 ring-amber-500"
                   : "bg-blue-100 text-blue-800 hover:bg-blue-200"
               }`}
               title={`Click to view Page ${citation.page_number} evidence`}
             >
-              [{citeIndex}]
+              {children}
             </button>
           );
-        }
-      }
-      return <span key={`text-${index}`}>{part}</span>;
-    });
-  };
+        },
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
 
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
@@ -264,7 +337,7 @@ export default function ChatPanel({
                 }`}
               >
                 {msg.role === "ASSISTANT"
-                  ? renderContentWithCitations(msg.content, msg.citations)
+                  ? renderContent(msg.content, msg.citations)
                   : msg.content}
               </div>
               <span className="mt-1 text-[10px] text-zinc-400">
@@ -287,6 +360,23 @@ export default function ChatPanel({
 
       {/* Input bar */}
       <form onSubmit={handleSubmit} className="border-t border-zinc-200 p-3">
+        {sourceSelection && (
+          <div className="mb-2 flex items-start justify-between gap-2 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+            <span>
+              Selected passage from page {sourceSelection.page_number}. Your
+              next question will be checked against this exact text.
+            </span>
+            {onClearSourceSelection && (
+              <button
+                type="button"
+                onClick={onClearSourceSelection}
+                className="shrink-0 underline"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
         <div className="flex gap-2">
           <input
             type="text"
@@ -313,6 +403,29 @@ export default function ChatPanel({
       </form>
     </div>
   );
+}
+
+function remarkCitationLinks() {
+  return (tree: Root) => {
+    visit(tree, "text", (node, index, parent) => {
+      if (index === undefined || !parent || !/\[\d+\]/.test(node.value)) return;
+      const children: PhrasingContent[] = node.value
+        .split(/(\[\d+\])/g)
+        .filter(Boolean)
+        .map((part) => {
+          const match = part.match(/^\[(\d+)\]$/);
+          return match
+            ? {
+                type: "link",
+                url: `myra-citation:${match[1]}`,
+                children: [{ type: "text", value: part }],
+              }
+            : { type: "text", value: part };
+        });
+      parent.children.splice(index, 1, ...children);
+      return index + children.length;
+    });
+  };
 }
 
 function intentLabel(intent: AssistantIntent): string {

@@ -229,6 +229,38 @@ describe("PdfViewer & Exact Range Matching", () => {
     expect(screen.getByText(/Page 1 of 5/)).toBeInTheDocument();
   });
 
+  it("returns selected PDF text with its paper, page, and document identity", async () => {
+    const onExplainSelection = vi.fn();
+    render(
+      <PdfViewer
+        paper={mockPaper}
+        activeCitation={null}
+        apiUrl="http://localhost:8000"
+        onExplainSelection={onExplainSelection}
+      />,
+    );
+
+    const textLayer = await screen.findByTestId("pdf-text-layer");
+    await waitFor(() =>
+      expect(textLayer.textContent).toContain("dominant sequence"),
+    );
+    const textNode = textLayer.querySelector("span")?.firstChild;
+    expect(textNode).toBeTruthy();
+    const range = document.createRange();
+    range.selectNodeContents(textNode!);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.mouseUp(textLayer);
+
+    expect(onExplainSelection).toHaveBeenCalledWith({
+      paper_id: "paper-123",
+      page_number: 1,
+      quote: "The dominant sequence transduction models are based on",
+      document_sha256: "aa".repeat(32),
+    });
+  });
+
   it("renders citation callout and exact DOM Range highlights when active citation matches text layer", async () => {
     render(
       <PdfViewer

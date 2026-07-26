@@ -20,6 +20,7 @@ import type {
   Paper,
   ProviderBudgetUsage,
   Project,
+  SourceSelection,
 } from "@/types";
 
 export default function Home() {
@@ -33,6 +34,8 @@ export default function Home() {
   const [paperTotal, setPaperTotal] = useState(0);
   const [paperOffset, setPaperOffset] = useState(0);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
+  const [sourceSelection, setSourceSelection] =
+    useState<SourceSelection | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [paperScope, setPaperScope] = useState<
@@ -53,6 +56,14 @@ export default function Home() {
     null,
   );
   const [chatError, setChatError] = useState<string | null>(null);
+
+  const activeSourceSelection =
+    sourceSelection &&
+    selectedPaper &&
+    sourceSelection.paper_id === selectedPaper.id &&
+    sourceSelection.document_sha256 === selectedPaper.document_sha256
+      ? sourceSelection
+      : null;
 
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
   const apiUrl = rawApiUrl.replace("localhost", "127.0.0.1");
@@ -645,9 +656,13 @@ export default function Home() {
             message: content,
             conversation_id: conversation.id,
             project_id: selectedProject.id,
-            scope: paperScope,
-            selected_paper_ids:
-              paperScope === "project" ? [] : selectedPaperIds,
+            scope: activeSourceSelection ? "paper" : paperScope,
+            selected_paper_ids: activeSourceSelection
+              ? [activeSourceSelection.paper_id]
+              : paperScope === "project"
+                ? []
+                : selectedPaperIds,
+            source_selection: activeSourceSelection ?? undefined,
             idempotency_key: `web-${crypto.randomUUID()}`,
           }),
         },
@@ -660,6 +675,7 @@ export default function Home() {
       }
 
       const run: AssistantRunResponse = await submitted.json();
+      setSourceSelection(null);
       window.localStorage.setItem(`myra.activeRun.${conversation.id}`, run.id);
       setActiveRun(run);
       setRoutedIntent(run.intent);
@@ -1033,6 +1049,8 @@ export default function Home() {
                   onCancelRun={handleCancelRun}
                   onResumeRun={handleResumeRun}
                   onDecideAction={handleDecideAction}
+                  sourceSelection={activeSourceSelection}
+                  onClearSourceSelection={() => setSourceSelection(null)}
                 />
               </div>
 
@@ -1042,6 +1060,7 @@ export default function Home() {
                   paper={selectedPaper}
                   activeCitation={activeCitation}
                   apiUrl={apiUrl}
+                  onExplainSelection={setSourceSelection}
                 />
               </div>
             </section>

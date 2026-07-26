@@ -6,13 +6,14 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Paper, PaperElement, PaperPage
+from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
 from app.ingestion.parser import find_verbatim_span
 from app.schemas.evidence import (
     AnchorStatus,
     BoundingBox,
     CitationAnchor,
     CoordinateOrigin,
+    EvidenceItem,
 )
 
 
@@ -135,4 +136,73 @@ def resolve_exact_source_anchor(
         parser_version=resolved_parser,
         anchor_status=AnchorStatus.VERIFIED,
         bounding_boxes=boxes,
+    )
+
+
+def build_selected_passage_evidence(
+    db: Session,
+    *,
+    project_id: UUID,
+    paper_id: UUID,
+    anchor: CitationAnchor,
+) -> EvidenceItem | None:
+    """Attach a verified page quote to its indexed chunk for grounded generation."""
+    if (
+        anchor.anchor_status != AnchorStatus.VERIFIED
+        or anchor.document_sha256 is None
+        or anchor.source_char_start is None
+        or anchor.source_char_end is None
+        or anchor.source_element_id is None
+    ):
+        return None
+
+    paper = (
+        db.query(Paper)
+        .filter(
+            Paper.id == paper_id,
+            Paper.project_id == project_id,
+            Paper.status == "READY",
+            Paper.document_sha256 == anchor.document_sha256,
+        )
+        .first()
+    )
+    page = (
+        db.query(PaperPage)
+        .filter(
+            PaperPage.paper_id == paper_id,
+            PaperPage.page_number == anchor.page_number,
+        )
+        .first()
+    )
+    chunk = (
+        db.query(PaperChunk)
+        .join(ChunkElement, ChunkElement.chunk_id == PaperChunk.id)
+        .filter(
+            PaperChunk.paper_id == paper_id,
+            PaperChunk.chunk_type == "child",
+            ChunkElement.element_id == anchor.source_element_id,
+        )
+        .order_by(PaperChunk.chunk_index)
+        .first()
+    )
+    if paper is None or page is None or not page.raw_text or chunk is None:
+        return None
+    start, end = anchor.source_char_start, anchor.source_char_end
+    if page.raw_text[start:end] != anchor.exact_quote:
+        return None
+
+    context_start = max(0, start - 300)
+    context_end = min(len(page.raw_text), end + 300)
+    return EvidenceItem(
+        id="selected-passage",
+        paper_id=paper.id,
+        paper_title=paper.title,
+        chunk_id=chunk.id,
+        quote=anchor.exact_quote,
+        parent_context=page.raw_text[context_start:context_end],
+        page_number=anchor.page_number,
+        source_element_ids=[anchor.source_element_id],
+        document_sha256=anchor.document_sha256,
+        parser_version=anchor.parser_version,
+        anchors=[anchor],
     )
