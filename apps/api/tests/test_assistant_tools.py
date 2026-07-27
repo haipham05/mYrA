@@ -1,10 +1,16 @@
+from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from app.db.base import Base
+from app.db.models import Paper, PaperPage, Project
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
 from app.schemas.evidence import EvidenceItem
+from app.services import assistant_tools
 from app.services.assistant_tools import (
     AssistantToolResult,
     CompareArguments,
@@ -15,6 +21,7 @@ from app.services.assistant_tools import (
     tool_requires_approval,
     validate_tool_input,
 )
+from app.services.llm import GenerationResult, GenerationUsage, LLMProvider
 
 
 def _request(*, scope: str = "selection", selected_paper_ids=None) -> AssistantRunRequest:
@@ -48,11 +55,11 @@ def test_tool_validation_rejects_arbitrary_fields_and_checks_paper_cardinality()
         intent=AssistantIntent.COMPARE,
         resolved_paper_ids=request.selected_paper_ids,
         action_summary="Compare the selected papers",
-        arguments={"dimensions": ["method", "results"]},
+        arguments={"dimensions": ["method_architecture", "results"]},
     )
     validated = validate_tool_input(registry[AssistantIntent.COMPARE], request, decision)
     assert isinstance(validated.arguments, CompareArguments)
-    assert validated.arguments.dimensions == ["method", "results"]
+    assert validated.arguments.dimensions == ["method_architecture", "results"]
 
     bad_decision = RouteDecision(
         intent=AssistantIntent.COMPARE,
@@ -69,6 +76,186 @@ def test_tool_validation_rejects_arbitrary_fields_and_checks_paper_cardinality()
     )
     with pytest.raises(ValueError, match="select more papers"):
         validate_tool_input(registry[AssistantIntent.COMPARE], one_paper, one_paper_decision)
+
+
+@pytest.mark.anyio
+async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'compare.db'}")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project = Project(name="Comparison project")
+        db.add(project)
+        db.flush()
+        papers = [
+            Paper(
+                project_id=project.id,
+                filename=f"paper-{index}.pdf",
+                storage_path=f"local/paper-{index}.pdf",
+                status="READY",
+            )
+            for index in range(2)
+        ]
+        db.add_all(papers)
+        db.commit()
+
+        quote = "The Transformer uses scaled dot-product attention for sequence modeling."
+
+        class FakeRetriever:
+            def retrieve(self, _db, _project_id, _query, *, selected_paper_ids):
+                assert len(selected_paper_ids) == 1
+                return [
+                    EvidenceItem(
+                        id="E1",
+                        paper_id=selected_paper_ids[0],
+                        chunk_id=uuid4(),
+                        quote=quote,
+                        page_number=1,
+                    )
+                ]
+
+        class FakeChatService:
+            retriever = FakeRetriever()
+
+        class FakeProvider(LLMProvider):
+            @property
+            def provider_name(self):
+                return "test"
+
+            async def generate(self, _system_prompt, _user_prompt):
+                return (
+                    '{"findings":[{"text":"' + quote + '","kind":"direct","evidence_ids":["C1"]}]}'
+                )
+
+            async def generate_result(self, system_prompt, user_prompt):
+                return GenerationResult(
+                    content=await self.generate(system_prompt, user_prompt),
+                    usage=GenerationUsage(prompt_tokens=12, completion_tokens=4, total_tokens=16),
+                )
+
+        telemetry_events = []
+
+        class FakeObservation:
+            def update(self, **kwargs):
+                telemetry_events.append(kwargs)
+
+        class FakeTelemetry:
+            @contextmanager
+            def stage(self, name, **_kwargs):
+                telemetry_events.append({"stage": name})
+                yield FakeObservation()
+
+        monkeypatch.setattr(assistant_tools, "get_llm_provider", lambda: FakeProvider())
+        monkeypatch.setattr(assistant_tools, "get_telemetry", lambda: FakeTelemetry())
+        request = AssistantRunRequest(
+            message="Compare the selected methods",
+            conversation_id=uuid4(),
+            project_id=project.id,
+            scope="selection",
+            selected_paper_ids=[paper.id for paper in papers],
+            idempotency_key="compare-tool-123",
+        )
+        decision = RouteDecision(
+            intent=AssistantIntent.COMPARE,
+            resolved_paper_ids=request.selected_paper_ids,
+            action_summary="Compare selected papers",
+            arguments={"dimensions": ["method_architecture"]},
+        )
+        definition = build_tool_registry()[AssistantIntent.COMPARE]
+        result = await execute_tool(
+            definition,
+            ToolContext(db=db, chat_service=FakeChatService()),  # type: ignore[arg-type]
+            validate_tool_input(definition, request, decision),
+        )
+
+        matrix = result.structured_payload["matrix"]
+        assert result.status is ToolStatus.SUCCEEDED
+        assert result.result_type == "comparison"
+        assert len(matrix["cells"]) == 2
+        assert [citation.paper_id for citation in result.citations] == [
+            papers[0].id,
+            papers[1].id,
+        ]
+        assert result.usage == {
+            "prompt_tokens": 12,
+            "completion_tokens": 4,
+            "total_tokens": 16,
+            "prompt_cache_hit_tokens": None,
+            "prompt_cache_miss_tokens": None,
+        }
+        assert any(
+            event.get("metadata", {}).get("provider_usage", {}).get("total_tokens") == 16
+            for event in telemetry_events
+        )
+        assert "[C1]" in result.display_text
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_compare_tool_rejects_papers_outside_project_before_retrieval(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'compare-scope.db'}")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project = Project(name="Current project")
+        other_project = Project(name="Other project")
+        db.add_all([project, other_project])
+        db.flush()
+        papers = [
+            Paper(
+                project_id=other_project.id,
+                filename=f"foreign-{index}.pdf",
+                storage_path=f"local/foreign-{index}.pdf",
+                status="READY",
+            )
+            for index in range(2)
+        ]
+        db.add_all(papers)
+        db.commit()
+
+        class FakeRetriever:
+            calls = 0
+
+            def retrieve(self, *_args, **_kwargs):
+                self.calls += 1
+                return []
+
+        retriever = FakeRetriever()
+
+        class FakeChatService:
+            pass
+
+        chat_service = FakeChatService()
+        chat_service.retriever = retriever
+        request = AssistantRunRequest(
+            message="Compare these papers",
+            conversation_id=uuid4(),
+            project_id=project.id,
+            scope="selection",
+            selected_paper_ids=[paper.id for paper in papers],
+            idempotency_key="compare-scope-123",
+        )
+        decision = RouteDecision(
+            intent=AssistantIntent.COMPARE,
+            resolved_paper_ids=request.selected_paper_ids,
+            action_summary="Compare selected papers",
+        )
+        definition = build_tool_registry()[AssistantIntent.COMPARE]
+        result = await execute_tool(
+            definition,
+            ToolContext(db=db, chat_service=chat_service),  # type: ignore[arg-type]
+            validate_tool_input(definition, request, decision),
+        )
+
+        assert result.status is ToolStatus.NEEDS_INPUT
+        assert retriever.calls == 0
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
 
 
 def test_note_reads_do_not_require_approval_but_mutations_do() -> None:
@@ -102,6 +289,110 @@ def test_note_reads_do_not_require_approval_but_mutations_do() -> None:
             ),
         ),
     )
+
+
+@pytest.mark.anyio
+async def test_claim_tool_verifies_current_source_and_keeps_refutation_model_assessed(
+    tmp_path, monkeypatch
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'claim-tool.db'}")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project = Project(name="Claim project")
+        db.add(project)
+        db.flush()
+        quote = "The method did not improve accuracy in the trial."
+        digest = "a" * 64
+        paper = Paper(
+            project_id=project.id,
+            filename="claim.pdf",
+            storage_path="local/claim.pdf",
+            document_sha256=digest,
+            status="READY",
+        )
+        db.add(paper)
+        db.flush()
+        db.add(
+            PaperPage(
+                paper_id=paper.id,
+                page_number=1,
+                width=612,
+                height=792,
+                raw_text=quote,
+            )
+        )
+        db.commit()
+
+        class FakeRetriever:
+            def retrieve(self, _db, _project_id, _query, *, selected_paper_ids):
+                assert selected_paper_ids == [paper.id]
+                return [
+                    EvidenceItem(
+                        id="E1",
+                        paper_id=paper.id,
+                        chunk_id=uuid4(),
+                        quote=quote,
+                        page_number=1,
+                        document_sha256=digest,
+                    )
+                ]
+
+        class FakeChatService:
+            retriever = FakeRetriever()
+
+        class FakeProvider(LLMProvider):
+            responses = [
+                '{"refuting_evidence_ids":[]}',
+                '{"refuting_evidence_ids":["S1"]}',
+            ]
+
+            @property
+            def provider_name(self):
+                return "test"
+
+            async def generate(self, _system_prompt, _user_prompt):
+                return self.responses.pop(0)
+
+        monkeypatch.setattr(assistant_tools, "get_llm_provider", lambda: FakeProvider())
+        definition = build_tool_registry()[AssistantIntent.VERIFY_CLAIM]
+
+        async def run_claim(claim, key):
+            request = AssistantRunRequest(
+                message="Verify the selected claim",
+                conversation_id=uuid4(),
+                project_id=project.id,
+                scope="paper",
+                selected_paper_ids=[paper.id],
+                idempotency_key=key,
+            )
+            decision = RouteDecision(
+                intent=AssistantIntent.VERIFY_CLAIM,
+                resolved_paper_ids=[paper.id],
+                action_summary="Verify the claim",
+                arguments={"claim": claim},
+            )
+            return await execute_tool(
+                definition,
+                ToolContext(db=db, chat_service=FakeChatService()),  # type: ignore[arg-type]
+                validate_tool_input(definition, request, decision),
+            )
+
+        supported = await run_claim(quote, "claim-check-123")
+        contradicted = await run_claim(
+            "The method improved accuracy in the trial.", "claim-check-456"
+        )
+
+        assert supported.structured_payload["verdict"] == "supported"
+        assert supported.citations[0].anchor_status.value == "verified"
+        assert contradicted.structured_payload["verdict"] == "contradicted"
+        assert contradicted.structured_payload["semantic_contradiction"] == "model_assessed"
+        assert contradicted.citations[0].quote == quote
+        assert "model-assessed" in contradicted.display_text
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
 
 
 @pytest.mark.anyio

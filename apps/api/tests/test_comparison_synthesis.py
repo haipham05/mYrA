@@ -1,0 +1,249 @@
+import json
+from uuid import uuid4
+
+import pytest
+
+from app.schemas.comparison import ComparisonDimension
+from app.schemas.comparison_result import (
+    ComparisonCell,
+    ComparisonCellStatus,
+    ComparisonExcerpt,
+    ComparisonMatrix,
+)
+from app.schemas.evidence import AnchorStatus, Citation, EvidenceItem
+from app.services.comparison_synthesis import FindingKind, synthesize_comparison
+from app.services.llm import GenerationResult, GenerationUsage, LLMProvider
+
+
+class _StubProvider:
+    def __init__(self, response: str | Exception) -> None:
+        self.response = response
+        self.calls = 0
+
+    async def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+        self.calls += 1
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+class _MetadataProvider(LLMProvider):
+    def __init__(self, response: str | Exception) -> None:
+        self.response = response
+        self.calls = 0
+
+    @property
+    def provider_name(self) -> str:
+        return "test"
+
+    async def generate(self, system_prompt: str, user_prompt: str) -> str:
+        raise AssertionError("metadata generation path should be used")
+
+    async def generate_result(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        self.calls += 1
+        if isinstance(self.response, Exception):
+            raise self.response
+        return GenerationResult(
+            content=self.response,
+            requested_model="test-model",
+            reported_model="test-model-reported",
+            usage=GenerationUsage(prompt_tokens=20, completion_tokens=8, total_tokens=28),
+        )
+
+
+def _matrix(*, paper_count: int = 2, with_evidence: bool = True) -> ComparisonMatrix:
+    paper_ids = [uuid4() for _ in range(paper_count)]
+    cells: list[ComparisonCell] = []
+    for index, paper_id in enumerate(paper_ids, start=1):
+        excerpts: list[ComparisonExcerpt] = []
+        if with_evidence:
+            evidence_id = f"C{index}"
+            quote = (
+                "The Transformer uses scaled dot-product attention for sequence modeling."
+                if index == 1
+                else "The model uses recurrent layers to process each input sequence."
+            )
+            evidence = EvidenceItem(
+                id=evidence_id,
+                paper_id=paper_id,
+                paper_title=f"Paper {index}",
+                chunk_id=uuid4(),
+                quote=quote,
+                page_number=index,
+                document_sha256=str(index) * 64,
+            )
+            citation = Citation(
+                citation_index=index,
+                evidence_id=evidence_id,
+                paper_id=paper_id,
+                page_number=index,
+                quote=quote,
+                document_sha256=str(index) * 64,
+                anchor_status=AnchorStatus.UNRESOLVED,
+            )
+            excerpts.append(ComparisonExcerpt(evidence=evidence, citation=citation))
+        cells.append(
+            ComparisonCell(
+                paper_id=paper_id,
+                dimension=ComparisonDimension.METHOD_ARCHITECTURE,
+                status=(
+                    ComparisonCellStatus.EVIDENCE_AVAILABLE
+                    if excerpts
+                    else ComparisonCellStatus.NOT_FOUND
+                ),
+                excerpts=excerpts,
+                message=None if excerpts else "Not reported in retrieved evidence",
+            )
+        )
+    return ComparisonMatrix(
+        project_id=uuid4(),
+        question="Compare their sequence modeling methods",
+        paper_ids=paper_ids,
+        dimensions=[ComparisonDimension.METHOD_ARCHITECTURE],
+        cells=cells,
+    )
+
+
+def _response(*findings: dict[str, object]) -> str:
+    return json.dumps({"findings": list(findings)})
+
+
+@pytest.mark.anyio
+async def test_supported_direct_finding_is_returned_with_nullable_usage() -> None:
+    matrix = _matrix()
+    provider = _MetadataProvider(
+        _response(
+            {
+                "text": "The Transformer uses scaled dot-product attention for sequence modeling.",
+                "kind": "direct",
+                "evidence_ids": ["C1"],
+            }
+        )
+    )
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert result.outcome == "completed"
+    assert result.findings[0].kind is FindingKind.DIRECT
+    assert result.findings[0].evidence_ids == ["C1"]
+    assert result.usage == GenerationUsage(prompt_tokens=20, completion_tokens=8, total_tokens=28)
+    assert result.requested_model == "test-model"
+    assert provider.calls == 1
+
+
+@pytest.mark.anyio
+async def test_unsupported_direct_finding_is_filtered_with_gap_warning() -> None:
+    provider = _StubProvider(
+        _response(
+            {
+                "text": "The Transformer significantly improves every translation benchmark.",
+                "kind": "direct",
+                "evidence_ids": ["C1"],
+            }
+        )
+    )
+
+    result = await synthesize_comparison(_matrix(), provider=provider)
+
+    assert result.findings == []
+    assert result.outcome == "insufficient_evidence"
+    assert any("unsupported direct finding" in warning for warning in result.warnings)
+    assert result.usage is None
+
+
+@pytest.mark.anyio
+async def test_unknown_evidence_reference_is_rejected() -> None:
+    provider = _StubProvider(
+        _response(
+            {
+                "text": "The Transformer uses scaled dot-product attention for sequence modeling.",
+                "kind": "direct",
+                "evidence_ids": ["unknown"],
+            }
+        )
+    )
+
+    result = await synthesize_comparison(_matrix(), provider=provider)
+
+    assert result.findings == []
+    assert any("outside the comparison matrix" in warning for warning in result.warnings)
+
+
+@pytest.mark.anyio
+async def test_interpretation_requires_two_distinct_selected_papers() -> None:
+    matrix = _matrix()
+    provider = _StubProvider(
+        _response(
+            {
+                "text": "The papers use different sequence modeling approaches.",
+                "kind": "interpretation",
+                "evidence_ids": ["C1"],
+            }
+        )
+    )
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert result.findings == []
+    assert any("two selected papers" in warning for warning in result.warnings)
+
+
+@pytest.mark.anyio
+async def test_interpretation_with_two_paper_sources_is_tagged() -> None:
+    provider = _StubProvider(
+        _response(
+            {
+                "text": "The papers use different sequence modeling approaches.",
+                "kind": "interpretation",
+                "evidence_ids": ["C1", "C2"],
+            }
+        )
+    )
+
+    result = await synthesize_comparison(_matrix(), provider=provider)
+
+    assert result.findings[0].kind is FindingKind.INTERPRETATION
+    assert result.findings[0].evidence_ids == ["C1", "C2"]
+
+
+@pytest.mark.anyio
+async def test_no_evidence_skips_provider_call() -> None:
+    provider = _StubProvider("unused")
+
+    result = await synthesize_comparison(_matrix(with_evidence=False), provider=provider)
+
+    assert result.outcome == "insufficient_evidence"
+    assert result.findings == []
+    assert provider.calls == 0
+
+
+@pytest.mark.anyio
+async def test_provider_failure_returns_safe_empty_result() -> None:
+    provider = _StubProvider(RuntimeError("private provider details"))
+
+    result = await synthesize_comparison(_matrix(), provider=provider)
+
+    assert result.outcome == "failed"
+    assert result.findings == []
+    assert "private provider details" not in " ".join(result.warnings)
+    assert provider.calls == 1
+
+
+@pytest.mark.anyio
+async def test_numeric_winner_is_withheld_without_comparability_evidence() -> None:
+    provider = _StubProvider(
+        _response(
+            {
+                "text": "The Transformer is better with 28.4 BLEU than the RNN model.",
+                "kind": "interpretation",
+                "evidence_ids": ["C1", "C2"],
+            }
+        )
+    )
+
+    result = await synthesize_comparison(_matrix(), provider=provider)
+
+    assert result.findings == []
+    assert any(
+        "benchmark comparability is not established" in warning for warning in result.warnings
+    )
