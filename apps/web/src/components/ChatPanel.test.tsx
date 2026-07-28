@@ -1,8 +1,13 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import ChatPanel from "./ChatPanel";
-import type { AssistantRunResponse, Citation, Message } from "@/types";
+import type {
+  AssistantRunResponse,
+  AssistantRunResult,
+  Citation,
+  Message,
+} from "@/types";
 
 const mockCitation: Citation = {
   citation_index: 1,
@@ -33,6 +38,48 @@ const mockMessages: Message[] = [
     created_at: new Date().toISOString(),
   },
 ];
+
+const comparisonResult: AssistantRunResult = {
+  result_type: "comparison",
+  display_text: "Comparison summary [1].",
+  structured_payload: {
+    matrix: {
+      paper_ids: ["paper-123", "paper-456"],
+      dimensions: ["method", "results"],
+      cells: [
+        {
+          paper_id: "paper-123",
+          dimension: "method",
+          status: "evidence_available",
+          excerpts: [
+            {
+              evidence: {
+                id: "E1",
+                paper_id: "paper-123",
+                paper_title: "Transformer Paper",
+                quote: "Transformers achieve state of the art results.",
+              },
+              citation: mockCitation,
+            },
+          ],
+        },
+        {
+          paper_id: "paper-123",
+          dimension: "results",
+          status: "not_found",
+          message: "Not reported in retrieved evidence.",
+          excerpts: [],
+        },
+      ],
+    },
+    synthesis: {},
+  },
+  citations: [mockCitation],
+  warnings: ["Candidate source excerpts only."],
+  usage: {},
+  available_actions: [],
+  artifact_ids: [],
+};
 
 describe("ChatPanel", () => {
   it("renders messages and citation chips", () => {
@@ -103,6 +150,190 @@ describe("ChatPanel", () => {
     const chip = screen.getByRole("button", { name: "[1]" });
     fireEvent.click(chip);
     expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
+  it("renders comparison cells and opens exact source citations", () => {
+    const onCitationClick = vi.fn();
+    const message: Message = {
+      id: "comparison-message",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: comparisonResult.display_text,
+      citations: [mockCitation],
+      evidence: [],
+      assistantResult: comparisonResult,
+      created_at: new Date().toISOString(),
+    };
+    const { container } = render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText("Transformer Paper")).toBeInTheDocument();
+    expect(screen.getByText("method")).toBeInTheDocument();
+    expect(
+      screen.getByText("Transformers achieve state of the art results."),
+    ).toBeInTheDocument();
+    expect(container.querySelector("table")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Page 1/ }));
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
+  it("shows benchmark comparability and opens sources from both papers", () => {
+    const secondCitation: Citation = {
+      ...mockCitation,
+      citation_index: 2,
+      evidence_id: "E2",
+      paper_id: "paper-456",
+      page_number: 3,
+      quote: "The reported result is 88 percent.",
+    };
+    const result: AssistantRunResult = {
+      ...comparisonResult,
+      citations: [mockCitation, secondCitation],
+      structured_payload: {
+        ...comparisonResult.structured_payload,
+        synthesis: {
+          benchmark_comparisons: [
+            {
+              left_paper_id: "paper-123",
+              right_paper_id: "paper-456",
+              left_result: "90 percent",
+              right_result: "88 percent",
+              evidence_ids: ["E1", "E2"],
+              comparability: {
+                status: "not directly comparable",
+                reasons: ["split differs between papers"],
+              },
+            },
+          ],
+        },
+      },
+    };
+    const onCitationClick = vi.fn();
+    const message: Message = {
+      id: "benchmark-comparison",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: result.display_text,
+      citations: result.citations,
+      evidence: [],
+      assistantResult: result,
+      created_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText("Not directly comparable.")).toBeInTheDocument();
+    expect(
+      screen.getByText("split differs between papers"),
+    ).toBeInTheDocument();
+    const section = screen.getByRole("region", {
+      name: "Benchmark comparisons",
+    });
+    fireEvent.click(
+      within(section).getByRole("button", { name: "Page 1 ·[1]" }),
+    );
+    fireEvent.click(
+      within(section).getByRole("button", { name: "Page 3 ·[2]" }),
+    );
+    expect(onCitationClick.mock.calls).toEqual([
+      [mockCitation],
+      [secondCitation],
+    ]);
+  });
+
+  it("shows missing cells and the candidate-only warning", () => {
+    const message: Message = {
+      id: "comparison-missing",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: comparisonResult.display_text,
+      citations: [mockCitation],
+      evidence: [],
+      assistantResult: comparisonResult,
+      created_at: new Date().toISOString(),
+    };
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByRole("note")).toHaveTextContent(
+      /Candidate source excerpts only/,
+    );
+    expect(
+      screen.getAllByText("Not reported in retrieved evidence.").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("paper-456")).toBeInTheDocument();
+  });
+
+  it("falls back to the regular answer when the comparison matrix is malformed", () => {
+    const message: Message = {
+      id: "comparison-malformed",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "A readable fallback answer [1].",
+      citations: [mockCitation],
+      evidence: [],
+      assistantResult: {
+        ...comparisonResult,
+        structured_payload: { matrix: { paper_ids: "not-an-array" } },
+      },
+      created_at: new Date().toISOString(),
+    };
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText(/A readable fallback answer/)).toBeInTheDocument();
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+  });
+
+  it("keeps normal QA answers in their existing Markdown rendering", () => {
+    const { container } = render(
+      <ChatPanel
+        messages={[mockMessages[1]]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByText(/The paper proposes the Transformer architecture/),
+    ).toBeInTheDocument();
+    expect(container.querySelector("table")).toBeNull();
   });
 
   it("calls onSendMessage when user submits input", () => {

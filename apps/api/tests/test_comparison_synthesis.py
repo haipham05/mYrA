@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.schemas.comparison import ComparisonDimension
+from app.schemas.comparison import ComparabilityStatus, ComparisonDimension
 from app.schemas.comparison_result import (
     ComparisonCell,
     ComparisonCellStatus,
@@ -104,8 +104,15 @@ def _matrix(*, paper_count: int = 2, with_evidence: bool = True) -> ComparisonMa
     )
 
 
-def _response(*findings: dict[str, object]) -> str:
-    return json.dumps({"findings": list(findings)})
+def _response(
+    *findings: dict[str, object], benchmark_comparisons: list[dict[str, object]] | None = None
+) -> str:
+    return json.dumps(
+        {
+            "findings": list(findings),
+            "benchmark_comparisons": benchmark_comparisons or [],
+        }
+    )
 
 
 @pytest.mark.anyio
@@ -185,11 +192,11 @@ async def test_interpretation_requires_two_distinct_selected_papers() -> None:
     result = await synthesize_comparison(matrix, provider=provider)
 
     assert result.findings == []
-    assert any("two selected papers" in warning for warning in result.warnings)
+    assert any("independently supported" in warning for warning in result.warnings)
 
 
 @pytest.mark.anyio
-async def test_interpretation_with_two_paper_sources_is_tagged() -> None:
+async def test_unsupported_interpretation_is_rejected_even_with_two_paper_sources() -> None:
     provider = _StubProvider(
         _response(
             {
@@ -202,8 +209,143 @@ async def test_interpretation_with_two_paper_sources_is_tagged() -> None:
 
     result = await synthesize_comparison(_matrix(), provider=provider)
 
-    assert result.findings[0].kind is FindingKind.INTERPRETATION
-    assert result.findings[0].evidence_ids == ["C1", "C2"]
+    assert result.findings == []
+    assert any("independently supported" in warning for warning in result.warnings)
+
+
+def _benchmark_proposal(matrix: ComparisonMatrix, *, right_split: str = "validation") -> dict:
+    left_id, right_id = matrix.paper_ids
+    quotes = [
+        "Image classification on ImageNet validation split reports top-1 accuracy in percent, "
+        "single crop 224px, result 90 percent.",
+        f"Image classification on ImageNet {right_split} split reports top-1 accuracy in percent, "
+        "single crop 224px, result 88 percent.",
+    ]
+    for cell, quote in zip(matrix.cells, quotes, strict=True):
+        excerpt = cell.excerpts[0]
+        cell.excerpts[0] = excerpt.model_copy(
+            update={
+                "evidence": excerpt.evidence.model_copy(update={"quote": quote}),
+                "citation": excerpt.citation.model_copy(update={"quote": quote}),
+            }
+        )
+    return {
+        "left_paper_id": str(left_id),
+        "right_paper_id": str(right_id),
+        "left_context": {
+            "task": "image classification",
+            "dataset": "ImageNet",
+            "split": "validation",
+            "metric": "top-1 accuracy",
+            "unit": "percent",
+            "comparison_condition": "single crop 224px",
+        },
+        "right_context": {
+            "task": "image classification",
+            "dataset": "ImageNet",
+            "split": right_split,
+            "metric": "top-1 accuracy",
+            "unit": "percent",
+            "comparison_condition": "single crop 224px",
+        },
+        "left_result": "90 percent",
+        "right_result": "88 percent",
+        "left_context_quote": quotes[0],
+        "right_context_quote": quotes[1],
+        "left_evidence_ids": ["C1"],
+        "right_evidence_ids": ["C2"],
+    }
+
+
+@pytest.mark.anyio
+async def test_source_backed_matching_benchmarks_are_comparable() -> None:
+    matrix = _matrix()
+    provider = _StubProvider(_response(benchmark_comparisons=[_benchmark_proposal(matrix)]))
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert result.outcome == "completed"
+    assert len(result.benchmark_comparisons) == 1
+    comparison = result.benchmark_comparisons[0]
+    assert comparison.comparability.status is ComparabilityStatus.DIRECTLY_COMPARABLE
+    assert (comparison.left_result, comparison.right_result) == ("90 percent", "88 percent")
+
+
+@pytest.mark.anyio
+async def test_different_split_is_reported_not_directly_comparable() -> None:
+    matrix = _matrix()
+    provider = _StubProvider(
+        _response(benchmark_comparisons=[_benchmark_proposal(matrix, right_split="test")])
+    )
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert len(result.benchmark_comparisons) == 1
+    comparison = result.benchmark_comparisons[0]
+    assert comparison.comparability.status is ComparabilityStatus.NOT_DIRECTLY_COMPARABLE
+    assert any("split differs" in reason for reason in comparison.comparability.reasons)
+
+
+@pytest.mark.anyio
+async def test_invented_benchmark_value_is_omitted() -> None:
+    matrix = _matrix()
+    proposal = _benchmark_proposal(matrix)
+    proposal["left_result"] = "190 percent"
+    provider = _StubProvider(_response(benchmark_comparisons=[proposal]))
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert result.benchmark_comparisons == []
+
+
+@pytest.mark.anyio
+async def test_result_cannot_be_assigned_to_the_wrong_dataset() -> None:
+    matrix = _matrix()
+    ambiguous_quote = (
+        "Image classification on ImageNet validation, top-1 accuracy percent, single crop "
+        "224px: 80 percent; CIFAR validation, top-1 accuracy percent, single crop 224px: "
+        "90 percent. The condition was evaluated at 80 and 90 percent."
+    )
+    excerpt = matrix.cells[0].excerpts[0]
+    matrix.cells[0].excerpts[0] = excerpt.model_copy(
+        update={
+            "evidence": excerpt.evidence.model_copy(update={"quote": ambiguous_quote}),
+            "citation": excerpt.citation.model_copy(update={"quote": ambiguous_quote}),
+        }
+    )
+
+    proposal = _benchmark_proposal(matrix)
+    proposal["left_context_quote"] = ambiguous_quote
+    proposal["left_context"]["comparison_condition"] = "evaluated at 80 and 90 percent"
+    provider = _StubProvider(_response(benchmark_comparisons=[proposal]))
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert result.benchmark_comparisons == []
+
+
+@pytest.mark.anyio
+async def test_result_unit_must_match_its_reported_metric_context() -> None:
+    matrix = _matrix()
+    mixed_quote = (
+        "Image classification on ImageNet validation reports top-1 accuracy 80 percent "
+        "under single crop 224px; CIFAR text retrieval reports BLEU 90 BLEU."
+    )
+    excerpt = matrix.cells[0].excerpts[0]
+    matrix.cells[0].excerpts[0] = excerpt.model_copy(
+        update={
+            "evidence": excerpt.evidence.model_copy(update={"quote": mixed_quote}),
+            "citation": excerpt.citation.model_copy(update={"quote": mixed_quote}),
+        }
+    )
+    proposal = _benchmark_proposal(matrix)
+    proposal["left_result"] = "90 BLEU"
+    proposal["left_context_quote"] = mixed_quote
+    provider = _StubProvider(_response(benchmark_comparisons=[proposal]))
+
+    result = await synthesize_comparison(matrix, provider=provider)
+
+    assert result.benchmark_comparisons == []
 
 
 @pytest.mark.anyio
@@ -244,6 +386,4 @@ async def test_numeric_winner_is_withheld_without_comparability_evidence() -> No
     result = await synthesize_comparison(_matrix(), provider=provider)
 
     assert result.findings == []
-    assert any(
-        "benchmark comparability is not established" in warning for warning in result.warnings
-    )
+    assert any("independently supported" in warning for warning in result.warnings)

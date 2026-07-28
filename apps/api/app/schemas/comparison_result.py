@@ -6,7 +6,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.schemas.comparison import ComparisonDimension
+from app.schemas.comparison import (
+    BenchmarkContext,
+    ComparabilityResult,
+    ComparisonDimension,
+)
 from app.schemas.evidence import Citation, EvidenceItem
 
 
@@ -40,3 +44,16 @@ class ComparisonMatrix(BaseModel):
     interpretation_notice: str = (
         "These are candidate source excerpts, not extracted or fact-checked comparison claims."
     )
+
+
+class BenchmarkComparison(BaseModel):
+    """Side-by-side numeric results, with source-backed experimental contexts."""
+
+    left_paper_id: UUID
+    right_paper_id: UUID
+    left_result: str = Field(max_length=160)
+    right_result: str = Field(max_length=160)
+    left_context: BenchmarkContext
+    right_context: BenchmarkContext
+    comparability: ComparabilityResult
+    evidence_ids: list[str] = Field(min_length=2, max_length=6)

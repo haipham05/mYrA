@@ -420,8 +420,29 @@ async def _compare(context: ToolContext, tool_input: AssistantToolInput) -> Assi
             outcome="failed",
             warnings=["Comparison synthesis is unavailable; source excerpts are still available."],
         )
+    with get_telemetry().stage(
+        "comparison.compatibility",
+        metadata={
+            "directly_comparable_count": sum(
+                item.comparability.status.value == "directly_comparable"
+                for item in synthesis.benchmark_comparisons
+            ),
+            "not_comparable_count": sum(
+                item.comparability.status.value == "not directly comparable"
+                for item in synthesis.benchmark_comparisons
+            ),
+        },
+    ) as observation:
+        if observation is not None:
+            observation.update(metadata={"outcome": "evaluated"})
     citation_by_id = {
         excerpt.evidence.id: excerpt.citation for cell in matrix.cells for excerpt in cell.excerpts
+    }
+    title_by_paper = {
+        excerpt.evidence.paper_id: excerpt.evidence.paper_title
+        for cell in matrix.cells
+        for excerpt in cell.excerpts
+        if excerpt.evidence.paper_title
     }
     rendered_findings: list[str] = []
     for finding in synthesis.findings:
@@ -435,6 +456,24 @@ async def _compare(context: ToolContext, tool_input: AssistantToolInput) -> Assi
         label = "Interpretation: " if finding.kind is FindingKind.INTERPRETATION else ""
         citations_text = " ".join(f"[C{index}]" for index in citation_indexes)
         rendered_findings.append(f"- {label}{finding.text} {citations_text}")
+    for comparison in synthesis.benchmark_comparisons:
+        citation_indexes = [
+            citation_by_id[evidence_id].citation_index
+            for evidence_id in comparison.evidence_ids
+            if evidence_id in citation_by_id
+        ]
+        citations_text = " ".join(f"[C{index}]" for index in citation_indexes)
+        left_title = title_by_paper.get(comparison.left_paper_id, "Paper A")
+        right_title = title_by_paper.get(comparison.right_paper_id, "Paper B")
+        status = (
+            "reported under matching conditions"
+            if comparison.comparability.status.value == "directly_comparable"
+            else "not directly comparable"
+        )
+        rendered_findings.append(
+            f"- Reported results: {left_title} — {comparison.left_result}; "
+            f"{right_title} — {comparison.right_result} ({status}). {citations_text}"
+        )
 
     display_text = (
         "\n".join(rendered_findings)
@@ -498,6 +537,7 @@ async def _verify_claim(
                 arguments.claim,
                 selected_paper_ids=[paper_id],
             )
+            paper_source_count = 0
             for item in evidence_items:
                 if (
                     item.paper_id != paper_id
@@ -515,6 +555,9 @@ async def _verify_claim(
                         document_sha256=item.document_sha256,
                     )
                 )
+                paper_source_count += 1
+                if paper_source_count >= 3:
+                    break
                 if len(sources) >= 18:
                     break
             if len(sources) >= 18:

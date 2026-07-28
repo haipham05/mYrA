@@ -18,6 +18,151 @@ import type {
   SourceSelection,
 } from "@/types";
 
+interface ComparisonExcerptView {
+  quote: string;
+  paperTitle?: string;
+  citation: Citation;
+}
+
+interface ComparisonCellView {
+  paperId: string;
+  dimension: string;
+  status: string;
+  message?: string;
+  excerpts: ComparisonExcerptView[];
+}
+
+interface ComparisonMatrixView {
+  paperIds: string[];
+  dimensions: string[];
+  cells: ComparisonCellView[];
+}
+
+interface BenchmarkComparisonView {
+  leftPaperId: string;
+  rightPaperId: string;
+  leftResult: string;
+  rightResult: string;
+  status: string;
+  reasons: string[];
+  evidenceIds: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCitation(value: unknown): value is Citation {
+  return (
+    isRecord(value) &&
+    typeof value.citation_index === "number" &&
+    typeof value.evidence_id === "string" &&
+    typeof value.paper_id === "string" &&
+    typeof value.page_number === "number" &&
+    typeof value.quote === "string" &&
+    Array.isArray(value.bounding_boxes)
+  );
+}
+
+function readComparisonMatrix(payload: unknown): ComparisonMatrixView | null {
+  if (!isRecord(payload)) return null;
+  const matrix = payload.matrix;
+  if (
+    !isRecord(matrix) ||
+    !Array.isArray(matrix.paper_ids) ||
+    !matrix.paper_ids.every((id) => typeof id === "string") ||
+    !Array.isArray(matrix.dimensions) ||
+    !matrix.dimensions.every((dimension) => typeof dimension === "string") ||
+    !Array.isArray(matrix.cells)
+  ) {
+    return null;
+  }
+
+  const cells = matrix.cells.flatMap((value): ComparisonCellView[] => {
+    if (
+      !isRecord(value) ||
+      typeof value.paper_id !== "string" ||
+      typeof value.dimension !== "string" ||
+      typeof value.status !== "string"
+    ) {
+      return [];
+    }
+    const excerpts = Array.isArray(value.excerpts)
+      ? value.excerpts.flatMap((excerpt): ComparisonExcerptView[] => {
+          if (!isRecord(excerpt) || !isRecord(excerpt.evidence)) return [];
+          const citation = excerpt.citation;
+          if (!isCitation(citation)) return [];
+          const evidence = excerpt.evidence;
+          const quote =
+            typeof evidence.quote === "string"
+              ? evidence.quote
+              : citation.quote;
+          return [
+            {
+              quote,
+              paperTitle:
+                typeof evidence.paper_title === "string"
+                  ? evidence.paper_title
+                  : undefined,
+              citation,
+            },
+          ];
+        })
+      : [];
+    return [
+      {
+        paperId: value.paper_id,
+        dimension: value.dimension,
+        status: value.status,
+        message: typeof value.message === "string" ? value.message : undefined,
+        excerpts,
+      },
+    ];
+  });
+
+  return {
+    paperIds: matrix.paper_ids,
+    dimensions: matrix.dimensions,
+    cells,
+  };
+}
+
+function readBenchmarkComparisons(payload: unknown): BenchmarkComparisonView[] {
+  if (!isRecord(payload) || !isRecord(payload.synthesis)) return [];
+  const comparisons = payload.synthesis.benchmark_comparisons;
+  if (!Array.isArray(comparisons)) return [];
+  return comparisons.flatMap((value): BenchmarkComparisonView[] => {
+    if (
+      !isRecord(value) ||
+      typeof value.left_paper_id !== "string" ||
+      typeof value.right_paper_id !== "string" ||
+      typeof value.left_result !== "string" ||
+      typeof value.right_result !== "string" ||
+      !isRecord(value.comparability) ||
+      typeof value.comparability.status !== "string" ||
+      !Array.isArray(value.evidence_ids) ||
+      !value.evidence_ids.every((id) => typeof id === "string")
+    ) {
+      return [];
+    }
+    return [
+      {
+        leftPaperId: value.left_paper_id,
+        rightPaperId: value.right_paper_id,
+        leftResult: value.left_result,
+        rightResult: value.right_result,
+        status: value.comparability.status,
+        reasons: Array.isArray(value.comparability.reasons)
+          ? value.comparability.reasons.filter(
+              (reason): reason is string => typeof reason === "string",
+            )
+          : [],
+        evidenceIds: value.evidence_ids,
+      },
+    ];
+  });
+}
+
 interface ChatPanelProps {
   messages: Message[];
   isLoading: boolean;
@@ -174,6 +319,168 @@ export default function ChatPanel({
       {content}
     </ReactMarkdown>
   );
+
+  const renderComparison = (message: Message) => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "comparison") return null;
+    const matrix = readComparisonMatrix(result.structured_payload);
+    if (!matrix) return null;
+    const benchmarkComparisons = readBenchmarkComparisons(
+      result.structured_payload,
+    );
+    const paperTitles = new Map(
+      matrix.cells.map((cell) => [
+        cell.paperId,
+        cell.excerpts.find((excerpt) => excerpt.paperTitle)?.paperTitle ??
+          cell.paperId,
+      ]),
+    );
+
+    return (
+      <div className="space-y-3">
+        <p className="text-xs font-medium text-amber-800" role="note">
+          Candidate source excerpts only; these are not extracted or
+          fact-checked claims.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-collapse text-left text-xs">
+            <thead>
+              <tr>
+                <th className="border border-zinc-300 bg-zinc-50 px-2 py-1">
+                  Paper
+                </th>
+                {matrix.dimensions.map((dimension) => (
+                  <th
+                    key={dimension}
+                    className="border border-zinc-300 bg-zinc-50 px-2 py-1"
+                  >
+                    {dimension.replaceAll("_", " ")}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {matrix.paperIds.map((paperId) => {
+                const paperCells = matrix.cells.filter(
+                  (cell) => cell.paperId === paperId,
+                );
+                const title = paperCells
+                  .flatMap((cell) => cell.excerpts)
+                  .find((excerpt) => excerpt.paperTitle)?.paperTitle;
+                return (
+                  <tr key={paperId}>
+                    <th className="border border-zinc-300 px-2 py-1 align-top font-medium">
+                      {title ?? paperId}
+                    </th>
+                    {matrix.dimensions.map((dimension) => {
+                      const cell = paperCells.find(
+                        (candidate) => candidate.dimension === dimension,
+                      );
+                      return (
+                        <td
+                          key={dimension}
+                          className="border border-zinc-300 px-2 py-1 align-top"
+                        >
+                          {!cell || cell.excerpts.length === 0 ? (
+                            <span className="text-zinc-500">
+                              {cell?.message ??
+                                "Not reported in retrieved evidence."}
+                            </span>
+                          ) : (
+                            <ul className="space-y-2">
+                              {cell.excerpts.map((excerpt) => (
+                                <li key={excerpt.citation.evidence_id}>
+                                  <blockquote className="border-l-2 border-zinc-300 pl-2">
+                                    {excerpt.quote}
+                                  </blockquote>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onCitationClick(excerpt.citation)
+                                    }
+                                    className="mt-1 rounded bg-blue-100 px-1.5 py-0.5 font-semibold text-blue-800 hover:bg-blue-200"
+                                    title={`Click to view Page ${excerpt.citation.page_number} evidence`}
+                                  >
+                                    Page {excerpt.citation.page_number} ·[
+                                    {excerpt.citation.citation_index}]
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {benchmarkComparisons.length > 0 && (
+          <section aria-label="Benchmark comparisons" className="space-y-2">
+            <h3 className="text-sm font-semibold">
+              Reported benchmark results
+            </h3>
+            {benchmarkComparisons.map((comparison, index) => (
+              <div
+                key={`${comparison.evidenceIds.join("-")}-${index}`}
+                className="rounded border border-zinc-200 p-2 text-xs"
+              >
+                <p className="font-medium">
+                  {paperTitles.get(comparison.leftPaperId) ??
+                    comparison.leftPaperId}
+                  : {comparison.leftResult} ·{" "}
+                  {paperTitles.get(comparison.rightPaperId) ??
+                    comparison.rightPaperId}
+                  : {comparison.rightResult}
+                </p>
+                <p className="text-zinc-600">
+                  {comparison.status === "directly_comparable"
+                    ? "Reported under matching benchmark conditions; values shown without ranking."
+                    : "Not directly comparable."}
+                </p>
+                {comparison.reasons.map((reason) => (
+                  <p key={reason} className="text-zinc-600">
+                    {reason}
+                  </p>
+                ))}
+                <div className="mt-1 flex gap-2">
+                  {comparison.evidenceIds.map((evidenceId) => {
+                    const citation = result.citations.find(
+                      (item) => item.evidence_id === evidenceId,
+                    );
+                    return citation ? (
+                      <button
+                        key={evidenceId}
+                        type="button"
+                        onClick={() => onCitationClick(citation)}
+                        className="rounded bg-blue-100 px-1.5 py-0.5 font-semibold text-blue-800 hover:bg-blue-200"
+                      >
+                        Page {citation.page_number} ·[{citation.citation_index}]
+                      </button>
+                    ) : null;
+                  })}
+                </div>
+              </div>
+            ))}
+          </section>
+        )}
+        {result.warnings
+          .filter(
+            (warning) =>
+              typeof warning === "string" &&
+              !warning.toLowerCase().includes("candidate source excerpts"),
+          )
+          .map((warning) => (
+            <p key={warning} className="text-xs text-amber-800">
+              {warning}
+            </p>
+          ))}
+        {renderContent(message.content, message.citations)}
+      </div>
+    );
+  };
 
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
@@ -337,7 +644,8 @@ export default function ChatPanel({
                 }`}
               >
                 {msg.role === "ASSISTANT"
-                  ? renderContent(msg.content, msg.citations)
+                  ? (renderComparison(msg) ??
+                    renderContent(msg.content, msg.citations))
                   : msg.content}
               </div>
               <span className="mt-1 text-[10px] text-zinc-400">

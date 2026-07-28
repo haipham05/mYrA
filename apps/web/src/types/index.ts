@@ -122,6 +122,7 @@ export interface Message {
   evidence: EvidenceItem[];
   model_name?: string | null;
   token_count?: number | null;
+  assistantResult?: AssistantRunResult;
   created_at: string;
 }
 

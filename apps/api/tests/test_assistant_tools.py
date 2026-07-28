@@ -99,7 +99,10 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
         db.add_all(papers)
         db.commit()
 
-        quote = "The Transformer uses scaled dot-product attention for sequence modeling."
+        quote = (
+            "Image classification on ImageNet validation reports 90 percent top-1 accuracy "
+            "under single crop 224px."
+        )
 
         class FakeRetriever:
             def retrieve(self, _db, _project_id, _query, *, selected_paper_ids):
@@ -124,7 +127,19 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
 
             async def generate(self, _system_prompt, _user_prompt):
                 return (
-                    '{"findings":[{"text":"' + quote + '","kind":"direct","evidence_ids":["C1"]}]}'
+                    '{"findings":[{"text":"' + quote + '","kind":"direct","evidence_ids":["C1"]}],'
+                    '"benchmark_comparisons":[{"left_paper_id":"'
+                    + str(papers[0].id)
+                    + '","right_paper_id":"'
+                    + str(papers[1].id)
+                    + '","left_context":{"task":"image classification","dataset":"ImageNet",'
+                    '"split":"validation","metric":"top-1 accuracy","unit":"percent",'
+                    '"comparison_condition":"single crop 224px"},"right_context":{"task":"image '
+                    'classification","dataset":"ImageNet","split":"validation",'
+                    '"metric":"top-1 accuracy","unit":"percent","comparison_condition":"single '
+                    'crop 224px"},"left_result":"90 percent","right_result":"90 percent",'
+                    '"left_context_quote":"' + quote + '","right_context_quote":"' + quote + '",'
+                    '"left_evidence_ids":["C1"],"right_evidence_ids":["C2"]}]}'
                 )
 
             async def generate_result(self, system_prompt, user_prompt):
@@ -172,6 +187,15 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
         assert result.status is ToolStatus.SUCCEEDED
         assert result.result_type == "comparison"
         assert len(matrix["cells"]) == 2
+        synthesis = result.structured_payload["synthesis"]
+        assert synthesis["benchmark_comparisons"][0]["comparability"]["status"] == (
+            "directly_comparable"
+        )
+        assert "Reported results:" in result.display_text
+        assert {event.get("stage") for event in telemetry_events} >= {
+            "comparison.synthesize",
+            "comparison.compatibility",
+        }
         assert [citation.paper_id for citation in result.citations] == [
             papers[0].id,
             papers[1].id,

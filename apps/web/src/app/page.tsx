@@ -157,6 +157,7 @@ export default function Home() {
               typeof run.result.usage.model_name === "string"
                 ? run.result.usage.model_name
                 : null,
+            assistantResult: run.result,
             created_at: run.updated_at,
           };
           setMessages((previous) =>
