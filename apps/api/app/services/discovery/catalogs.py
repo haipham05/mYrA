@@ -20,6 +20,7 @@ MAX_PAGE = 3
 MAX_PAGE_SIZE = 25
 TIMEOUT_SECONDS = 10.0
 _ARXIV_ID = re.compile(r"(?:arxiv\.org/(?:abs|pdf)/)?([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?)", re.I)
+_OPENALEX_WORK_ID = re.compile(r"^https://openalex\.org/W[0-9]+$", re.I)
 
 
 def _bounded_query(query: str, page: int, page_size: int) -> tuple[str, int, int]:
@@ -42,13 +43,18 @@ def _abstract_from_inverted_index(value: object) -> str | None:
             for position in positions:
                 if isinstance(position, int) and 0 <= position < 100_000:
                     words[position] = token
-    return " ".join(words[index] for index in sorted(words)) or None
+    return " ".join(words[index] for index in sorted(words))[:50_000] or None
 
 
 def _openalex_candidate(item: dict[str, Any]) -> CatalogCandidate | None:
     work_id = item.get("id")
     title = item.get("title") or item.get("display_name")
-    if not isinstance(work_id, str) or not isinstance(title, str) or not title.strip():
+    if (
+        not isinstance(work_id, str)
+        or not _OPENALEX_WORK_ID.fullmatch(work_id)
+        or not isinstance(title, str)
+        or not title.strip()
+    ):
         return None
 
     authorships = item.get("authorships")
@@ -83,6 +89,8 @@ def _openalex_candidate(item: dict[str, Any]) -> CatalogCandidate | None:
         arxiv_id = match.group(1) if match else None
 
     year = item.get("publication_year")
+    open_access = item.get("open_access")
+    open_access_value = open_access.get("is_oa") if isinstance(open_access, dict) else None
     return CatalogCandidate(
         catalog="openalex",
         catalog_id=work_id[:300],
@@ -94,9 +102,7 @@ def _openalex_candidate(item: dict[str, Any]) -> CatalogCandidate | None:
         abstract=_abstract_from_inverted_index(item.get("abstract_inverted_index")),
         source_url=work_id[:4_000],
         pdf_url=pdf_url,
-        open_access=(item.get("open_access") or {}).get("is_oa")
-        if isinstance(item.get("open_access"), dict)
-        else None,
+        open_access=open_access_value if isinstance(open_access_value, bool) else None,
     )
 
 

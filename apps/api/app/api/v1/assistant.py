@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.crud.assistant_run import (
     IdempotencyConflict,
     create_assistant_run,
+    create_discovery_import_approval,
     decide_assistant_approval,
     get_assistant_run,
     list_assistant_approvals,
@@ -23,6 +24,9 @@ from app.schemas.assistant import (
     AssistantRunResult,
     AssistantRunResumeRequest,
 )
+from app.schemas.discovery import CatalogCandidate
+from app.services.discovery.download import ImportDownloadError
+from app.services.discovery.importer import import_approved_candidate
 
 router = APIRouter(tags=["assistant"])
 
@@ -35,6 +39,11 @@ def _run_response(run: AssistantRun) -> AssistantRunResponse:
             # Tool payloads also persist their execution status; public run results
             # use a compact schema and represent unknown usage as an empty object.
             payload.pop("status", None)
+            structured_payload = payload.get("structured_payload")
+            if not isinstance(structured_payload, dict):
+                structured_payload = {}
+                payload["structured_payload"] = structured_payload
+            structured_payload.setdefault("run_id", str(run.id))
             if payload.get("usage") is None:
                 payload["usage"] = {}
             result = AssistantRunResult.model_validate(payload)
@@ -135,7 +144,32 @@ def inspect_assistant_actions(
     return [_approval_response(action) for action in list_assistant_approvals(db, run_id)]
 
 
-def _decide_action(action_id: UUID, *, approve: bool, db: Session) -> AssistantApprovalResponse:
+@router.post(
+    "/runs/{run_id}/discovery-import-proposals",
+    response_model=AssistantApprovalResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def propose_discovery_import(
+    run_id: UUID,
+    candidate: CatalogCandidate,
+    db: Session = Depends(get_db),
+) -> AssistantApprovalResponse:
+    try:
+        action = create_discovery_import_approval(db, run_id, candidate)
+    except ValueError as exc:
+        code = str(exc)
+        http_status = (
+            status.HTTP_404_NOT_FOUND
+            if code == "assistant_run_not_found"
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(status_code=http_status, detail=code) from exc
+    return _approval_response(action)
+
+
+async def _decide_action(
+    action_id: UUID, *, approve: bool, db: Session
+) -> AssistantApprovalResponse:
     try:
         action = decide_assistant_approval(db, action_id, approve=approve)
     except ValueError as exc:
@@ -147,18 +181,26 @@ def _decide_action(action_id: UUID, *, approve: bool, db: Session) -> AssistantA
     response = _approval_response(action)
     if response.status in {"STALE", "EXPIRED"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=response.status)
+    if approve and action.action_type == "discovery_import" and response.status == "APPROVED":
+        try:
+            response.import_result = await import_approved_candidate(db, action)
+        except ImportDownloadError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"DISCOVERY_IMPORT_FAILED: {exc}",
+            ) from exc
     return response
 
 
 @router.post("/actions/{action_id}/approve", response_model=AssistantApprovalResponse)
-def approve_assistant_action(
+async def approve_assistant_action(
     action_id: UUID, db: Session = Depends(get_db)
 ) -> AssistantApprovalResponse:
-    return _decide_action(action_id, approve=True, db=db)
+    return await _decide_action(action_id, approve=True, db=db)
 
 
 @router.post("/actions/{action_id}/reject", response_model=AssistantApprovalResponse)
-def reject_assistant_action(
+async def reject_assistant_action(
     action_id: UUID, db: Session = Depends(get_db)
 ) -> AssistantApprovalResponse:
-    return _decide_action(action_id, approve=False, db=db)
+    return await _decide_action(action_id, approve=False, db=db)

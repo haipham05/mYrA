@@ -48,6 +48,19 @@ interface BenchmarkComparisonView {
   evidenceIds: string[];
 }
 
+interface DiscoveryCandidateView {
+  catalog: "openalex" | "arxiv";
+  title: string;
+  authors: string[];
+  publicationYear?: number;
+  doi?: string;
+  arxivId?: string;
+  abstract?: string;
+  sourceUrl: string;
+  openAccess?: boolean;
+  possibleDuplicate: boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -158,6 +171,58 @@ function readBenchmarkComparisons(payload: unknown): BenchmarkComparisonView[] {
             )
           : [],
         evidenceIds: value.evidence_ids,
+      },
+    ];
+  });
+}
+
+function readDiscoveryCandidates(payload: unknown): DiscoveryCandidateView[] {
+  if (!isRecord(payload) || !Array.isArray(payload.items)) return [];
+  return payload.items.flatMap((item): DiscoveryCandidateView[] => {
+    if (
+      !isRecord(item) ||
+      (item.catalog !== "openalex" && item.catalog !== "arxiv") ||
+      typeof item.title !== "string" ||
+      typeof item.source_url !== "string"
+    ) {
+      return [];
+    }
+    let sourceUrl: URL;
+    try {
+      sourceUrl = new URL(item.source_url);
+    } catch {
+      return [];
+    }
+    const allowedHosts =
+      item.catalog === "openalex"
+        ? new Set(["openalex.org", "www.openalex.org"])
+        : new Set(["arxiv.org", "www.arxiv.org"]);
+    if (
+      sourceUrl.protocol !== "https:" ||
+      !allowedHosts.has(sourceUrl.hostname)
+    ) {
+      return [];
+    }
+    return [
+      {
+        catalog: item.catalog,
+        title: item.title,
+        authors: Array.isArray(item.authors)
+          ? item.authors.filter(
+              (author): author is string => typeof author === "string",
+            )
+          : [],
+        publicationYear:
+          typeof item.publication_year === "number"
+            ? item.publication_year
+            : undefined,
+        doi: typeof item.doi === "string" ? item.doi : undefined,
+        arxivId: typeof item.arxiv_id === "string" ? item.arxiv_id : undefined,
+        abstract: typeof item.abstract === "string" ? item.abstract : undefined,
+        sourceUrl: sourceUrl.toString(),
+        openAccess:
+          typeof item.open_access === "boolean" ? item.open_access : undefined,
+        possibleDuplicate: item.possible_duplicate === true,
       },
     ];
   });
@@ -482,6 +547,81 @@ export default function ChatPanel({
     );
   };
 
+  const renderDiscovery = (message: Message) => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "discovery_results") return null;
+    const payload = result.structured_payload;
+    const candidates = readDiscoveryCandidates(payload);
+    const sourceErrors =
+      isRecord(payload) && isRecord(payload.source_errors)
+        ? Object.keys(payload.source_errors)
+        : [];
+    return (
+      <div className="space-y-3">
+        <p className="text-xs font-medium text-amber-800" role="note">
+          Metadata only. Abstracts are catalog descriptions, not indexed
+          full-text evidence. Nothing was downloaded or added to your library.
+        </p>
+        {sourceErrors.map((source) => (
+          <p key={source} className="text-xs text-amber-800">
+            {source} search was unavailable.
+          </p>
+        ))}
+        {candidates.map((candidate) => (
+          <article
+            key={`${candidate.catalog}:${candidate.sourceUrl}`}
+            className="rounded border border-zinc-200 p-3"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <h3 className="font-medium">{candidate.title}</h3>
+              <span className="rounded bg-zinc-100 px-2 py-0.5 text-[11px]">
+                {candidate.catalog}
+                {candidate.openAccess === true
+                  ? " · open access"
+                  : candidate.openAccess === false
+                    ? " · not open access"
+                    : " · access unknown"}
+              </span>
+            </div>
+            {(candidate.authors.length > 0 || candidate.publicationYear) && (
+              <p className="mt-1 text-xs text-zinc-600">
+                {[candidate.authors.join(", "), candidate.publicationYear]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </p>
+            )}
+            {(candidate.doi || candidate.arxivId) && (
+              <p className="mt-1 text-xs text-zinc-600">
+                {candidate.doi ? `DOI: ${candidate.doi}` : ""}
+                {candidate.doi && candidate.arxivId ? " · " : ""}
+                {candidate.arxivId ? `arXiv: ${candidate.arxivId}` : ""}
+              </p>
+            )}
+            {candidate.possibleDuplicate && (
+              <p className="mt-1 text-xs text-amber-800">
+                Possible title match in these results; inspect before importing.
+              </p>
+            )}
+            {candidate.abstract && (
+              <p className="mt-2 whitespace-pre-wrap text-xs text-zinc-700">
+                {candidate.abstract}
+              </p>
+            )}
+            <a
+              className="mt-2 inline-block text-xs text-blue-700 underline"
+              href={candidate.sourceUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open catalog record
+            </a>
+          </article>
+        ))}
+        {renderContent(message.content, message.citations)}
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
       <div className="border-b border-zinc-200 px-4 py-3">
@@ -644,7 +784,8 @@ export default function ChatPanel({
                 }`}
               >
                 {msg.role === "ASSISTANT"
-                  ? (renderComparison(msg) ??
+                  ? (renderDiscovery(msg) ??
+                    renderComparison(msg) ??
                     renderContent(msg.content, msg.citations))
                   : msg.content}
               </div>

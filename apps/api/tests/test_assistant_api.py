@@ -11,9 +11,10 @@ from app.crud.assistant_run import (
     finish_assistant_run,
 )
 from app.db.base import Base
-from app.db.models import AssistantRun, Conversation, Paper, Project
+from app.db.models import AssistantApprovalAction, AssistantRun, Conversation, Paper, Project
 from app.db.session import get_db
 from app.main import app
+from app.schemas.paper import PaperStatus, PaperUploadResponse
 
 
 @pytest.fixture
@@ -162,6 +163,68 @@ def test_approval_endpoints_expose_and_decide_persisted_proposal(assistant_api_c
     assert approved.status_code == 200
     assert approved.json()["status"] == "APPROVED"
     assert client.get(f"/api/v1/runs/{run_id}").json()["status"] == "QUEUED"
+
+
+def test_discovery_result_proposes_exact_candidate_without_importing(
+    assistant_api_context, monkeypatch
+):
+    client, session, project, conversation, paper = assistant_api_context
+
+    async def fake_import(_db, _action):
+        return PaperUploadResponse(paper_id=paper.id, job_id=paper.id, status=PaperStatus.READY)
+
+    monkeypatch.setattr("app.api.v1.assistant.import_approved_candidate", fake_import)
+    candidate = {
+        "catalog": "arxiv",
+        "catalog_id": "2401.12345v1",
+        "title": "A Catalog Candidate",
+        "authors": [],
+        "publication_year": None,
+        "doi": None,
+        "arxiv_id": "2401.12345v1",
+        "abstract": None,
+        "source_url": "https://arxiv.org/abs/2401.12345v1",
+        "pdf_url": "https://arxiv.org/pdf/2401.12345v1",
+        "open_access": True,
+        "possible_duplicate": False,
+    }
+    run = AssistantRun(
+        project_id=project.id,
+        conversation_id=conversation.id,
+        idempotency_key="discovery-result-run",
+        request_hash="a" * 64,
+        request_payload={},
+        status="SUCCEEDED",
+        intent="discover",
+        result_payload={
+            "result_type": "discovery_results",
+            "display_text": "Metadata only",
+            "structured_payload": {"items": [candidate]},
+            "citations": [],
+            "warnings": [],
+            "usage": {},
+        },
+    )
+    session.add(run)
+    session.commit()
+
+    result = client.get(f"/api/v1/runs/{run.id}")
+    proposal = client.post(f"/api/v1/runs/{run.id}/discovery-import-proposals", json=candidate)
+
+    assert result.status_code == 200
+    assert result.json()["result"]["structured_payload"]["run_id"] == str(run.id)
+    assert proposal.status_code == 201
+    assert proposal.json()["action_type"] == "discovery_import"
+    assert proposal.json()["arguments"]["candidate"] == candidate
+    assert session.query(AssistantApprovalAction).count() == 1
+    assert session.query(Paper).count() == 1
+
+    approved = client.post(f"/api/v1/actions/{proposal.json()['id']}/approve")
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+    assert approved.json()["import_result"]["paper_id"] == str(paper.id)
+    assert session.get(AssistantRun, run.id).status == "SUCCEEDED"
+    assert session.query(Paper).count() == 1
 
 
 @pytest.mark.parametrize("suffix", ["approve", "reject"])

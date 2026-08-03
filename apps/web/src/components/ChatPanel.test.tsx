@@ -318,6 +318,74 @@ describe("ChatPanel", () => {
     expect(screen.queryByRole("note")).not.toBeInTheDocument();
   });
 
+  it("renders discovery cards as metadata only and rejects unsafe catalog links", () => {
+    const result: AssistantRunResult = {
+      result_type: "discovery_results",
+      display_text: "Found two catalog records.",
+      structured_payload: {
+        metadata_only: true,
+        items: [
+          {
+            catalog: "arxiv",
+            catalog_id: "2401.12345",
+            title: "A Research Paper",
+            authors: ["Researcher"],
+            publication_year: 2024,
+            arxiv_id: "2401.12345",
+            abstract: "A short catalog abstract.",
+            source_url: "https://arxiv.org/abs/2401.12345",
+            open_access: true,
+            possible_duplicate: true,
+          },
+          {
+            catalog: "openalex",
+            catalog_id: "W2",
+            title: "Unsafe candidate",
+            source_url: "javascript:alert(1)",
+          },
+        ],
+        source_errors: { openalex: "TimeoutException" },
+      },
+      citations: [],
+      warnings: [],
+      usage: {},
+      available_actions: [],
+      artifact_ids: [],
+    };
+    const message: Message = {
+      id: "discovery-message",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: result.display_text,
+      citations: [],
+      evidence: [],
+      assistantResult: result,
+      created_at: new Date().toISOString(),
+    };
+
+    const { container } = render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByRole("note")).toHaveTextContent(/Metadata only/);
+    expect(screen.getByText("A Research Paper")).toBeInTheDocument();
+    expect(screen.getByText(/Possible title match/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/openalex search was unavailable/),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelectorAll('a[href^="https://arxiv.org/"]'),
+    ).toHaveLength(1);
+    expect(screen.queryByText("Unsafe candidate")).not.toBeInTheDocument();
+  });
+
   it("keeps normal QA answers in their existing Markdown rendering", () => {
     const { container } = render(
       <ChatPanel

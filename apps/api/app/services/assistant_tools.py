@@ -4,6 +4,7 @@ Registry entries are application code, never names or callables supplied by the 
 without an implemented service return an explicit UNAVAILABLE result.
 """
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -12,7 +13,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from app.db.models import Paper
@@ -33,6 +34,8 @@ from app.services.comparison_synthesis import (
     FindingKind,
     synthesize_comparison,
 )
+from app.services.discovery.catalogs import CatalogSearchError, search_arxiv, search_openalex
+from app.services.discovery.deduplicate import deduplicate_candidates
 from app.services.llm import (
     DeepSeekLLMProvider,
     GenerationOptions,
@@ -80,6 +83,16 @@ class DiscoverArguments(ToolArguments):
     query: str = Field(min_length=1, max_length=1000)
     year_from: int | None = Field(default=None, ge=1000, le=3000)
     year_to: int | None = Field(default=None, ge=1000, le=3000)
+
+    @model_validator(mode="after")
+    def validate_year_range(self) -> "DiscoverArguments":
+        if (
+            self.year_from is not None
+            and self.year_to is not None
+            and self.year_from > self.year_to
+        ):
+            raise ValueError("year_from must not be after year_to")
+        return self
 
 
 class NotesArguments(ToolArguments):
@@ -320,6 +333,116 @@ async def _read_paper(context: ToolContext, tool_input: AssistantToolInput) -> A
         citations=response.citations,
         evidence=[item.model_dump(mode="json") for item in response.evidence],
         usage=response.provider_usage,
+    )
+
+
+async def _discover(_context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    arguments = tool_input.arguments
+    if not isinstance(arguments, DiscoverArguments):
+        raise TypeError("discovery arguments were not validated")
+
+    with get_telemetry().stage(
+        "discovery.query",
+        input={"query": arguments.query},
+        metadata={"catalogs": ["openalex", "arxiv"], "page_size": 10, "cache": "none"},
+    ) as observation:
+        outcomes = await asyncio.gather(
+            search_openalex(arguments.query, page_size=10),
+            search_arxiv(arguments.query, page_size=10),
+            return_exceptions=True,
+        )
+
+    candidates = []
+    source_errors: dict[str, str] = {}
+    for catalog, outcome in zip(("openalex", "arxiv"), outcomes, strict=True):
+        if isinstance(outcome, CatalogSearchError):
+            source_errors[catalog] = outcome.reason
+        elif isinstance(outcome, Exception):
+            source_errors[catalog] = type(outcome).__name__
+        else:
+            candidates.extend(outcome.items)
+
+    if observation is not None:
+        observation.update(
+            metadata={
+                "outcome": "partial" if source_errors else "completed",
+                "sources_succeeded": 2 - len(source_errors),
+                "source_errors": source_errors,
+            },
+            output={"candidate_count": len(candidates)},
+        )
+
+    normalized = deduplicate_candidates(candidates)
+    if arguments.year_from is not None:
+        normalized = [
+            candidate
+            for candidate in normalized
+            if candidate.publication_year is not None
+            and candidate.publication_year >= arguments.year_from
+        ]
+    if arguments.year_to is not None:
+        normalized = [
+            candidate
+            for candidate in normalized
+            if candidate.publication_year is not None
+            and candidate.publication_year <= arguments.year_to
+        ]
+
+    with get_telemetry().stage(
+        "discovery.normalize",
+        metadata={"raw_candidate_count": len(candidates), "cache": "none"},
+    ) as observation:
+        if observation is not None:
+            observation.update(
+                metadata={
+                    "outcome": "normalized",
+                    "candidate_count": len(normalized),
+                    "possible_duplicate_count": sum(item.possible_duplicate for item in normalized),
+                    "source_errors": source_errors,
+                }
+            )
+
+    if len(source_errors) == 2:
+        return AssistantToolResult(
+            status=ToolStatus.UNAVAILABLE,
+            result_type="discovery_unavailable",
+            display_text="Academic search is temporarily unavailable from both catalogs.",
+            structured_payload={"source_errors": source_errors, "items": []},
+        )
+
+    display_lines = [
+        f"- {candidate.title}"
+        + (f" ({candidate.publication_year})" if candidate.publication_year else "")
+        + f" — {candidate.catalog}; metadata only."
+        for candidate in normalized[:10]
+    ]
+    display_text = (
+        "Found metadata-only academic candidates. Choose a result to inspect its source; "
+        "no papers were downloaded or added to your library."
+    )
+    if display_lines:
+        display_text += "\n" + "\n".join(display_lines)
+    elif not source_errors:
+        display_text = "No matching catalog records were found. No papers were downloaded."
+    else:
+        display_text = (
+            "No matching records were found in the responding catalog; another source was "
+            "unavailable. No papers were downloaded."
+        )
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="discovery_results",
+        display_text=display_text,
+        structured_payload={
+            "query": arguments.query,
+            "items": [candidate.model_dump(mode="json") for candidate in normalized[:10]],
+            "source_errors": source_errors,
+            "metadata_only": True,
+        },
+        warnings=[
+            f"{catalog} search failed ({reason})." for catalog, reason in source_errors.items()
+        ],
     )
 
 
@@ -724,7 +847,7 @@ def build_tool_registry() -> Mapping[AssistantIntent, ToolDefinition]:
         min_papers=1,
         available=True,
     )
-    register(AssistantIntent.DISCOVER, DiscoverArguments)
+    register(AssistantIntent.DISCOVER, DiscoverArguments, _discover, available=True)
     register(AssistantIntent.NOTES, NotesArguments, approval=True)
     register(AssistantIntent.REPORT, ReportArguments, min_papers=1)
     register(AssistantIntent.RESEARCH, ResearchArguments, min_papers=1)

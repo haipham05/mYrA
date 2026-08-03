@@ -17,6 +17,7 @@ from app.db.models import (
     Project,
 )
 from app.schemas.assistant import AssistantRunRequest
+from app.schemas.discovery import CatalogCandidate
 
 
 class IdempotencyConflict(ValueError):
@@ -268,6 +269,67 @@ def create_assistant_approval(
     return action
 
 
+def create_discovery_import_approval(
+    db: Session, run_id: UUID, candidate: CatalogCandidate, *, expires_in_seconds: int = 1800
+) -> AssistantApprovalAction:
+    """Persist a user's exact catalog candidate proposal without downloading it."""
+    if expires_in_seconds <= 0 or expires_in_seconds > 86_400:
+        raise ValueError("assistant_approval_expiry_out_of_range")
+    run = get_assistant_run(db, run_id)
+    if run is None:
+        raise ValueError("assistant_run_not_found")
+    if run.status != "SUCCEEDED" or run.intent != "discover" or not run.result_payload:
+        raise ValueError("discovery_run_not_available")
+
+    result = run.result_payload
+    structured = result.get("structured_payload") if isinstance(result, dict) else None
+    stored_items = structured.get("items") if isinstance(structured, dict) else None
+    candidate_payload = candidate.model_dump(mode="json")
+    if not isinstance(stored_items, list) or candidate_payload not in stored_items:
+        raise ValueError("discovery_candidate_not_in_run")
+
+    source_fingerprint = _approval_source_fingerprint(db, run.project_id, [])
+    if source_fingerprint is None:
+        raise ValueError("assistant_approval_source_missing")
+    arguments = {"paper_ids": [], "candidate": candidate_payload}
+    idempotency_key = hashlib.sha256(
+        json.dumps(
+            {
+                "run_id": str(run_id),
+                "action_type": "discovery_import",
+                "arguments": arguments,
+                "source": source_fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing = (
+        db.query(AssistantApprovalAction)
+        .filter(
+            AssistantApprovalAction.run_id == run_id,
+            AssistantApprovalAction.idempotency_key == idempotency_key,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    action = AssistantApprovalAction(
+        run_id=run_id,
+        action_type="discovery_import",
+        arguments=arguments,
+        source_fingerprint=source_fingerprint,
+        idempotency_key=idempotency_key,
+        status="PENDING",
+        expires_at=datetime.now(UTC) + timedelta(seconds=expires_in_seconds),
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
 def _approval_source_fingerprint(
     db: Session, project_id: UUID, paper_ids: list[UUID]
 ) -> str | None:
@@ -362,7 +424,9 @@ def decide_assistant_approval(
     if action.status != "PENDING":
         raise ValueError("assistant_approval_already_decided")
     run = db.query(AssistantRun).filter(AssistantRun.id == action.run_id).first()
-    if run is None or run.status != "AWAITING_APPROVAL":
+    discovery_import = action.action_type == "discovery_import"
+    required_run_status = "SUCCEEDED" if discovery_import else "AWAITING_APPROVAL"
+    if run is None or run.status != required_run_status:
         raise ValueError("assistant_run_not_awaiting_approval")
 
     now = datetime.now(UTC)
@@ -372,10 +436,11 @@ def decide_assistant_approval(
     if expiry <= now:
         action.status = "EXPIRED"
         action.decided_at = now
-        run.status = "FAILED"
-        run.safe_error = "APPROVAL_EXPIRED"
-        run.finished_at = now
-        run.updated_at = now
+        if not discovery_import:
+            run.status = "FAILED"
+            run.safe_error = "APPROVAL_EXPIRED"
+            run.finished_at = now
+            run.updated_at = now
         db.commit()
         db.refresh(action)
         return action
@@ -392,28 +457,32 @@ def decide_assistant_approval(
         if source_fingerprint != action.source_fingerprint:
             action.status = "STALE"
             action.decided_at = now
-            run.status = "FAILED"
-            run.safe_error = "APPROVAL_SOURCE_CHANGED"
-            run.finished_at = now
-            run.updated_at = now
+            if not discovery_import:
+                run.status = "FAILED"
+                run.safe_error = "APPROVAL_SOURCE_CHANGED"
+                run.finished_at = now
+                run.updated_at = now
             db.commit()
             db.refresh(action)
             return action
-        run.status = "QUEUED"
-        run.current_stage = None
-        run.result_payload = None
-        run.safe_error = None
-        run.finished_at = None
-        run.cancel_requested = False
-        run.lease_owner = None
-        run.lease_expires_at = None
+        if not discovery_import:
+            run.status = "QUEUED"
+            run.current_stage = None
+            run.result_payload = None
+            run.safe_error = None
+            run.finished_at = None
+            run.cancel_requested = False
+            run.lease_owner = None
+            run.lease_expires_at = None
     else:
-        run.status = "CANCELLED"
-        run.safe_error = "ACTION_REJECTED"
-        run.finished_at = now
+        if not discovery_import:
+            run.status = "CANCELLED"
+            run.safe_error = "ACTION_REJECTED"
+            run.finished_at = now
     action.status = desired_status
     action.decided_at = now
-    run.updated_at = now
+    if not discovery_import:
+        run.updated_at = now
     db.commit()
     db.refresh(action)
     return action

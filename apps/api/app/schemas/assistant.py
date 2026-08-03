@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.schemas.chat import PaperScope
 from app.schemas.evidence import Citation
+from app.schemas.paper import PaperUploadResponse
 
 
 class AssistantIntent(StrEnum):
@@ -188,6 +189,7 @@ class AssistantApprovalResponse(BaseModel):
     status: str = Field(min_length=1, max_length=24)
     expires_at: datetime
     decided_at: datetime | None = None
+    import_result: PaperUploadResponse | None = None
 
 
 class AssistantRunResumeRequest(BaseModel):

@@ -126,3 +126,12 @@ def test_search_inputs_are_bounded(query: str, page: int, page_size: int):
         from app.services.discovery.catalogs import _bounded_query
 
         _bounded_query(query, page, page_size)
+
+
+def test_openalex_ignores_untrusted_work_ids_and_bounds_abstracts():
+    from app.services.discovery.catalogs import _abstract_from_inverted_index, _openalex_candidate
+
+    item = {"id": "https://attacker.invalid/W1", "title": "Unexpected source"}
+    assert _openalex_candidate(item) is None
+    long_index = {"word": list(range(50_100))}
+    assert len(_abstract_from_inverted_index(long_index) or "") <= 50_000
