@@ -15,6 +15,7 @@ from app.db.models import AssistantApprovalAction, AssistantRun, Conversation, P
 from app.db.session import get_db
 from app.main import app
 from app.schemas.paper import PaperStatus, PaperUploadResponse
+from app.services.discovery.download import ImportDownloadError
 
 
 @pytest.fixture
@@ -169,8 +170,13 @@ def test_discovery_result_proposes_exact_candidate_without_importing(
     assistant_api_context, monkeypatch
 ):
     client, session, project, conversation, paper = assistant_api_context
+    import_calls = 0
 
     async def fake_import(_db, _action):
+        nonlocal import_calls
+        import_calls += 1
+        if import_calls == 1:
+            raise ImportDownloadError("temporary source failure")
         return PaperUploadResponse(paper_id=paper.id, job_id=paper.id, status=PaperStatus.READY)
 
     monkeypatch.setattr("app.api.v1.assistant.import_approved_candidate", fake_import)
@@ -219,10 +225,19 @@ def test_discovery_result_proposes_exact_candidate_without_importing(
     assert session.query(AssistantApprovalAction).count() == 1
     assert session.query(Paper).count() == 1
 
+    failed = client.post(f"/api/v1/actions/{proposal.json()['id']}/approve")
+    assert failed.status_code == 502
+    assert session.query(AssistantApprovalAction).one().status == "PENDING"
+
     approved = client.post(f"/api/v1/actions/{proposal.json()['id']}/approve")
     assert approved.status_code == 200
     assert approved.json()["status"] == "APPROVED"
     assert approved.json()["import_result"]["paper_id"] == str(paper.id)
+    repeated = client.post(f"/api/v1/actions/{proposal.json()['id']}/approve")
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "APPROVED"
+    assert repeated.json()["import_result"] is None
+    assert import_calls == 2
     assert session.get(AssistantRun, run.id).status == "SUCCEEDED"
     assert session.query(Paper).count() == 1
 

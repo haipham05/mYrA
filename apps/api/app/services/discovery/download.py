@@ -19,6 +19,33 @@ MAX_REDIRECTS = 3
 DOWNLOAD_TIMEOUT_SECONDS = 20.0
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _ALLOWED_CONTENT_TYPES = {"application/pdf", "application/octet-stream"}
+_SCHOLARLY_HOST_SUFFIXES = (
+    "acm.org",
+    "annualreviews.org",
+    "aps.org",
+    "arxiv.org",
+    "biorxiv.org",
+    "cambridge.org",
+    "cell.com",
+    "elsevier.com",
+    "europepmc.org",
+    "frontiersin.org",
+    "ieee.org",
+    "iop.org",
+    "mdpi.com",
+    "medrxiv.org",
+    "nature.com",
+    "ncbi.nlm.nih.gov",
+    "oup.com",
+    "pnas.org",
+    "plos.org",
+    "royalsocietypublishing.org",
+    "sagepub.com",
+    "sciencedirect.com",
+    "springer.com",
+    "tandfonline.com",
+    "wiley.com",
+)
 
 
 class ImportDownloadError(ValueError):
@@ -55,8 +82,14 @@ def _validate_https_public_url(url: str, resolve_host: Callable[[str], list[str]
     ):
         raise ImportDownloadError("download URL must be a public HTTPS URL")
 
+    hostname = parsed.hostname.rstrip(".").casefold()
+    if not any(
+        hostname == suffix or hostname.endswith(f".{suffix}") for suffix in _SCHOLARLY_HOST_SUFFIXES
+    ):
+        raise ImportDownloadError("download host is not an approved scholarly source")
+
     try:
-        addresses = resolve_host(parsed.hostname)
+        addresses = resolve_host(hostname)
     except ImportDownloadError:
         raise
     except Exception as exc:

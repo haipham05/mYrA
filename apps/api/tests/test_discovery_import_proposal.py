@@ -78,9 +78,10 @@ def test_import_approval_does_not_rerun_or_mutate_discovery_run(proposal_db):
     db, _project, run, candidate = proposal_db
     action = create_discovery_import_approval(db, run.id, candidate)
 
-    decided = decide_assistant_approval(db, action.id, approve=True)
+    decided, transitioned = decide_assistant_approval(db, action.id, approve=True)
 
     assert decided.status == "APPROVED"
+    assert transitioned is True
     assert run.status == "SUCCEEDED"
     assert run.result_payload["result_type"] == "discovery_results"
     assert db.query(Paper).count() == 0
@@ -92,9 +93,10 @@ def test_changed_project_corpus_marks_pending_import_proposal_stale(proposal_db)
     project.corpus_revision += 1
     db.commit()
 
-    decided = decide_assistant_approval(db, action.id, approve=True)
+    decided, transitioned = decide_assistant_approval(db, action.id, approve=True)
 
     assert decided.status == "STALE"
+    assert transitioned is False
     assert run.status == "SUCCEEDED"
     assert db.query(Paper).count() == 0
 
@@ -103,8 +105,9 @@ def test_rejection_leaves_discovery_run_complete(proposal_db):
     db, _project, run, candidate = proposal_db
     action = create_discovery_import_approval(db, run.id, candidate)
 
-    decided = decide_assistant_approval(db, action.id, approve=False)
+    decided, transitioned = decide_assistant_approval(db, action.id, approve=False)
 
     assert decided.status == "REJECTED"
+    assert transitioned is True
     assert run.status == "SUCCEEDED"
     assert db.query(Paper).count() == 0

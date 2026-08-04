@@ -762,6 +762,50 @@ export default function Home() {
     }
   };
 
+  const handleProposeDiscoveryImport = async (
+    runId: string,
+    candidate: Record<string, unknown>,
+  ): Promise<AssistantApprovalResponse> => {
+    const response = await fetch(
+      `${apiUrl}/api/v1/runs/${runId}/discovery-import-proposals`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(candidate),
+      },
+    );
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(
+        typeof body.detail === "string"
+          ? body.detail
+          : "Could not prepare the import proposal.",
+      );
+    }
+    return body as AssistantApprovalResponse;
+  };
+
+  const handleDecideDiscoveryImport = async (
+    actionId: string,
+    approve: boolean,
+  ): Promise<AssistantApprovalResponse> => {
+    const response = await fetch(
+      `${apiUrl}/api/v1/actions/${actionId}/${approve ? "approve" : "reject"}`,
+      { method: "POST" },
+    );
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(
+        typeof body.detail === "string"
+          ? body.detail
+          : "The import proposal could not be updated.",
+      );
+    }
+    const action = body as AssistantApprovalResponse;
+    if (action.import_result) await refreshPapers();
+    return action;
+  };
+
   // Handle project selection with immediate state clearing
   const handleSelectProject = (project: Project | null) => {
     if (selectedProject?.id === project?.id) return;
@@ -1050,6 +1094,8 @@ export default function Home() {
                   onCancelRun={handleCancelRun}
                   onResumeRun={handleResumeRun}
                   onDecideAction={handleDecideAction}
+                  onProposeDiscoveryImport={handleProposeDiscoveryImport}
+                  onDecideDiscoveryImport={handleDecideDiscoveryImport}
                   sourceSelection={activeSourceSelection}
                   onClearSourceSelection={() => setSourceSelection(null)}
                 />

@@ -8,6 +8,7 @@ import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import type { PhrasingContent, Root } from "mdast";
 import ConversationNavigator from "@/components/ConversationNavigator";
+import DiscoveryImportControls from "@/components/DiscoveryImportControls";
 import type {
   AssistantApprovalResponse,
   AssistantIntent,
@@ -57,8 +58,10 @@ interface DiscoveryCandidateView {
   arxivId?: string;
   abstract?: string;
   sourceUrl: string;
+  pdfUrl?: string;
   openAccess?: boolean;
   possibleDuplicate: boolean;
+  candidatePayload: Record<string, unknown>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -203,6 +206,17 @@ function readDiscoveryCandidates(payload: unknown): DiscoveryCandidateView[] {
     ) {
       return [];
     }
+    let pdfUrl: string | undefined;
+    if (typeof item.pdf_url === "string") {
+      try {
+        const parsedPdfUrl = new URL(item.pdf_url);
+        if (parsedPdfUrl.protocol === "https:" && parsedPdfUrl.hostname) {
+          pdfUrl = parsedPdfUrl.toString();
+        }
+      } catch {
+        pdfUrl = undefined;
+      }
+    }
     return [
       {
         catalog: item.catalog,
@@ -220,9 +234,11 @@ function readDiscoveryCandidates(payload: unknown): DiscoveryCandidateView[] {
         arxivId: typeof item.arxiv_id === "string" ? item.arxiv_id : undefined,
         abstract: typeof item.abstract === "string" ? item.abstract : undefined,
         sourceUrl: sourceUrl.toString(),
+        pdfUrl,
         openAccess:
           typeof item.open_access === "boolean" ? item.open_access : undefined,
         possibleDuplicate: item.possible_duplicate === true,
+        candidatePayload: item,
       },
     ];
   });
@@ -250,6 +266,14 @@ interface ChatPanelProps {
   onCancelRun?: (runId: string) => Promise<void>;
   onResumeRun?: (runId: string, input: string) => Promise<void>;
   onDecideAction?: (actionId: string, approve: boolean) => Promise<void>;
+  onProposeDiscoveryImport?: (
+    runId: string,
+    candidate: Record<string, unknown>,
+  ) => Promise<AssistantApprovalResponse>;
+  onDecideDiscoveryImport?: (
+    actionId: string,
+    approve: boolean,
+  ) => Promise<AssistantApprovalResponse>;
   sourceSelection?: SourceSelection | null;
   onClearSourceSelection?: () => void;
 }
@@ -276,6 +300,8 @@ export default function ChatPanel({
   onCancelRun,
   onResumeRun,
   onDecideAction,
+  onProposeDiscoveryImport,
+  onDecideDiscoveryImport,
   sourceSelection,
   onClearSourceSelection,
 }: ChatPanelProps) {
@@ -552,6 +578,10 @@ export default function ChatPanel({
     if (result?.result_type !== "discovery_results") return null;
     const payload = result.structured_payload;
     const candidates = readDiscoveryCandidates(payload);
+    const runId =
+      isRecord(payload) && typeof payload.run_id === "string"
+        ? payload.run_id
+        : null;
     const sourceErrors =
       isRecord(payload) && isRecord(payload.source_errors)
         ? Object.keys(payload.source_errors)
@@ -615,6 +645,17 @@ export default function ChatPanel({
             >
               Open catalog record
             </a>
+            {onProposeDiscoveryImport && onDecideDiscoveryImport && (
+              <DiscoveryImportControls
+                runId={runId}
+                candidate={candidate.candidatePayload}
+                pdfUrl={candidate.pdfUrl}
+                openAccess={candidate.openAccess}
+                disabled={isLoading}
+                onPropose={onProposeDiscoveryImport}
+                onDecide={onDecideDiscoveryImport}
+              />
+            )}
           </article>
         ))}
         {renderContent(message.content, message.citations)}

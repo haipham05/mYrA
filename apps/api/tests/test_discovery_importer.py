@@ -52,7 +52,8 @@ def import_context(tmp_path):
         db.add(run)
         db.commit()
         action = create_discovery_import_approval(db, run.id, candidate)
-        action = decide_assistant_approval(db, action.id, approve=True)
+        action, transitioned = decide_assistant_approval(db, action.id, approve=True)
+        assert transitioned is True
         yield db, project, candidate, action
     engine.dispose()
 

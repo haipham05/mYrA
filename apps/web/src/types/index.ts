@@ -185,6 +185,11 @@ export interface AssistantApprovalResponse {
   status: string;
   expires_at: string;
   decided_at: string | null;
+  import_result?: {
+    paper_id: string;
+    job_id: string;
+    status: PaperStatus;
+  } | null;
 }
 
 export interface Conversation {

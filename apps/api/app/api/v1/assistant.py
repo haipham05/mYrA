@@ -171,24 +171,38 @@ async def _decide_action(
     action_id: UUID, *, approve: bool, db: Session
 ) -> AssistantApprovalResponse:
     try:
-        action = decide_assistant_approval(db, action_id, approve=approve)
+        decision = decide_assistant_approval(db, action_id, approve=approve)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    if action is None:
+    if decision is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Assistant approval action not found"
         )
+    action, transitioned = decision
     response = _approval_response(action)
     if response.status in {"STALE", "EXPIRED"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=response.status)
-    if approve and action.action_type == "discovery_import" and response.status == "APPROVED":
+    if (
+        approve
+        and transitioned
+        and action.action_type == "discovery_import"
+        and response.status == "APPROVED"
+    ):
         try:
             response.import_result = await import_approved_candidate(db, action)
         except ImportDownloadError as exc:
+            action.status = "PENDING"
+            action.decided_at = None
+            db.commit()
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"DISCOVERY_IMPORT_FAILED: {exc}",
             ) from exc
+        except Exception:
+            action.status = "PENDING"
+            action.decided_at = None
+            db.commit()
+            raise
     return response
 
 

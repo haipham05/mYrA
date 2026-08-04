@@ -908,6 +908,27 @@ def _consolidate_memory_candidate(
     for mem in existing_active:
         if mem.content.strip().lower() == safe_content.strip().lower():
             # Exact duplicate: return existing memory (idempotent, skips embedding call)
+            for source in candidate.sources:
+                if source.message_id is None:
+                    continue
+                has_source = (
+                    db.query(MemorySource.id)
+                    .filter(
+                        MemorySource.memory_id == mem.id,
+                        MemorySource.source_type == MemorySourceType.MESSAGE.value,
+                        MemorySource.message_id == source.message_id,
+                    )
+                    .first()
+                )
+                if has_source is None:
+                    db.add(
+                        MemorySource(
+                            memory_id=mem.id,
+                            source_type=MemorySourceType.MESSAGE.value,
+                            message_id=source.message_id,
+                        )
+                    )
+                    db.commit()
             return mem
 
     if embedding is None:
@@ -984,10 +1005,22 @@ def _capture_conversation_memories(
     if not messages:
         return []
 
+    processed_message_ids = {
+        message_id
+        for (message_id,) in (
+            db.query(MemorySource.message_id)
+            .join(Memory, Memory.id == MemorySource.memory_id)
+            .filter(
+                Memory.project_id == project_id,
+                MemorySource.message_id.is_not(None),
+            )
+            .all()
+        )
+    }
     created_memories: list[Memory] = []
     for msg in messages:
         # Only capture decisions and preferences from USER messages
-        if msg.role.upper() != "USER":
+        if msg.role.upper() != "USER" or msg.id in processed_message_ids:
             continue
         candidates = extract_candidates_from_text(msg.content, message_id=msg.id)
         for cand in candidates:

@@ -408,7 +408,7 @@ def get_valid_approved_assistant_action(
 
 def decide_assistant_approval(
     db: Session, action_id: UUID, *, approve: bool
-) -> AssistantApprovalAction | None:
+) -> tuple[AssistantApprovalAction, bool] | None:
     """Approve the exact pending proposal only while its source fingerprint is current."""
     action = (
         db.query(AssistantApprovalAction)
@@ -420,7 +420,7 @@ def decide_assistant_approval(
         return None
     desired_status = "APPROVED" if approve else "REJECTED"
     if action.status == desired_status:
-        return action
+        return action, False
     if action.status != "PENDING":
         raise ValueError("assistant_approval_already_decided")
     run = db.query(AssistantRun).filter(AssistantRun.id == action.run_id).first()
@@ -443,7 +443,7 @@ def decide_assistant_approval(
             run.updated_at = now
         db.commit()
         db.refresh(action)
-        return action
+        return action, False
 
     if approve:
         raw_paper_ids = action.arguments.get("paper_ids", [])
@@ -464,7 +464,7 @@ def decide_assistant_approval(
                 run.updated_at = now
             db.commit()
             db.refresh(action)
-            return action
+            return action, False
         if not discovery_import:
             run.status = "QUEUED"
             run.current_stage = None
@@ -485,7 +485,7 @@ def decide_assistant_approval(
         run.updated_at = now
     db.commit()
     db.refresh(action)
-    return action
+    return action, True
 
 
 def claim_next_assistant_run(

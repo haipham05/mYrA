@@ -1,10 +1,17 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import ChatPanel from "./ChatPanel";
 import type {
   AssistantRunResponse,
   AssistantRunResult,
+  AssistantApprovalResponse,
   Citation,
   Message,
 } from "@/types";
@@ -384,6 +391,95 @@ describe("ChatPanel", () => {
       container.querySelectorAll('a[href^="https://arxiv.org/"]'),
     ).toHaveLength(1);
     expect(screen.queryByText("Unsafe candidate")).not.toBeInTheDocument();
+  });
+
+  it("requires a separate approval click before importing a discovery result", async () => {
+    const candidate = {
+      catalog: "arxiv",
+      catalog_id: "2401.12345v1",
+      title: "A Research Paper",
+      authors: [],
+      publication_year: 2024,
+      doi: null,
+      arxiv_id: "2401.12345v1",
+      abstract: "Catalog description.",
+      source_url: "https://arxiv.org/abs/2401.12345v1",
+      pdf_url: "https://arxiv.org/pdf/2401.12345v1",
+      open_access: true,
+      possible_duplicate: false,
+    };
+    const pending: AssistantApprovalResponse = {
+      id: "action-1",
+      run_id: "run-1",
+      action_type: "discovery_import",
+      arguments: { candidate },
+      source_fingerprint: "a".repeat(64),
+      status: "PENDING",
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      decided_at: null,
+    };
+    const onProposeDiscoveryImport = vi.fn().mockResolvedValue(pending);
+    const onDecideDiscoveryImport = vi.fn().mockResolvedValue({
+      ...pending,
+      status: "APPROVED",
+      import_result: {
+        paper_id: "paper-imported",
+        job_id: "job-imported",
+        status: "PROCESSING",
+      },
+    });
+    const message: Message = {
+      id: "discovery-import-message",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "Found a candidate.",
+      citations: [],
+      evidence: [],
+      assistantResult: {
+        result_type: "discovery_results",
+        display_text: "Found a candidate.",
+        structured_payload: {
+          run_id: "run-1",
+          items: [candidate],
+          source_errors: {},
+          metadata_only: true,
+        },
+        citations: [],
+        warnings: [],
+        usage: {},
+        available_actions: [],
+        artifact_ids: [],
+      },
+      created_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+        onProposeDiscoveryImport={onProposeDiscoveryImport}
+        onDecideDiscoveryImport={onDecideDiscoveryImport}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Review import" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Confirm download from arxiv.org/),
+      ).toBeInTheDocument(),
+    );
+    expect(onProposeDiscoveryImport).toHaveBeenCalledWith("run-1", candidate);
+    fireEvent.click(screen.getByRole("button", { name: "Approve and import" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("Approved; paper queued for ingestion."),
+      ).toBeInTheDocument(),
+    );
+    expect(onDecideDiscoveryImport).toHaveBeenCalledWith("action-1", true);
   });
 
   it("keeps normal QA answers in their existing Markdown rendering", () => {

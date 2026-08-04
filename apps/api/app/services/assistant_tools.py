@@ -24,7 +24,9 @@ from app.schemas.comparison import (
     ComparisonDimension,
     ComparisonRequest,
 )
+from app.schemas.discovery import CatalogSearchResult
 from app.schemas.evidence import Citation
+from app.services.cache import get_cache
 from app.services.chat_service import ChatService
 from app.services.claim_verification import ClaimAssessment, ClaimSource, verify_claim
 from app.services.comparison_matrix import build_comparison_matrix
@@ -159,6 +161,42 @@ class ToolContext:
 
 
 ToolHandler = Callable[[ToolContext, AssistantToolInput], Awaitable[AssistantToolResult]]
+
+
+async def _cached_catalog_search(catalog: str, query: str) -> tuple[CatalogSearchResult, str]:
+    """Cache only public catalog metadata; cache failures fall through to search."""
+    searcher = search_openalex if catalog == "openalex" else search_arxiv
+    normalized_query = " ".join(query.split())
+    cache = get_cache()
+    key = f"discovery:v1:{catalog}:{normalized_query.casefold()}:1:10"
+
+    def validate(value: object) -> CatalogSearchResult:
+        result = CatalogSearchResult.model_validate(value)
+        if (
+            result.catalog != catalog
+            or result.query != normalized_query
+            or result.page != 1
+            or result.page_size != 10
+        ):
+            raise ValueError("cached catalog result did not match its key")
+        return result
+
+    cached = cache.get(key, validate)
+    if cached is not None:
+        return cached, "hit"
+
+    errors_before = cache.stats.errors
+    result = await searcher(query, page_size=10)
+    cache.set(key, result.model_dump(mode="json"), ttl_seconds=600)
+    errors_after = cache.stats.errors
+    cache_status = (
+        "disabled"
+        if not cache.enabled
+        else "error_recomputed"
+        if errors_after != errors_before
+        else "miss"
+    )
+    return result, cache_status
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,23 +382,26 @@ async def _discover(_context: ToolContext, tool_input: AssistantToolInput) -> As
     with get_telemetry().stage(
         "discovery.query",
         input={"query": arguments.query},
-        metadata={"catalogs": ["openalex", "arxiv"], "page_size": 10, "cache": "none"},
+        metadata={"catalogs": ["openalex", "arxiv"], "page_size": 10},
     ) as observation:
         outcomes = await asyncio.gather(
-            search_openalex(arguments.query, page_size=10),
-            search_arxiv(arguments.query, page_size=10),
+            _cached_catalog_search("openalex", arguments.query),
+            _cached_catalog_search("arxiv", arguments.query),
             return_exceptions=True,
         )
 
     candidates = []
     source_errors: dict[str, str] = {}
+    cache_status: dict[str, str] = {}
     for catalog, outcome in zip(("openalex", "arxiv"), outcomes, strict=True):
         if isinstance(outcome, CatalogSearchError):
             source_errors[catalog] = outcome.reason
         elif isinstance(outcome, Exception):
             source_errors[catalog] = type(outcome).__name__
         else:
-            candidates.extend(outcome.items)
+            result, status = outcome
+            candidates.extend(result.items)
+            cache_status[catalog] = status
 
     if observation is not None:
         observation.update(
@@ -368,6 +409,7 @@ async def _discover(_context: ToolContext, tool_input: AssistantToolInput) -> As
                 "outcome": "partial" if source_errors else "completed",
                 "sources_succeeded": 2 - len(source_errors),
                 "source_errors": source_errors,
+                "cache_status": cache_status,
             },
             output={"candidate_count": len(candidates)},
         )
@@ -390,7 +432,7 @@ async def _discover(_context: ToolContext, tool_input: AssistantToolInput) -> As
 
     with get_telemetry().stage(
         "discovery.normalize",
-        metadata={"raw_candidate_count": len(candidates), "cache": "none"},
+        metadata={"raw_candidate_count": len(candidates), "cache_status": cache_status},
     ) as observation:
         if observation is not None:
             observation.update(
@@ -399,6 +441,7 @@ async def _discover(_context: ToolContext, tool_input: AssistantToolInput) -> As
                     "candidate_count": len(normalized),
                     "possible_duplicate_count": sum(item.possible_duplicate for item in normalized),
                     "source_errors": source_errors,
+                    "cache_status": cache_status,
                 }
             )
 

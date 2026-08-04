@@ -19,6 +19,7 @@ from app.db.models import (
     ChunkElement,
     Conversation,
     Memory,
+    MemoryAudit,
     MemorySource,
     Message,
     Paper,
@@ -921,7 +922,6 @@ def test_conversation_capture_and_scoped_retrieval(db: Session) -> None:
     # First item should be the ViT decision
     assert any("vit" in m.content.lower() for m in retrieved_a)
     assert not any("resnet50 for image processing" in m.content.lower() for m in retrieved_a)
-
     # Verify last_accessed_at was updated
     for m in retrieved_a:
         assert m.last_accessed_at is not None
@@ -930,6 +930,56 @@ def test_conversation_capture_and_scoped_retrieval(db: Session) -> None:
     formatted = format_memories_for_prompt(retrieved_a)
     assert "PROJECT DECISIONS & USER PREFERENCES" in formatted
     assert "ViT" in formatted
+
+
+def test_repeated_capture_does_not_resurrect_superseded_decisions(db: Session) -> None:
+    project = Project(name="Memory capture idempotency")
+    db.add(project)
+    db.flush()
+    conversation = Conversation(project_id=project.id, title="Decisions")
+    db.add(conversation)
+    db.flush()
+    db.add_all(
+        [
+            Message(
+                conversation_id=conversation.id,
+                role="user",
+                content="We decided to use BGE for image classification.",
+            ),
+            Message(
+                conversation_id=conversation.id,
+                role="user",
+                content="We decided to use ViT for image classification.",
+            ),
+        ]
+    )
+    db.commit()
+
+    captured = capture_conversation_memories(db, project.id, conversation.id)
+    assert len(captured) == 2
+    previous, current = (
+        db.query(Memory)
+        .filter(Memory.project_id == project.id)
+        .order_by(Memory.created_at.asc())
+        .all()
+    )
+    assert previous.status == MemoryStatus.SUPERSEDED
+    assert "BGE" in previous.content
+    assert current.status == MemoryStatus.ACTIVE
+    assert "ViT" in current.content
+    memory_count = db.query(Memory).filter(Memory.project_id == project.id).count()
+    audit_count = db.query(MemoryAudit).join(Memory).filter(Memory.project_id == project.id).count()
+
+    assert capture_conversation_memories(db, project.id, conversation.id) == []
+    assert db.query(Memory).filter(Memory.project_id == project.id).count() == memory_count
+    assert (
+        db.query(MemoryAudit).join(Memory).filter(Memory.project_id == project.id).count()
+        == audit_count
+    )
+    db.refresh(previous)
+    db.refresh(current)
+    assert previous.status == MemoryStatus.SUPERSEDED
+    assert current.status == MemoryStatus.ACTIVE
 
 
 def test_paper_memory_source_resolution(db: Session) -> None:

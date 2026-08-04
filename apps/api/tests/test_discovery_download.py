@@ -7,7 +7,7 @@ from app.schemas.discovery import CatalogCandidate
 from app.services.discovery.download import ImportDownloadError, download_open_access_pdf
 
 
-def _candidate(url: str = "https://repo.example/paper.pdf", **values) -> CatalogCandidate:
+def _candidate(url: str = "https://arxiv.org/pdf/2401.12345.pdf", **values) -> CatalogCandidate:
     candidate = {
         "catalog": "arxiv",
         "catalog_id": "2401.12345",
@@ -29,7 +29,7 @@ async def test_downloads_and_hashes_a_bounded_pdf():
     pdf = b"%PDF-1.7\nsmall fixture"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "repo.example"
+        assert request.url.host == "arxiv.org"
         return httpx.Response(200, headers={"content-type": "application/pdf"}, content=pdf)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -39,7 +39,7 @@ async def test_downloads_and_hashes_a_bounded_pdf():
 
     assert result.data == pdf
     assert result.sha256 == hashlib.sha256(pdf).hexdigest()
-    assert result.final_url == "https://repo.example/paper.pdf"
+    assert result.final_url == "https://arxiv.org/pdf/2401.12345.pdf"
 
 
 @pytest.mark.anyio
@@ -51,13 +51,32 @@ async def test_private_redirect_is_rejected_before_following_it():
         return httpx.Response(302, headers={"location": "http://127.0.0.1/admin"})
 
     def resolver(host: str) -> list[str]:
-        return ["93.184.216.34"] if host == "repo.example" else ["127.0.0.1"]
+        return ["93.184.216.34"] if host == "arxiv.org" else ["127.0.0.1"]
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(ImportDownloadError, match="public HTTPS"):
             await download_open_access_pdf(_candidate(), client=client, resolve_host=resolver)
 
-    assert requested_hosts == ["repo.example"]
+    assert requested_hosts == ["arxiv.org"]
+
+
+@pytest.mark.anyio
+async def test_unapproved_public_host_is_rejected_before_request():
+    requested = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requested
+        requested = True
+        return httpx.Response(200, content=b"%PDF-test")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ImportDownloadError, match="approved scholarly source"):
+            await download_open_access_pdf(
+                _candidate("https://example.com/paper.pdf"),
+                client=client,
+                resolve_host=_public_resolver,
+            )
+    assert requested is False
 
 
 @pytest.mark.anyio

@@ -338,9 +338,12 @@ def _pending_approval(session: Session):
 
 def test_approval_decision_is_idempotent_and_requeues_exact_proposal(session: Session) -> None:
     project, run, action = _pending_approval(session)
-    approved = decide_assistant_approval(session, action.id, approve=True)
+    approved, transitioned = decide_assistant_approval(session, action.id, approve=True)
     assert approved is not None and approved.status == "APPROVED"
-    assert decide_assistant_approval(session, action.id, approve=True).id == action.id
+    assert transitioned is True
+    repeated, repeated_transition = decide_assistant_approval(session, action.id, approve=True)
+    assert repeated.id == action.id
+    assert repeated_transition is False
     session.refresh(run)
     assert run.status == "QUEUED"
     assert run.result_payload is None
@@ -369,8 +372,9 @@ def test_approval_decision_is_idempotent_and_requeues_exact_proposal(session: Se
 
 def test_rejection_cancels_without_queueing_mutation(session: Session) -> None:
     _, run, action = _pending_approval(session)
-    rejected = decide_assistant_approval(session, action.id, approve=False)
+    rejected, transitioned = decide_assistant_approval(session, action.id, approve=False)
     assert rejected is not None and rejected.status == "REJECTED"
+    assert transitioned is True
     session.refresh(run)
     assert run.status == "CANCELLED"
     assert run.safe_error == "ACTION_REJECTED"
@@ -382,8 +386,9 @@ def test_approval_refuses_changed_source_and_expires_stale_proposal(session: Ses
     project, run, action = _pending_approval(session)
     project.corpus_revision += 1
     session.commit()
-    stale = decide_assistant_approval(session, action.id, approve=True)
+    stale, transitioned = decide_assistant_approval(session, action.id, approve=True)
     assert stale is not None and stale.status == "STALE"
+    assert transitioned is False
     session.refresh(run)
     assert run.status == "FAILED"
     assert run.safe_error == "APPROVAL_SOURCE_CHANGED"
@@ -391,8 +396,9 @@ def test_approval_refuses_changed_source_and_expires_stale_proposal(session: Ses
     _, expired_run, expired_action = _pending_approval(session)
     expired_action.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     session.commit()
-    expired = decide_assistant_approval(session, expired_action.id, approve=True)
+    expired, transitioned = decide_assistant_approval(session, expired_action.id, approve=True)
     assert expired is not None and expired.status == "EXPIRED"
+    assert transitioned is False
     session.refresh(expired_run)
     assert expired_run.status == "FAILED"
     assert expired_run.safe_error == "APPROVAL_EXPIRED"
