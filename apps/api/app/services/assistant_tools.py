@@ -16,6 +16,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
+from app.crud.memory import (
+    MemoryVersionConflictError,
+    create_memory,
+    get_memory,
+    list_memories,
+    update_memory,
+)
 from app.db.models import Paper
 from app.observability.telemetry import get_telemetry
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
@@ -26,6 +33,14 @@ from app.schemas.comparison import (
 )
 from app.schemas.discovery import CatalogSearchResult
 from app.schemas.evidence import Citation
+from app.schemas.memory import (
+    MemoryCreate,
+    MemorySourceCreate,
+    MemorySourceType,
+    MemoryStatus,
+    MemoryType,
+    MemoryUpdate,
+)
 from app.services.cache import get_cache
 from app.services.chat_service import ChatService
 from app.services.claim_verification import ClaimAssessment, ClaimSource, verify_claim
@@ -49,6 +64,7 @@ from app.services.reading_brief import (
     READING_BRIEF_GUIDANCE,
     parse_reading_brief_sections,
 )
+from app.services.research_report import REPORT_GUIDANCE, report_source_manifest
 from app.services.source_resolution import (
     build_selected_passage_evidence,
     resolve_exact_source_anchor,
@@ -101,6 +117,21 @@ class NotesArguments(ToolArguments):
     action: Literal["list", "propose_save", "propose_update", "propose_archive"]
     content: str | None = Field(default=None, max_length=4000)
     title: str | None = Field(default=None, max_length=200)
+    memory_id: UUID | None = None
+    expected_version: int | None = Field(default=None, ge=1)
+    search: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_note_action(self) -> "NotesArguments":
+        if self.action == "propose_save" and not (self.title or self.content):
+            raise ValueError("a note title or content is required")
+        if self.action in {"propose_update", "propose_archive"} and (
+            self.memory_id is None or self.expected_version is None
+        ):
+            raise ValueError("an existing note ID and expected version are required")
+        if self.action == "propose_update" and not (self.title or self.content):
+            raise ValueError("a note title or content is required for an update")
+        return self
 
 
 class ReportArguments(ToolArguments):
@@ -243,6 +274,140 @@ async def _clarify(_context: ToolContext, tool_input: AssistantToolInput) -> Ass
     )
 
 
+def _note_payload(memory: Any) -> dict[str, Any]:
+    return {
+        "id": str(memory.id),
+        "type": memory.memory_type,
+        "title": memory.title,
+        "content": memory.content,
+        "status": memory.status,
+        "version": memory.version,
+        "sources": [
+            {
+                "source_type": source.source_type,
+                "paper_id": str(source.paper_id) if source.paper_id else None,
+                "page_number": source.page_number,
+                "quote": source.quote_text,
+                "document_sha256": source.document_sha256,
+                "message_id": str(source.message_id) if source.message_id else None,
+            }
+            for source in memory.sources
+        ],
+    }
+
+
+async def _notes(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    arguments = tool_input.arguments
+    if not isinstance(arguments, NotesArguments):
+        raise TypeError("note arguments were not validated")
+
+    project_id = tool_input.request.project_id
+    if arguments.action == "list":
+        memories, total = list_memories(
+            context.db,
+            project_id=project_id,
+            status=MemoryStatus.ACTIVE,
+            search=arguments.search,
+            limit=10,
+        )
+        return AssistantToolResult(
+            status=ToolStatus.SUCCEEDED,
+            result_type="notes_list",
+            display_text=(
+                f"Found {total} active research note(s)."
+                if memories
+                else "No active research notes found."
+            ),
+            structured_payload={
+                "items": [_note_payload(memory) for memory in memories],
+                "total": total,
+            },
+        )
+
+    if arguments.action == "propose_save":
+        content = (arguments.content or arguments.title or "").strip()
+        title = (arguments.title or content[:80]).strip()
+        sources: list[MemorySourceCreate] = []
+        selected = tool_input.request.source_selection
+        if selected is not None:
+            sources.append(
+                MemorySourceCreate(
+                    source_type=MemorySourceType.PAPER_CHUNK,
+                    paper_id=selected.paper_id,
+                    page_number=selected.page_number,
+                    quote_text=selected.quote,
+                    document_sha256=selected.document_sha256,
+                )
+            )
+        candidate = MemoryCreate(
+            memory_type=MemoryType.PROCEDURAL,
+            title=title,
+            content=content,
+            sources=sources,
+        )
+        try:
+            from app.services.memory_service import validate_memory_candidate
+
+            validate_memory_candidate(context.db, project_id, candidate)
+            memory = create_memory(context.db, project_id, candidate)
+        except ValueError:
+            return AssistantToolResult(
+                status=ToolStatus.NEEDS_INPUT,
+                result_type="note_source_unavailable",
+                display_text=(
+                    "I couldn't verify the selected source for this note. Refresh it and try again."
+                ),
+            )
+        display_text = "Saved the approved research note."
+    else:
+        memory = get_memory(context.db, memory_id=arguments.memory_id, project_id=project_id)
+        if memory is None:
+            return AssistantToolResult(
+                status=ToolStatus.NEEDS_INPUT,
+                result_type="note_not_found",
+                display_text="That note is no longer available in this project.",
+            )
+        update = MemoryUpdate(
+            title=arguments.title,
+            content=arguments.content,
+            status=MemoryStatus.ARCHIVED if arguments.action == "propose_archive" else None,
+            version=arguments.expected_version,
+            reason=(
+                "Archived through an approved assistant action"
+                if arguments.action == "propose_archive"
+                else "Updated through an approved assistant action"
+            ),
+        )
+        try:
+            memory = update_memory(context.db, memory, update)
+        except MemoryVersionConflictError:
+            return AssistantToolResult(
+                status=ToolStatus.NEEDS_INPUT,
+                result_type="note_version_conflict",
+                display_text=(
+                    "This note changed after the proposal. Reopen it and prepare a new update."
+                ),
+            )
+        except ValueError:
+            return AssistantToolResult(
+                status=ToolStatus.NEEDS_INPUT,
+                result_type="note_update_rejected",
+                display_text="This update couldn't be applied to the current source-backed note.",
+            )
+        display_text = (
+            "Archived the approved research note."
+            if arguments.action == "propose_archive"
+            else "Updated the approved research note."
+        )
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="note",
+        display_text=display_text,
+        structured_payload={"item": _note_payload(memory)},
+    )
+
+
 async def _qa(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
     source_selection = tool_input.request.source_selection
     resolved_paper_ids = tool_input.decision.resolved_paper_ids
@@ -367,6 +532,61 @@ async def _read_paper(context: ToolContext, tool_input: AssistantToolInput) -> A
             "message_id": str(response.id),
             "model_name": response.model_name,
             "sections": parse_reading_brief_sections(response.content),
+        },
+        citations=response.citations,
+        evidence=[item.model_dump(mode="json") for item in response.evidence],
+        usage=response.provider_usage,
+    )
+
+
+async def _report(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    arguments = tool_input.arguments
+    if not isinstance(arguments, ReportArguments):
+        raise TypeError("report arguments were not validated")
+
+    paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    scope = "selection" if paper_ids else "project"
+    question = arguments.question or tool_input.request.message
+    with get_telemetry().stage(
+        "report.generate",
+        input={"question": question, "scope": scope, "selected_paper_count": len(paper_ids)},
+        metadata={"cache": "none", "outcome": "started"},
+    ) as observation:
+        response = await context.chat_service.answer_question(
+            context.db,
+            tool_input.request.conversation_id,
+            question,
+            assistant_run_id=context.assistant_run_id,
+            retrieval_question=question,
+            paper_scope=scope,
+            selected_paper_ids=paper_ids,
+            run_worker_id=context.worker_id,
+            run_attempt_count=context.attempt_count,
+            response_guidance=REPORT_GUIDANCE,
+        )
+        manifest = report_source_manifest(response.citations, response.evidence)
+        if observation is not None:
+            observation.update(
+                output={"evidence_count": len(manifest), "outcome": "drafted"},
+                metadata={"model": response.model_name, "cache": "none"},
+            )
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED if manifest else ToolStatus.NEEDS_INPUT,
+        result_type="research_report" if manifest else "report_evidence_unavailable",
+        display_text=(
+            response.content
+            if manifest
+            else (
+                "I couldn't find verified paper evidence for this report. "
+                "Select ready papers or narrow the question."
+            )
+        ),
+        structured_payload={
+            "report_markdown": response.content,
+            "scope": scope,
+            "source_manifest": manifest,
+            "saved": False,
         },
         citations=response.citations,
         evidence=[item.model_dump(mode="json") for item in response.evidence],
@@ -891,8 +1111,8 @@ def build_tool_registry() -> Mapping[AssistantIntent, ToolDefinition]:
         available=True,
     )
     register(AssistantIntent.DISCOVER, DiscoverArguments, _discover, available=True)
-    register(AssistantIntent.NOTES, NotesArguments, approval=True)
-    register(AssistantIntent.REPORT, ReportArguments, min_papers=1)
+    register(AssistantIntent.NOTES, NotesArguments, _notes, approval=True, available=True)
+    register(AssistantIntent.REPORT, ReportArguments, _report, available=True)
     register(AssistantIntent.RESEARCH, ResearchArguments, min_papers=1)
     register(AssistantIntent.GAP_ANALYSIS, GapAnalysisArguments, min_papers=1)
     register(AssistantIntent.EXPERIMENT_PLAN, ExperimentPlanArguments, min_papers=1)

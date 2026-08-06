@@ -55,6 +55,62 @@ class Project(Base):
     memories: Mapped[list["Memory"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    artifacts: Mapped[list["ResearchArtifact"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class ResearchArtifact(Base):
+    __tablename__ = "research_artifacts"
+    __table_args__ = (Index("ix_research_artifacts_project_updated", "project_id", "updated_at"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    artifact_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    latest_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped["Project"] = relationship(back_populates="artifacts")
+    revisions: Mapped[list["ResearchArtifactRevision"]] = relationship(
+        back_populates="artifact",
+        cascade="all, delete-orphan",
+        order_by="ResearchArtifactRevision.revision_number",
+    )
+
+
+class ResearchArtifactRevision(Base):
+    __tablename__ = "research_artifact_revisions"
+    __table_args__ = (
+        UniqueConstraint("artifact_id", "revision_number", name="uq_artifact_revision_number"),
+        Index("ix_artifact_revisions_artifact_created", "artifact_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    artifact_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_artifacts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    scope_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    source_manifest: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    artifact: Mapped["ResearchArtifact"] = relationship(back_populates="revisions")
 
 
 class Paper(Base):

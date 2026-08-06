@@ -8,11 +8,12 @@ from sqlalchemy.orm import sessionmaker
 from app.crud.assistant_run import (
     claim_next_assistant_run,
     create_assistant_run,
+    decide_assistant_approval,
     request_assistant_run_cancel,
     resume_assistant_run,
 )
 from app.db.base import Base
-from app.db.models import AssistantRun
+from app.db.models import AssistantApprovalAction, AssistantRun, Memory
 from app.schemas.assistant import (
     AssistantIntent,
     AssistantRouteResult,
@@ -281,6 +282,63 @@ async def test_run_processor_marks_clarification_without_dispatching_tool(sessio
         assert run is not None and run.status == "NEEDS_INPUT"
         assert run.result_payload["result_type"] == "clarification"
     assert chat.calls == []
+
+
+@pytest.mark.anyio
+async def test_note_mutation_waits_for_approval_then_runs_once(session_factory) -> None:
+    run_id = _queue_run(session_factory)
+
+    class SaveNoteRoute:
+        async def route(self, request, **kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.NOTES,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Save a research note",
+                    arguments={
+                        "action": "propose_save",
+                        "title": "Useful limitation",
+                        "content": "The paper evaluates only a narrow set of tasks.",
+                    },
+                ),
+            )
+
+    processor = AssistantRunProcessor(
+        session_factory=session_factory,
+        router=SaveNoteRoute(),  # type: ignore[arg-type]
+        chat_service=_ChatStub(),  # type: ignore[arg-type]
+    )
+    with session_factory() as db:
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        first_attempt = claim.attempt_count
+
+    await processor.process(run_id, worker_id="worker-a", attempt_count=first_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        action = db.query(AssistantApprovalAction).filter_by(run_id=run_id).one()
+        assert run is not None and run.status == "AWAITING_APPROVAL"
+        assert action.status == "PENDING"
+        assert db.query(Memory).count() == 0
+        action_id = action.id
+        approved, transitioned = decide_assistant_approval(db, action_id, approve=True)
+        assert transitioned and approved.status == "APPROVED"
+        next_claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert next_claim is not None
+        second_attempt = next_claim.attempt_count
+
+    await processor.process(run_id, worker_id="worker-a", attempt_count=second_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        memories = db.query(Memory).all()
+        assert run is not None and run.status == "SUCCEEDED"
+        assert len(memories) == 1
+        assert memories[0].title == "Useful limitation"
+        assert memories[0].content == "The paper evaluates only a narrow set of tasks."
+        assert db.query(AssistantApprovalAction).filter_by(run_id=run_id).one().status == "APPROVED"
 
 
 @pytest.mark.anyio

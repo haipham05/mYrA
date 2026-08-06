@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -7,13 +7,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
-from app.db.models import Paper, PaperPage, Project
+from app.db.models import Memory, Paper, PaperPage, Project
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
-from app.schemas.evidence import EvidenceItem
+from app.schemas.evidence import AnchorStatus, Citation, EvidenceItem
 from app.services import assistant_tools
 from app.services.assistant_tools import (
     AssistantToolResult,
     CompareArguments,
+    NotesArguments,
     ToolContext,
     ToolStatus,
     build_tool_registry,
@@ -293,7 +294,12 @@ def test_note_reads_do_not_require_approval_but_mutations_do() -> None:
     update_decision = RouteDecision(
         intent=AssistantIntent.NOTES,
         action_summary="Propose note update",
-        arguments={"action": "propose_update", "content": "new preference"},
+        arguments={
+            "action": "propose_update",
+            "content": "new preference",
+            "memory_id": str(uuid4()),
+            "expected_version": 1,
+        },
     )
     assert not tool_requires_approval(
         definition, validate_tool_input(definition, request, read_decision)
@@ -301,6 +307,191 @@ def test_note_reads_do_not_require_approval_but_mutations_do() -> None:
     assert tool_requires_approval(
         definition, validate_tool_input(definition, request, update_decision)
     )
+
+
+@pytest.mark.anyio
+async def test_report_draft_uses_existing_grounded_chat_and_records_source_manifest() -> None:
+    paper_id = uuid4()
+    chunk_id = uuid4()
+    digest = "a" * 64
+
+    class FakeChatService:
+        def __init__(self) -> None:
+            self.call = None
+
+        async def answer_question(self, db, conversation_id, question, **kwargs):
+            self.call = (conversation_id, question, kwargs)
+            return type(
+                "Response",
+                (),
+                {
+                    "id": uuid4(),
+                    "model_name": "test-model",
+                    "content": "## Findings\nThe paper uses attention [1].",
+                    "citations": [
+                        Citation(
+                            citation_index=1,
+                            evidence_id="E1",
+                            paper_id=paper_id,
+                            page_number=3,
+                            quote="The model uses attention.",
+                            document_sha256=digest,
+                            anchor_status=AnchorStatus.VERIFIED,
+                        )
+                    ],
+                    "evidence": [
+                        EvidenceItem(
+                            id="E1",
+                            paper_id=paper_id,
+                            paper_title="Attention Is All You Need",
+                            chunk_id=chunk_id,
+                            quote="The model uses attention.",
+                            page_number=3,
+                            document_sha256=digest,
+                        ),
+                        EvidenceItem(
+                            id="E2",
+                            paper_id=paper_id,
+                            paper_title="Attention Is All You Need",
+                            chunk_id=uuid4(),
+                            quote="Uncited retrieved text.",
+                            page_number=4,
+                            document_sha256=digest,
+                        ),
+                    ],
+                    "provider_usage": {"total_tokens": 20},
+                },
+            )()
+
+    request = _request(scope="paper", selected_paper_ids=[paper_id])
+    decision = RouteDecision(
+        intent=AssistantIntent.REPORT,
+        resolved_paper_ids=[paper_id],
+        action_summary="Draft a paper report",
+        arguments={"question": "Summarize this paper's findings."},
+    )
+    registry = build_tool_registry()
+    chat = FakeChatService()
+    result = await execute_tool(
+        registry[AssistantIntent.REPORT],
+        ToolContext(db=None, chat_service=chat),  # type: ignore[arg-type]
+        validate_tool_input(registry[AssistantIntent.REPORT], request, decision),
+    )
+
+    assert result.status is ToolStatus.SUCCEEDED
+    assert result.result_type == "research_report"
+    assert result.structured_payload["saved"] is False
+    assert result.structured_payload["source_manifest"] == [
+        {
+            "evidence_id": "1",
+            "source_evidence_id": "E1",
+            "citation_index": 1,
+            "paper_id": str(paper_id),
+            "paper_title": "Attention Is All You Need",
+            "page_number": 3,
+            "chunk_id": str(chunk_id),
+            "document_sha256": digest,
+            "quote": "The model uses attention.",
+        }
+    ]
+    assert "[1]" in result.display_text
+    assert "E2" not in str(result.structured_payload["source_manifest"])
+    assert chat.call[2]["paper_scope"] == "selection"
+    assert chat.call[2]["selected_paper_ids"] == [paper_id]
+    assert "cite every factual sentence" in chat.call[2]["response_guidance"].lower()
+
+
+@pytest.mark.anyio
+async def test_note_actions_save_update_archive_and_reject_stale_version(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'note-actions.db'}")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        project = Project(name="Note actions")
+        db.add(project)
+        db.commit()
+        request = AssistantRunRequest.model_validate(
+            {
+                "message": "Save a research note",
+                "conversation_id": str(uuid4()),
+                "project_id": str(project.id),
+                "scope": "project",
+                "selected_paper_ids": [],
+                "idempotency_key": "note-action-123",
+            }
+        )
+        definition = build_tool_registry()[AssistantIntent.NOTES]
+        context = ToolContext(db=db, chat_service=object())  # type: ignore[arg-type]
+
+        def tool_input(arguments: NotesArguments):
+            decision = RouteDecision(
+                intent=AssistantIntent.NOTES,
+                action_summary="Manage a research note",
+                arguments=arguments.model_dump(mode="json", exclude_none=True),
+            )
+            return validate_tool_input(definition, request, decision)
+
+        saved = await execute_tool(
+            definition,
+            context,
+            tool_input(
+                NotesArguments(
+                    action="propose_save", title="Reading preference", content="Keep short notes."
+                )
+            ),
+        )
+        memory_id = saved.structured_payload["item"]["id"]
+        assert saved.status is ToolStatus.SUCCEEDED
+        assert db.query(Memory).filter(Memory.project_id == project.id).count() == 1
+
+        updated = await execute_tool(
+            definition,
+            context,
+            tool_input(
+                NotesArguments(
+                    action="propose_update",
+                    memory_id=memory_id,
+                    expected_version=1,
+                    content="Keep concise research notes.",
+                )
+            ),
+        )
+        assert updated.structured_payload["item"]["version"] == 2
+
+        stale = await execute_tool(
+            definition,
+            context,
+            tool_input(
+                NotesArguments(
+                    action="propose_update",
+                    memory_id=memory_id,
+                    expected_version=1,
+                    content="Overwrite with stale content.",
+                )
+            ),
+        )
+        assert stale.status is ToolStatus.NEEDS_INPUT
+        assert (
+            db.query(Memory).filter(Memory.id == UUID(memory_id)).one().content
+            == "Keep concise research notes."
+        )
+
+        archived = await execute_tool(
+            definition,
+            context,
+            tool_input(
+                NotesArguments(
+                    action="propose_archive",
+                    memory_id=memory_id,
+                    expected_version=2,
+                )
+            ),
+        )
+        assert archived.structured_payload["item"]["status"] == "ARCHIVED"
+    finally:
+        db.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
     assert tool_requires_approval(
         build_tool_registry()[AssistantIntent.TRANSLATE],
         validate_tool_input(
