@@ -7,18 +7,23 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
-from app.db.models import Memory, Paper, PaperPage, Project
+from app.db.models import Memory, Message, Paper, PaperPage, Project
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
 from app.schemas.evidence import AnchorStatus, Citation, EvidenceItem
 from app.services import assistant_tools
 from app.services.assistant_tools import (
+    AssistantToolInput,
     AssistantToolResult,
     CompareArguments,
+    ExperimentPlanArguments,
+    GapAnalysisArguments,
     NotesArguments,
     ToolContext,
     ToolStatus,
+    TranslateArguments,
     build_tool_registry,
     execute_tool,
+    recover_persisted_research_result,
     tool_requires_approval,
     validate_tool_input,
 )
@@ -77,6 +82,69 @@ def test_tool_validation_rejects_arbitrary_fields_and_checks_paper_cardinality()
     )
     with pytest.raises(ValueError, match="select more papers"):
         validate_tool_input(registry[AssistantIntent.COMPARE], one_paper, one_paper_decision)
+
+
+@pytest.mark.parametrize(
+    ("intent", "arguments", "content", "expected_type"),
+    [
+        (
+            AssistantIntent.GAP_ANALYSIS,
+            GapAnalysisArguments(focus="evaluation gaps"),
+            "## Evidence gaps\nNot reported [1].",
+            "gap_analysis",
+        ),
+        (
+            AssistantIntent.EXPERIMENT_PLAN,
+            ExperimentPlanArguments(objective="Test robustness"),
+            "## Objective\nTest robustness\n## Hypothesis\nA proposal [1].",
+            "experiment_proposal",
+        ),
+    ],
+)
+def test_persisted_research_recovery_preserves_grounded_results(
+    intent, arguments, content, expected_type
+):
+    paper_id = uuid4()
+    request = _request(selected_paper_ids=[paper_id])
+    decision = RouteDecision(
+        intent=intent,
+        resolved_paper_ids=[paper_id],
+        action_summary="Resume the saved research result",
+    )
+    tool_input = AssistantToolInput(request=request, decision=decision, arguments=arguments)
+    citation = Citation(
+        citation_index=1,
+        evidence_id="E1",
+        paper_id=paper_id,
+        page_number=2,
+        quote="A source-backed excerpt.",
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        quote=citation.quote,
+        page_number=2,
+    )
+    message = Message(
+        conversation_id=request.conversation_id,
+        role="ASSISTANT",
+        content=content,
+        citations=[citation.model_dump(mode="json")],
+        evidence=[evidence.model_dump(mode="json")],
+        model_name="deepseek-flash",
+        provider_usage={"total_tokens": 12},
+    )
+
+    recovered = recover_persisted_research_result(intent, tool_input, message)
+
+    assert recovered is not None
+    assert recovered.status is ToolStatus.SUCCEEDED
+    assert recovered.result_type == expected_type
+    assert recovered.display_text == content
+    assert recovered.structured_payload["source_manifest"][0]["paper_id"] == str(paper_id)
+    assert recovered.usage == {"total_tokens": 12}
 
 
 @pytest.mark.anyio
@@ -506,6 +574,27 @@ async def test_note_actions_save_update_archive_and_reject_stale_version(tmp_pat
     )
 
 
+def test_translation_is_fixed_to_vietnamese_and_one_resolved_paper() -> None:
+    registry = build_tool_registry()
+    definition = registry[AssistantIntent.TRANSLATE]
+    request = _request(scope="selection", selected_paper_ids=[uuid4(), uuid4()])
+    decision = RouteDecision(
+        intent=AssistantIntent.TRANSLATE,
+        resolved_paper_ids=request.selected_paper_ids,
+        action_summary="Translate the selected papers",
+        arguments={"target_language": "vi"},
+    )
+
+    with pytest.raises(ValueError, match="too many papers"):
+        validate_tool_input(definition, request, decision)
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        TranslateArguments.model_validate(
+            {"target_language": "vi", "external_processing_acknowledged": True}
+        )
+    with pytest.raises(ValidationError):
+        TranslateArguments.model_validate({"target_language": "en"})
+
+
 @pytest.mark.anyio
 async def test_claim_tool_verifies_current_source_and_keeps_refutation_model_assessed(
     tmp_path, monkeypatch
@@ -714,6 +803,339 @@ async def test_read_paper_tool_reuses_scoped_chat_and_returns_brief_sections() -
     assert service.calls[0][2]["selected_paper_ids"] == request.selected_paper_ids
     assert service.calls[0][2]["response_guidance"]
     assert service.calls[0][2]["run_worker_id"] == "worker-read"
+
+
+@pytest.mark.anyio
+async def test_research_tool_runs_one_scoped_grounded_draft_without_saving(monkeypatch) -> None:
+    paper_id = uuid4()
+    other_paper_id = uuid4()
+    project_id = uuid4()
+    chunk_id = uuid4()
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=chunk_id,
+        paper_title="Selected paper",
+        quote="The paper reports a bounded research result.",
+        page_number=2,
+        document_sha256="a" * 64,
+    )
+    citation = Citation(
+        citation_index=1,
+        evidence_id="E1",
+        paper_id=paper_id,
+        page_number=2,
+        quote=evidence.quote,
+        document_sha256=evidence.document_sha256,
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+
+    class FakeChatService:
+        retriever = None
+
+        def __init__(self):
+            self.calls = []
+
+        async def answer_question(self, db, conversation_id, question, **kwargs):
+            self.calls.append((db, conversation_id, question, kwargs))
+            return type(
+                "Response",
+                (),
+                {
+                    "id": uuid4(),
+                    "model_name": "test-model",
+                    "content": "A grounded research draft [1].",
+                    "citations": [citation],
+                    "evidence": kwargs["additional_evidence"],
+                    "provider_usage": {"total_tokens": 10},
+                },
+            )()
+
+    class FakeRetriever:
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, _db, _project_id, query, *, query_embedding, selected_paper_ids):
+            self.calls.append((query, selected_paper_ids))
+            assert query_embedding == [0.1]
+            assert len(selected_paper_ids) == 1
+            return (
+                [evidence]
+                if selected_paper_ids == [paper_id] and "method" in query.casefold()
+                else []
+            )
+
+    class FakeEmbeddingProvider:
+        def embed_query(self, _query):
+            return [0.1]
+
+    events = []
+
+    class FakeObservation:
+        def update(self, **kwargs):
+            events.append(kwargs)
+
+    class FakeTelemetry:
+        @contextmanager
+        def stage(self, name, **_kwargs):
+            events.append({"stage": name})
+            yield FakeObservation()
+
+    monkeypatch.setattr(assistant_tools, "get_telemetry", lambda: FakeTelemetry())
+    monkeypatch.setattr(
+        "app.services.embedding.get_embedding_provider", lambda: FakeEmbeddingProvider()
+    )
+    request = AssistantRunRequest(
+        message="Investigate the method",
+        conversation_id=uuid4(),
+        project_id=project_id,
+        scope="selection",
+        selected_paper_ids=[paper_id, other_paper_id],
+        idempotency_key="research-tool-123",
+    )
+    decision = RouteDecision(
+        intent=AssistantIntent.RESEARCH,
+        resolved_paper_ids=[paper_id, other_paper_id],
+        action_summary="Research the selected paper",
+        arguments={
+            "goal": "Assess the method",
+            "subquestions": ["What is the method?", "What evidence supports it?"],
+        },
+    )
+    registry = build_tool_registry()
+    definition = registry[AssistantIntent.RESEARCH]
+    service = FakeChatService()
+    service.retriever = FakeRetriever()
+    result = await execute_tool(
+        definition,
+        ToolContext(db=None, chat_service=service),  # type: ignore[arg-type]
+        validate_tool_input(definition, request, decision),
+    )
+
+    assert result.status is ToolStatus.SUCCEEDED
+    assert result.result_type == "research_draft"
+    assert result.structured_payload["saved"] is False
+    assert result.structured_payload["subquestions"] == [
+        "What is the method?",
+        "What evidence supports it?",
+    ]
+    assert result.structured_payload["source_manifest"][0]["citation_index"] == 1
+    assert len(service.calls) == 1
+    assert service.calls[0][2] == "Assess the method"
+    assert service.calls[0][3]["paper_scope"] == "selection"
+    assert service.calls[0][3]["selected_paper_ids"] == [paper_id, other_paper_id]
+    assert "What is the method?" in service.calls[0][3]["retrieval_question"]
+    assert service.calls[0][3]["additional_evidence"] == [evidence]
+    assert len(service.retriever.calls) == 4
+    assert result.structured_payload["evidence_coverage"] == [
+        {"paper_id": str(paper_id), "subquestion": "What is the method?", "has_evidence": True},
+        {
+            "paper_id": str(paper_id),
+            "subquestion": "What evidence supports it?",
+            "has_evidence": False,
+        },
+        {
+            "paper_id": str(other_paper_id),
+            "subquestion": "What is the method?",
+            "has_evidence": False,
+        },
+        {
+            "paper_id": str(other_paper_id),
+            "subquestion": "What evidence supports it?",
+            "has_evidence": False,
+        },
+    ]
+    assert len(result.structured_payload["evidence_gaps"]) == 3
+    assert result.available_actions == ["discover"]
+    assert result.structured_payload["discovery_query"] == "What evidence supports it?"
+    assert result.structured_payload["discovery_requires_import_approval"] is True
+    assert {event["stage"] for event in events if "stage" in event} == {
+        "research.plan",
+        "research.retrieve",
+        "research.analyze",
+        "research.verify",
+        "research.draft",
+    }
+
+
+@pytest.mark.anyio
+async def test_gap_analysis_is_scoped_cited_and_does_not_claim_global_novelty(monkeypatch) -> None:
+    paper_id = uuid4()
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        paper_title="Selected paper",
+        quote="The authors state that broader evaluation is future work.",
+        page_number=4,
+        document_sha256="b" * 64,
+    )
+    citation = Citation(
+        citation_index=1,
+        evidence_id="E1",
+        paper_id=paper_id,
+        page_number=4,
+        quote=evidence.quote,
+        document_sha256=evidence.document_sha256,
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+
+    class FakeChatService:
+        def __init__(self):
+            self.calls = []
+
+        async def answer_question(self, db, conversation_id, question, **kwargs):
+            self.calls.append((question, kwargs))
+            return type(
+                "Response",
+                (),
+                {
+                    "model_name": "test-model",
+                    "content": "Broader evaluation is future work [1].",
+                    "citations": [citation],
+                    "evidence": [evidence],
+                    "provider_usage": None,
+                },
+            )()
+
+    class FakeTelemetry:
+        @contextmanager
+        def stage(self, *_args, **_kwargs):
+            yield None
+
+    monkeypatch.setattr(assistant_tools, "get_telemetry", lambda: FakeTelemetry())
+    request = AssistantRunRequest(
+        message="What are the limitations?",
+        conversation_id=uuid4(),
+        project_id=uuid4(),
+        scope="paper",
+        selected_paper_ids=[paper_id],
+        idempotency_key="gap-analysis-123",
+    )
+    decision = RouteDecision(
+        intent=AssistantIntent.GAP_ANALYSIS,
+        resolved_paper_ids=[paper_id],
+        action_summary="Analyze selected evidence gaps",
+        arguments={"focus": "evaluation coverage"},
+    )
+    registry = build_tool_registry()
+    definition = registry[AssistantIntent.GAP_ANALYSIS]
+    service = FakeChatService()
+    result = await execute_tool(
+        definition,
+        ToolContext(db=None, chat_service=service),  # type: ignore[arg-type]
+        validate_tool_input(definition, request, decision),
+    )
+
+    assert result.status is ToolStatus.SUCCEEDED
+    assert result.result_type == "gap_analysis"
+    assert result.structured_payload["source_manifest"][0]["paper_id"] == str(paper_id)
+    assert "selected evidence only" in result.structured_payload["scope_limit"]
+    assert len(service.calls) == 1
+    assert service.calls[0][1]["paper_scope"] == "selection"
+    assert service.calls[0][1]["selected_paper_ids"] == [paper_id]
+    assert "Not found in the selected evidence" in " ".join(
+        service.calls[0][1]["response_guidance"].split()
+    )
+
+
+@pytest.mark.anyio
+async def test_experiment_plan_returns_labeled_fields_and_verified_motivation(monkeypatch) -> None:
+    paper_id = uuid4()
+    evidence = EvidenceItem(
+        id="E1",
+        paper_id=paper_id,
+        chunk_id=uuid4(),
+        paper_title="Selected paper",
+        quote="The evaluated dataset contains short text documents.",
+        page_number=5,
+        document_sha256="c" * 64,
+    )
+    citation = Citation(
+        citation_index=1,
+        evidence_id="E1",
+        paper_id=paper_id,
+        page_number=5,
+        quote=evidence.quote,
+        document_sha256=evidence.document_sha256,
+        anchor_status=AnchorStatus.VERIFIED,
+    )
+    proposal_text = """## Objective
+Compare the two approaches.
+## Hypothesis
+Proposed: method A may improve robustness.
+## Dataset
+Proposed: validate a short-text dataset.
+## Baselines
+Proposed: include the paper's reported baseline.
+## Metrics
+Proposed: use accuracy and macro-F1.
+## Ablations
+Proposed: remove each method component in turn.
+## Risks
+Dataset mismatch may limit comparability.
+## Evidence-based motivation
+The paper evaluates short text [1]."""
+
+    class FakeChatService:
+        def __init__(self):
+            self.calls = []
+
+        async def answer_question(self, db, conversation_id, question, **kwargs):
+            self.calls.append((question, kwargs))
+            return type(
+                "Response",
+                (),
+                {
+                    "model_name": "test-model",
+                    "content": proposal_text,
+                    "citations": [citation],
+                    "evidence": [evidence],
+                    "provider_usage": None,
+                },
+            )()
+
+    class FakeTelemetry:
+        @contextmanager
+        def stage(self, *_args, **_kwargs):
+            yield None
+
+    monkeypatch.setattr(assistant_tools, "get_telemetry", lambda: FakeTelemetry())
+    request = AssistantRunRequest(
+        message="Propose an evaluation plan",
+        conversation_id=uuid4(),
+        project_id=uuid4(),
+        scope="paper",
+        selected_paper_ids=[paper_id],
+        idempotency_key="experiment-plan-123",
+    )
+    decision = RouteDecision(
+        intent=AssistantIntent.EXPERIMENT_PLAN,
+        resolved_paper_ids=[paper_id],
+        action_summary="Draft a proposed experiment",
+        arguments={"objective": "Compare the two approaches"},
+    )
+    registry = build_tool_registry()
+    definition = registry[AssistantIntent.EXPERIMENT_PLAN]
+    service = FakeChatService()
+    result = await execute_tool(
+        definition,
+        ToolContext(db=None, chat_service=service),  # type: ignore[arg-type]
+        validate_tool_input(definition, request, decision),
+    )
+
+    assert result.status is ToolStatus.SUCCEEDED
+    assert result.result_type == "experiment_proposal"
+    assert result.structured_payload["proposal"]["objective"] == "Compare the two approaches."
+    assert result.structured_payload["proposal"]["dataset"] == (
+        "Proposed: validate a short-text dataset."
+    )
+    assert result.structured_payload["proposal"]["evidence_motivation"].endswith("[1].")
+    assert result.structured_payload["saved"] is False
+    assert len(service.calls) == 1
+    guidance = " ".join(service.calls[0][1]["response_guidance"].split())
+    assert "Do not generate or execute code" in guidance
+    assert "Do not invent benchmark results" in guidance
 
 
 def test_read_paper_tool_requires_one_paper():

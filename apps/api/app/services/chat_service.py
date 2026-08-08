@@ -8,7 +8,10 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.crud.assistant_run import begin_assistant_run_publication
+from app.crud.assistant_run import (
+    assistant_run_cancel_requested,
+    begin_assistant_run_publication,
+)
 from app.crud.chat import add_message, get_conversation
 from app.db.models import Memory, Message, Paper, PaperPage
 from app.observability.telemetry import Observation, TelemetryAdapter, get_telemetry
@@ -1003,6 +1006,16 @@ class ChatService:
         )
 
         # 4. Generate answer with LLM
+        if assistant_run_id is not None:
+            if run_worker_id is None or run_attempt_count is None:
+                raise ValueError("Assistant-run QA requires its worker lease context")
+            if assistant_run_cancel_requested(
+                db,
+                assistant_run_id,
+                worker_id=run_worker_id,
+                attempt_count=run_attempt_count,
+            ):
+                raise AssistantRunCancelled
         llm = get_llm_provider()
         selected_evidence = [
             {

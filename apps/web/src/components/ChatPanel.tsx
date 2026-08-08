@@ -663,6 +663,43 @@ export default function ChatPanel({
     );
   };
 
+  const renderResearchDiscovery = (message: Message) => {
+    const result = message.assistantResult;
+    if (
+      result?.result_type !== "research_draft" ||
+      !result.available_actions.includes("discover") ||
+      !isRecord(result.structured_payload) ||
+      typeof result.structured_payload.discovery_query !== "string"
+    ) {
+      return null;
+    }
+
+    const query = result.structured_payload.discovery_query;
+    return (
+      <div className="mt-3 rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+        <p>
+          This evidence gap can be explored through paper discovery. Search
+          shows catalog metadata only; importing a result requires your
+          approval. After its paper finishes indexing, ask mYrA to continue the
+          research.
+        </p>
+        <button
+          type="button"
+          disabled={disabled || isLoading}
+          onClick={() =>
+            void onSendMessage(`Find academic papers about: ${query}`)
+          }
+          className="mt-2 rounded bg-amber-900 px-3 py-1.5 font-medium text-white disabled:opacity-50"
+        >
+          Discover papers for this gap
+        </button>
+        <div className="mt-3 text-zinc-900">
+          {renderContent(message.content, message.citations)}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
       <div className="border-b border-zinc-200 px-4 py-3">
@@ -825,7 +862,8 @@ export default function ChatPanel({
                 }`}
               >
                 {msg.role === "ASSISTANT"
-                  ? (renderDiscovery(msg) ??
+                  ? (renderResearchDiscovery(msg) ??
+                    renderDiscovery(msg) ??
                     renderComparison(msg) ??
                     renderContent(msg.content, msg.citations))
                   : msg.content}

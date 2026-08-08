@@ -5,7 +5,9 @@ without an implemented service return an explicit UNAVAILABLE result.
 """
 
 import asyncio
+import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -14,6 +16,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.crud.memory import (
@@ -23,7 +26,15 @@ from app.crud.memory import (
     list_memories,
     update_memory,
 )
-from app.db.models import Paper
+from app.crud.translation import TranslationConflict, create_translation
+from app.db.models import (
+    AssistantApprovalAction,
+    AssistantRun,
+    Message,
+    Paper,
+    ProjectTranslationGlossaryEntry,
+    TranslationDocument,
+)
 from app.observability.telemetry import get_telemetry
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
 from app.schemas.comparison import (
@@ -32,7 +43,7 @@ from app.schemas.comparison import (
     ComparisonRequest,
 )
 from app.schemas.discovery import CatalogSearchResult
-from app.schemas.evidence import Citation
+from app.schemas.evidence import Citation, EvidenceItem
 from app.schemas.memory import (
     MemoryCreate,
     MemorySourceCreate,
@@ -151,9 +162,36 @@ class ExperimentPlanArguments(ToolArguments):
     objective: str = Field(min_length=1, max_length=2000)
 
 
+_EXPERIMENT_PLAN_SECTIONS = {
+    "objective": "Objective",
+    "hypothesis": "Hypothesis",
+    "dataset": "Dataset",
+    "baselines": "Baselines",
+    "metrics": "Metrics",
+    "ablations": "Ablations",
+    "risks": "Risks",
+    "evidence_motivation": "Evidence-based motivation",
+}
+
+
+def _parse_experiment_plan(content: str) -> dict[str, str]:
+    titles = {title.casefold(): key for key, title in _EXPERIMENT_PLAN_SECTIONS.items()}
+    collected: dict[str, list[str]] = {key: [] for key in _EXPERIMENT_PLAN_SECTIONS}
+    current_key = None
+    for line in content.splitlines():
+        heading = re.match(r"^\s{0,3}#{1,3}\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            current_key = titles.get(heading.group(1).strip().casefold())
+        elif current_key is not None and line.strip():
+            collected[current_key].append(line.strip())
+    return {
+        key: " ".join(lines).strip() or "Not specified in the draft."
+        for key, lines in collected.items()
+    }
+
+
 class TranslateArguments(ToolArguments):
     target_language: Literal["vi"]
-    external_processing_acknowledged: bool = False
 
 
 class VisionArguments(ToolArguments):
@@ -180,6 +218,90 @@ class AssistantToolResult(BaseModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
     warnings: list[str] = Field(default_factory=list, max_length=50)
     usage: dict[str, int | None] | None = None
+    available_actions: list[str] = Field(default_factory=list, max_length=20)
+
+
+def recover_persisted_research_result(
+    intent: AssistantIntent, tool_input: AssistantToolInput, message: Message
+) -> AssistantToolResult | None:
+    """Rebuild a research-family result from its already-persisted assistant response."""
+    if intent not in {
+        AssistantIntent.RESEARCH,
+        AssistantIntent.GAP_ANALYSIS,
+        AssistantIntent.EXPERIMENT_PLAN,
+    }:
+        return None
+
+    try:
+        citations = [Citation.model_validate(item) for item in (message.citations or [])]
+        evidence_items = [EvidenceItem.model_validate(item) for item in (message.evidence or [])]
+    except (TypeError, ValueError):
+        return None
+
+    manifest = report_source_manifest(citations, evidence_items)
+    arguments = tool_input.arguments
+    if intent is AssistantIntent.RESEARCH:
+        if not isinstance(arguments, ResearchArguments):
+            return None
+        payload = {
+            "goal": arguments.goal,
+            "subquestions": arguments.subquestions or [arguments.goal],
+            "scope": (
+                "selection"
+                if tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+                else "project"
+            ),
+            "model_name": message.model_name,
+            "evidence_coverage": [],
+            "evidence_gaps": [],
+            "coverage_status": "not_persisted_before_interruption",
+            "discovery_query": None,
+            "discovery_requires_import_approval": False,
+            "source_manifest": manifest,
+            "saved": False,
+        }
+        result_type = "research_draft"
+    elif intent is AssistantIntent.GAP_ANALYSIS:
+        if not isinstance(arguments, GapAnalysisArguments):
+            return None
+        payload = {
+            "focus": arguments.focus or tool_input.request.message,
+            "scope": "selection",
+            "model_name": message.model_name,
+            "scope_limit": "selected evidence only; not a corpus-wide novelty assessment",
+            "analysis_markdown": message.content,
+            "source_manifest": manifest,
+            "saved": False,
+        }
+        result_type = "gap_analysis"
+    else:
+        if not isinstance(arguments, ExperimentPlanArguments):
+            return None
+        payload = {
+            "objective": arguments.objective,
+            "model_name": message.model_name,
+            "proposal": _parse_experiment_plan(message.content),
+            "proposal_markdown": message.content,
+            "source_manifest": manifest,
+            "saved": False,
+        }
+        result_type = "experiment_proposal"
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED if manifest else ToolStatus.NEEDS_INPUT,
+        result_type=result_type if manifest else f"{intent.value}_evidence_unavailable",
+        display_text=(
+            message.content
+            if manifest
+            else "I couldn't find verified evidence for this research request. Select READY "
+            "papers or narrow the request."
+        ),
+        structured_payload=payload,
+        citations=citations,
+        evidence=[item.model_dump(mode="json") for item in evidence_items],
+        usage=message.provider_usage,
+        warnings=["Evidence coverage was not saved before the worker stopped."],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,11 +309,110 @@ class ToolContext:
     db: Session
     chat_service: ChatService
     assistant_run_id: UUID | None = None
+    approved_action_id: UUID | None = None
     worker_id: str | None = None
     attempt_count: int | None = None
 
 
 ToolHandler = Callable[[ToolContext, AssistantToolInput], Awaitable[AssistantToolResult]]
+
+TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE = (
+    "The selected paper's text will be sent through PDFMathTranslate-next and its "
+    "SiliconFlowFree external proxy for translation. Translation is not local-only."
+)
+
+
+def _translation_proposal_details(
+    db: Session, *, project_id: UUID, paper_id: UUID
+) -> dict[str, Any]:
+    paper = db.get(Paper, paper_id)
+    if paper is None or paper.project_id != project_id:
+        raise ValueError("Select a paper from this project.")
+    if paper.status != "READY":
+        raise ValueError("Translation is available only for a READY paper.")
+    if not paper.document_sha256:
+        raise ValueError("The selected paper does not have a verified source file.")
+
+    glossary = [
+        {
+            "source_term": entry.source_term,
+            "preferred_translation": entry.preferred_translation,
+        }
+        for entry in db.scalars(
+            select(ProjectTranslationGlossaryEntry)
+            .where(ProjectTranslationGlossaryEntry.project_id == project_id)
+            .order_by(func.lower(ProjectTranslationGlossaryEntry.source_term))
+        ).all()
+    ]
+    glossary_identity = hashlib.sha256(
+        json.dumps(glossary, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return {
+        "source_sha256": paper.document_sha256,
+        "target_language": "vi",
+        "output_format": "translated_pdf_only",
+        "external_processing_disclosure": TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE,
+        "glossary_snapshot_identity": glossary_identity,
+        "glossary_entry_count": len(glossary),
+    }
+
+
+def build_assistant_approval_arguments(
+    db: Session,
+    *,
+    run_id: UUID,
+    request: AssistantRunRequest,
+    decision: RouteDecision,
+    tool_input: AssistantToolInput,
+) -> tuple[dict[str, Any], list[UUID]]:
+    """Build persisted approval data from trusted code and current source state."""
+    paper_ids = decision.resolved_paper_ids or request.selected_paper_ids
+    arguments: dict[str, Any] = {
+        "message": request.message,
+        "scope": request.scope.value,
+        "paper_ids": [str(item) for item in paper_ids],
+        "action_summary": decision.action_summary,
+        "tool_arguments": tool_input.arguments.model_dump(mode="json"),
+    }
+    if decision.intent is AssistantIntent.TRANSLATE:
+        run = db.get(AssistantRun, run_id)
+        if run is None or run.project_id != request.project_id:
+            raise ValueError("The research request is no longer available.")
+        if len(paper_ids) != 1:
+            raise ValueError("Select exactly one paper to translate.")
+        if not isinstance(tool_input.arguments, TranslateArguments):
+            raise ValueError("Choose English-to-Vietnamese translation.")
+        arguments["translation"] = _translation_proposal_details(
+            db, project_id=run.project_id, paper_id=paper_ids[0]
+        )
+    return arguments, paper_ids
+
+
+def _current_translation_approval_arguments(
+    context: ToolContext, tool_input: AssistantToolInput
+) -> tuple[AssistantApprovalAction, list[UUID]]:
+    if context.assistant_run_id is None or context.approved_action_id is None:
+        raise ValueError("Translation requires an approved action.")
+    action = context.db.get(AssistantApprovalAction, context.approved_action_id)
+    if (
+        action is None
+        or action.run_id != context.assistant_run_id
+        or action.action_type != AssistantIntent.TRANSLATE.value
+        or action.status not in {"APPROVED", "STALE"}
+    ):
+        raise ValueError("Translation approval is no longer valid.")
+    expected, paper_ids = build_assistant_approval_arguments(
+        context.db,
+        run_id=context.assistant_run_id,
+        request=tool_input.request,
+        decision=tool_input.decision,
+        tool_input=tool_input,
+    )
+    if action.arguments != expected:
+        raise ValueError("The source or glossary changed after approval. Please review again.")
+    return action, paper_ids
 
 
 async def _cached_catalog_search(catalog: str, query: str) -> tuple[CatalogSearchResult, str]:
@@ -272,6 +493,117 @@ async def _clarify(_context: ToolContext, tool_input: AssistantToolInput) -> Ass
         display_text=tool_input.decision.clarification or "Please clarify what you want me to do.",
         structured_payload={"missing_information": tool_input.decision.missing_information},
     )
+
+
+async def _translate(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    try:
+        action, paper_ids = _current_translation_approval_arguments(context, tool_input)
+        translation, created = create_translation(
+            context.db,
+            project_id=tool_input.request.project_id,
+            paper_id=paper_ids[0],
+            idempotency_key=f"assistant:{context.assistant_run_id}:{action.id}",
+            acknowledge_external_processing=True,
+        )
+    except (TranslationConflict, ValueError) as exc:
+        return AssistantToolResult(
+            status=ToolStatus.NEEDS_INPUT,
+            result_type="translation_approval_invalid",
+            display_text=str(exc),
+        )
+
+    return _translation_job_result(translation, created=created)
+
+
+def _translation_job_result(
+    translation: TranslationDocument, *, created: bool
+) -> AssistantToolResult:
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="translation_job",
+        display_text=(
+            "The English-to-Vietnamese translation job is queued. "
+            "You can check its status or download the translated-only PDF when it is ready."
+        ),
+        structured_payload={
+            "translation_id": str(translation.id),
+            "paper_id": str(translation.paper_id),
+            "status": translation.status,
+            "stage": translation.stage,
+            "created": created,
+            "output_format": "translated_pdf_only",
+        },
+    )
+
+
+def recover_approved_translation(
+    context: ToolContext, tool_input: AssistantToolInput
+) -> AssistantToolResult | None:
+    """Recover a committed translation job after its assistant step was not saved."""
+    if context.assistant_run_id is None or context.approved_action_id is None:
+        return None
+    action = context.db.get(AssistantApprovalAction, context.approved_action_id)
+    run = context.db.get(AssistantRun, context.assistant_run_id)
+    if (
+        action is None
+        or action.run_id != context.assistant_run_id
+        or action.action_type != AssistantIntent.TRANSLATE.value
+        or action.status != "APPROVED"
+        or run is None
+        or run.project_id != tool_input.request.project_id
+        or tool_input.decision.intent is not AssistantIntent.TRANSLATE
+    ):
+        return None
+
+    expected_paper_ids = (
+        tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    )
+    action_paper_ids = action.arguments.get("paper_ids")
+    if (
+        len(expected_paper_ids) != 1
+        or action_paper_ids != [str(expected_paper_ids[0])]
+        or action.arguments.get("message") != tool_input.request.message
+        or action.arguments.get("scope") != tool_input.request.scope.value
+        or action.arguments.get("action_summary") != tool_input.decision.action_summary
+        or action.arguments.get("tool_arguments") != tool_input.arguments.model_dump(mode="json")
+    ):
+        return None
+
+    approved_snapshot = action.arguments.get("translation")
+    if not isinstance(approved_snapshot, dict):
+        return None
+    translation = (
+        context.db.query(TranslationDocument)
+        .filter(
+            TranslationDocument.project_id == run.project_id,
+            TranslationDocument.paper_id == expected_paper_ids[0],
+            TranslationDocument.idempotency_key
+            == f"assistant:{context.assistant_run_id}:{action.id}",
+        )
+        .one_or_none()
+    )
+    if (
+        translation is None
+        or translation.source_sha256 != approved_snapshot.get("source_sha256")
+        or not translation.acknowledge_external_processing
+        or approved_snapshot.get("target_language") != "vi"
+        or approved_snapshot.get("output_format") != "translated_pdf_only"
+        or approved_snapshot.get("external_processing_disclosure")
+        != TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE
+        or len(translation.glossary_snapshot) != approved_snapshot.get("glossary_entry_count")
+    ):
+        return None
+    glossary_identity = hashlib.sha256(
+        json.dumps(
+            translation.glossary_snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if glossary_identity != approved_snapshot.get("glossary_snapshot_identity"):
+        return None
+    return _translation_job_result(translation, created=False)
 
 
 def _note_payload(memory: Any) -> dict[str, Any]:
@@ -585,6 +917,307 @@ async def _report(context: ToolContext, tool_input: AssistantToolInput) -> Assis
         structured_payload={
             "report_markdown": response.content,
             "scope": scope,
+            "source_manifest": manifest,
+            "saved": False,
+        },
+        citations=response.citations,
+        evidence=[item.model_dump(mode="json") for item in response.evidence],
+        usage=response.provider_usage,
+    )
+
+
+async def _research(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    """Draft one bounded research synthesis using the existing grounded QA path."""
+    arguments = tool_input.arguments
+    if not isinstance(arguments, ResearchArguments):
+        raise TypeError("research arguments were not validated")
+
+    paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    scope = "selection" if paper_ids else "project"
+    subquestions = arguments.subquestions or [arguments.goal]
+    retrieval_question = "\n".join([arguments.goal, *subquestions])
+    guidance = (
+        "Draft a concise research synthesis for the stated goal. Address each listed subquestion "
+        "using only retrieved paper evidence. Cite factual claims. Clearly label interpretations, "
+        "and say when the selected evidence does not answer a subquestion. Do not claim that a "
+        "finding is novel or absent from literature beyond the selected evidence. Return a useful "
+        "draft, not hidden reasoning."
+    )
+
+    with get_telemetry().stage(
+        "research.plan",
+        input={"goal": arguments.goal, "subquestion_count": len(subquestions)},
+        metadata={"outcome": "planned", "step_limit": 1},
+    ) as plan_observation:
+        if plan_observation is not None:
+            plan_observation.update(output={"subquestions": subquestions})
+
+    from app.services.embedding import get_embedding_provider
+
+    embedding_provider = get_embedding_provider()
+    retrieved_evidence = []
+    source_questions: dict[tuple[UUID, UUID], set[str]] = {}
+    for subquestion in subquestions:
+        query_embedding = await asyncio.to_thread(embedding_provider.embed_query, subquestion)
+        for paper_id in paper_ids:
+            with get_telemetry().stage(
+                "research.retrieve",
+                input={"question": subquestion},
+                metadata={"paper_id": str(paper_id), "outcome": "started"},
+            ) as retrieval_observation:
+                candidates = context.chat_service.retriever.retrieve(
+                    context.db,
+                    tool_input.request.project_id,
+                    subquestion,
+                    query_embedding=query_embedding,
+                    selected_paper_ids=[paper_id],
+                )
+                if retrieval_observation is not None:
+                    retrieval_observation.update(
+                        output={"candidate_count": len(candidates)},
+                        metadata={"outcome": "completed" if candidates else "no_evidence"},
+                    )
+            if candidates:
+                candidate = candidates[0]
+                if candidate.paper_id != paper_id:
+                    continue
+                source_key = (candidate.paper_id, candidate.chunk_id)
+                source_questions.setdefault(source_key, set()).add(subquestion)
+                retrieved_evidence.append(
+                    candidate.model_copy(update={"id": f"E{len(retrieved_evidence) + 1}"})
+                )
+
+    with get_telemetry().stage(
+        "research.analyze",
+        input={"goal": arguments.goal, "subquestion_count": len(subquestions)},
+        metadata={
+            "scope": scope,
+            "selected_paper_count": len(paper_ids),
+            "cache": "shared retrieval cache; corpus-revision keyed",
+        },
+    ) as observation:
+        response = await context.chat_service.answer_question(
+            context.db,
+            tool_input.request.conversation_id,
+            arguments.goal,
+            assistant_run_id=context.assistant_run_id,
+            retrieval_question=retrieval_question,
+            paper_scope=scope,
+            selected_paper_ids=paper_ids,
+            run_worker_id=context.worker_id,
+            run_attempt_count=context.attempt_count,
+            response_guidance=guidance,
+            additional_evidence=retrieved_evidence,
+        )
+        if observation is not None:
+            observation.update(
+                output={"evidence_count": len(response.evidence)},
+                metadata={"model": response.model_name, "outcome": "analyzed"},
+            )
+
+    manifest = report_source_manifest(response.citations, response.evidence)
+    analyzed_sources = {(item.paper_id, item.chunk_id) for item in response.evidence}
+    coverage = [
+        {
+            "paper_id": str(paper_id),
+            "subquestion": subquestion,
+            "has_evidence": any(
+                (paper_id, chunk_id) in analyzed_sources and subquestion in covered_questions
+                for (candidate_paper_id, chunk_id), covered_questions in source_questions.items()
+                if candidate_paper_id == paper_id
+            ),
+        }
+        for paper_id in paper_ids
+        for subquestion in subquestions
+    ]
+    evidence_gaps = [
+        {"paper_id": item["paper_id"], "subquestion": item["subquestion"]}
+        for item in coverage
+        if not item["has_evidence"]
+    ]
+    with get_telemetry().stage(
+        "research.verify",
+        input={"evidence_count": len(response.evidence)},
+        metadata={"outcome": "completed" if manifest else "insufficient_evidence"},
+    ) as verify_observation:
+        if verify_observation is not None:
+            verify_observation.update(output={"verified_citation_count": len(manifest)})
+
+    with get_telemetry().stage(
+        "research.draft",
+        metadata={"saved": False, "outcome": "drafted" if manifest else "needs_evidence"},
+    ) as draft_observation:
+        if draft_observation is not None:
+            draft_observation.update(output={"citation_count": len(manifest)})
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED if manifest else ToolStatus.NEEDS_INPUT,
+        result_type="research_draft" if manifest else "research_evidence_unavailable",
+        display_text=(
+            response.content
+            if manifest
+            else (
+                "I couldn't find verified evidence for this research task. Select READY papers "
+                "or narrow the goal."
+            )
+        ),
+        structured_payload={
+            "goal": arguments.goal,
+            "subquestions": subquestions,
+            "scope": scope,
+            "model_name": response.model_name,
+            "evidence_coverage": coverage,
+            "evidence_gaps": evidence_gaps,
+            "discovery_query": evidence_gaps[0]["subquestion"] if evidence_gaps else None,
+            "discovery_requires_import_approval": bool(evidence_gaps),
+            "source_manifest": manifest,
+            "saved": False,
+        },
+        citations=response.citations,
+        evidence=[item.model_dump(mode="json") for item in response.evidence],
+        usage=response.provider_usage,
+        available_actions=["discover"] if evidence_gaps else [],
+    )
+
+
+async def _gap_analysis(
+    context: ToolContext, tool_input: AssistantToolInput
+) -> AssistantToolResult:
+    arguments = tool_input.arguments
+    if not isinstance(arguments, GapAnalysisArguments):
+        raise TypeError("gap-analysis arguments were not validated")
+
+    paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    focus = arguments.focus or tool_input.request.message
+    question = f"Analyze evidence gaps in the selected papers, focusing on: {focus}"
+    guidance = """Review only the supplied evidence from the selected papers. Use these headings:
+## Stated limitations
+## Future work
+## Missing evaluations
+## Conflicting findings
+## Evidence gaps
+
+Cite every statement about a paper. Separate limitations or future work explicitly stated by a
+paper from gaps inferred from the evidence returned here. Phrase absence as 'Not found in the
+selected evidence'; do not claim novelty or absence from the wider literature. If evidence is
+insufficient for a category, say so plainly."""
+
+    with get_telemetry().stage(
+        "research.analyze",
+        input={"focus": focus, "paper_count": len(paper_ids)},
+        metadata={"operation": "gap_analysis", "cache": "shared retrieval policy"},
+    ) as observation:
+        response = await context.chat_service.answer_question(
+            context.db,
+            tool_input.request.conversation_id,
+            question,
+            assistant_run_id=context.assistant_run_id,
+            retrieval_question=question,
+            paper_scope="selection",
+            selected_paper_ids=paper_ids,
+            run_worker_id=context.worker_id,
+            run_attempt_count=context.attempt_count,
+            response_guidance=guidance,
+        )
+        manifest = report_source_manifest(response.citations, response.evidence)
+        if observation is not None:
+            observation.update(
+                output={"evidence_count": len(response.evidence), "citation_count": len(manifest)},
+                metadata={"model": response.model_name, "outcome": "analyzed"},
+            )
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED if manifest else ToolStatus.NEEDS_INPUT,
+        result_type="gap_analysis" if manifest else "gap_analysis_evidence_unavailable",
+        display_text=(
+            response.content
+            if manifest
+            else (
+                "I couldn't find verified evidence for this gap analysis. Select READY papers or "
+                "narrow the focus."
+            )
+        ),
+        structured_payload={
+            "focus": focus,
+            "scope": "selection",
+            "model_name": response.model_name,
+            "scope_limit": "selected evidence only; not a corpus-wide novelty assessment",
+            "analysis_markdown": response.content,
+            "source_manifest": manifest,
+            "saved": False,
+        },
+        citations=response.citations,
+        evidence=[item.model_dump(mode="json") for item in response.evidence],
+        usage=response.provider_usage,
+    )
+
+
+async def _experiment_plan(
+    context: ToolContext, tool_input: AssistantToolInput
+) -> AssistantToolResult:
+    arguments = tool_input.arguments
+    if not isinstance(arguments, ExperimentPlanArguments):
+        raise TypeError("experiment-plan arguments were not validated")
+
+    paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    guidance = """Draft a proposed experiment grounded in the supplied selected-paper evidence.
+Use these headings:
+## Objective
+## Hypothesis
+## Dataset
+## Baselines
+## Metrics
+## Ablations
+## Risks
+## Evidence-based motivation
+
+The objective is user-supplied. Label every other design choice as a proposal, not a fact about
+completed research. Cite factual motivation with evidence markers such as [E1]. Do not invent
+benchmark results or claim a proposal is validated. Do not generate or execute code. If the
+papers do not identify a suitable dataset or baseline, state that and offer a clearly labelled
+suggestion for the owner to verify."""
+
+    with get_telemetry().stage(
+        "research.analyze",
+        input={"objective": arguments.objective, "paper_count": len(paper_ids)},
+        metadata={"operation": "experiment_plan", "cache": "shared retrieval policy"},
+    ) as observation:
+        response = await context.chat_service.answer_question(
+            context.db,
+            tool_input.request.conversation_id,
+            arguments.objective,
+            assistant_run_id=context.assistant_run_id,
+            retrieval_question=arguments.objective,
+            paper_scope="selection",
+            selected_paper_ids=paper_ids,
+            run_worker_id=context.worker_id,
+            run_attempt_count=context.attempt_count,
+            response_guidance=guidance,
+        )
+        manifest = report_source_manifest(response.citations, response.evidence)
+        proposal = _parse_experiment_plan(response.content)
+        if observation is not None:
+            observation.update(
+                output={"evidence_count": len(response.evidence), "citation_count": len(manifest)},
+                metadata={"model": response.model_name, "outcome": "analyzed"},
+            )
+
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED if manifest else ToolStatus.NEEDS_INPUT,
+        result_type="experiment_proposal" if manifest else "experiment_evidence_unavailable",
+        display_text=(
+            response.content
+            if manifest
+            else (
+                "I couldn't find verified evidence to motivate an experiment proposal. "
+                "Select READY papers or narrow the objective."
+            )
+        ),
+        structured_payload={
+            "objective": arguments.objective,
+            "model_name": response.model_name,
+            "proposal": proposal,
+            "proposal_markdown": response.content,
             "source_manifest": manifest,
             "saved": False,
         },
@@ -1113,10 +1746,36 @@ def build_tool_registry() -> Mapping[AssistantIntent, ToolDefinition]:
     register(AssistantIntent.DISCOVER, DiscoverArguments, _discover, available=True)
     register(AssistantIntent.NOTES, NotesArguments, _notes, approval=True, available=True)
     register(AssistantIntent.REPORT, ReportArguments, _report, available=True)
-    register(AssistantIntent.RESEARCH, ResearchArguments, min_papers=1)
-    register(AssistantIntent.GAP_ANALYSIS, GapAnalysisArguments, min_papers=1)
-    register(AssistantIntent.EXPERIMENT_PLAN, ExperimentPlanArguments, min_papers=1)
-    register(AssistantIntent.TRANSLATE, TranslateArguments, approval=True, min_papers=1)
+    register(
+        AssistantIntent.RESEARCH,
+        ResearchArguments,
+        _research,
+        min_papers=1,
+        available=True,
+    )
+    register(
+        AssistantIntent.GAP_ANALYSIS,
+        GapAnalysisArguments,
+        _gap_analysis,
+        min_papers=1,
+        available=True,
+    )
+    register(
+        AssistantIntent.EXPERIMENT_PLAN,
+        ExperimentPlanArguments,
+        _experiment_plan,
+        min_papers=1,
+        available=True,
+    )
+    register(
+        AssistantIntent.TRANSLATE,
+        TranslateArguments,
+        _translate,
+        approval=True,
+        min_papers=1,
+        max_papers=1,
+        available=True,
+    )
     register(AssistantIntent.VISION, VisionArguments, min_papers=1)
     register(AssistantIntent.GRAPH, GraphArguments, min_papers=1)
     # QA's handler receives the already-configured existing chat service in ToolContext.

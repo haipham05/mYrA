@@ -110,6 +110,54 @@ describe("ChatPanel", () => {
     expect(screen.getByRole("button", { name: "[1]" })).toBeInTheDocument();
   });
 
+  it("offers bounded discovery from a research evidence gap", async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const message: Message = {
+      id: "research-gap",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "The selected papers do not report this evaluation [1].",
+      citations: [mockCitation],
+      evidence: [],
+      created_at: new Date().toISOString(),
+      assistantResult: {
+        result_type: "research_draft",
+        display_text: "The selected papers do not report this evaluation [1].",
+        structured_payload: {
+          discovery_query: "small-data evaluation methods",
+        },
+        citations: [mockCitation],
+        warnings: [],
+        usage: {},
+        available_actions: ["discover"],
+        artifact_ids: [],
+      },
+    };
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={onSendMessage}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Discover papers for this gap" }),
+    );
+    expect(
+      screen.getByText(/selected papers do not report this evaluation/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "[1]" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(onSendMessage).toHaveBeenCalledWith(
+        "Find academic papers about: small-data evaluation methods",
+      ),
+    );
+  });
+
   it("renders tables and math, keeps citations interactive, and ignores raw HTML", () => {
     const onCitationClick = vi.fn();
     const message: Message = {

@@ -201,3 +201,7 @@ class AssistantRunResumeRequest(BaseModel):
         if not value.strip():
             raise ValueError("additional_input must not be blank")
         return value
+
+
+class AssistantRunArtifactSaveRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=255)

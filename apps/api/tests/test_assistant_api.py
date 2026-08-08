@@ -115,6 +115,99 @@ def test_successful_run_poll_returns_tool_result_with_unknown_usage(assistant_ap
     assert result.json()["result"]["usage"] == {}
 
 
+def test_research_draft_is_saved_only_when_requested_and_once_per_run(assistant_api_context):
+    client, session, project, conversation, paper = assistant_api_context
+    run = AssistantRun(
+        project_id=project.id,
+        conversation_id=conversation.id,
+        idempotency_key="research-artifact-run",
+        request_hash="f" * 64,
+        request_payload={"scope": "paper", "selected_paper_ids": [str(paper.id)]},
+        status="SUCCEEDED",
+        intent="research",
+        action_summary="Review selected-paper evidence",
+        route_decision={"resolved_paper_ids": [str(paper.id)]},
+        result_payload={
+            "status": "SUCCEEDED",
+            "result_type": "research_draft",
+            "display_text": "A grounded research draft [1].",
+            "structured_payload": {
+                "goal": "Review the method",
+                "model_name": "deepseek-flash",
+                "source_manifest": [
+                    {
+                        "evidence_id": "1",
+                        "citation_index": 1,
+                        "paper_id": str(paper.id),
+                        "paper_title": "Selected paper",
+                        "page_number": 1,
+                        "chunk_id": str(uuid4()),
+                        "document_sha256": "a" * 64,
+                        "quote": "The selected paper supports this point.",
+                    }
+                ],
+                "saved": False,
+            },
+            "citations": [],
+            "evidence": [],
+            "usage": {"total_tokens": 24},
+        },
+    )
+    session.add(run)
+    session.commit()
+
+    from app.db.models import ResearchArtifact
+
+    assert session.query(ResearchArtifact).count() == 0
+    first = client.post(f"/api/v1/runs/{run.id}/artifact", json={"title": "Method review"})
+    second = client.post(f"/api/v1/runs/{run.id}/artifact", json={})
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["artifact_type"] == "report"
+    assert first.json()["latest"]["payload"]["run_id"] == str(run.id)
+    assert first.json()["latest"]["scope_snapshot"]["paper_ids"] == [str(paper.id)]
+    assert first.json()["latest"]["config_snapshot"]["model_name"] == "deepseek-flash"
+    assert first.json()["latest"]["usage"] == {"total_tokens": 24}
+    assert session.query(ResearchArtifact).count() == 1
+
+
+def test_run_artifact_requires_completed_result_and_verified_sources(assistant_api_context):
+    client, session, project, conversation, _paper = assistant_api_context
+    run = AssistantRun(
+        project_id=project.id,
+        conversation_id=conversation.id,
+        idempotency_key="unfinished-artifact-run",
+        request_hash="e" * 64,
+        request_payload={},
+        status="NEEDS_INPUT",
+        intent="research",
+        result_payload={
+            "result_type": "research_draft",
+            "structured_payload": {"source_manifest": []},
+        },
+    )
+    session.add(run)
+    session.commit()
+
+    response = client.post(f"/api/v1/runs/{run.id}/artifact", json={})
+
+    assert response.status_code == 409
+    run.status = "SUCCEEDED"
+    run.result_payload = {
+        "result_type": "research_draft",
+        "structured_payload": {"source_manifest": []},
+    }
+    session.commit()
+    no_sources = client.post(f"/api/v1/runs/{run.id}/artifact", json={})
+
+    assert no_sources.status_code == 409
+    from app.db.models import ResearchArtifact
+
+    assert session.query(ResearchArtifact).count() == 0
+
+
 def test_run_submit_rejects_path_mismatch_and_idempotency_conflict(assistant_api_context):
     client, _, project, conversation, paper = assistant_api_context
     body = _request_body(project, conversation, paper)

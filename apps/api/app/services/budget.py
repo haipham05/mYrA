@@ -1,7 +1,7 @@
 """Atomic admission controls for paid DeepSeek requests.
 
 Reservations are conservative estimates, not a promise of the provider's final bill.
-The snapshot is pinned to the official DeepSeek pricing published 2026-09-10; peak
+The snapshot is pinned to the official DeepSeek pricing checked 2026-10-05; peak
 prices are used at all times so off-peak discounts cannot inflate available budget.
 """
 
@@ -19,8 +19,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.models import ProviderBudgetDay, ProviderBudgetReservation
 
-PRICING_SNAPSHOT = "deepseek-flash-peak-2026-09-10"
-PRICING_SNAPSHOT_DATE = date(2026, 9, 10)
+PRICING_SNAPSHOT = "deepseek-flash-peak-2026-10-05"
+PRICING_SNAPSHOT_DATE = date(2026, 10, 5)
 PRICE_PER_MILLION = {
     "deepseek-flash": {
         "input_miss": Decimal("0.30"),
@@ -56,7 +56,11 @@ def _ceil_microdollar(value: Decimal) -> Decimal:
 
 
 def estimate_reservation(
-    *, requested_model: str, input_bytes: int, max_output_tokens: int
+    *,
+    requested_model: str,
+    input_bytes: int,
+    max_output_tokens: int,
+    estimated_input_tokens: int | None = None,
 ) -> tuple[Decimal, int]:
     age_days = (datetime.now(UTC).date() - PRICING_SNAPSHOT_DATE).days
     if age_days > 30:
@@ -64,7 +68,13 @@ def estimate_reservation(
     prices = PRICE_PER_MILLION.get(requested_model)
     if prices is None:
         raise BudgetDeniedError("No current price snapshot is configured for this model")
-    input_tokens = input_bytes * INPUT_TOKEN_SAFETY_MULTIPLIER
+    input_tokens = (
+        estimated_input_tokens
+        if estimated_input_tokens is not None
+        else input_bytes * INPUT_TOKEN_SAFETY_MULTIPLIER
+    )
+    if input_tokens < 0:
+        raise ValueError("estimated_input_tokens must not be negative")
     if input_tokens > MAX_ESTIMATED_INPUT_TOKENS:
         raise BudgetDeniedError("Request exceeds the configured paid-input budget")
     estimate = (
@@ -96,6 +106,7 @@ class BudgetManager:
         requested_model: str,
         input_bytes: int,
         max_output_tokens: int,
+        estimated_input_tokens: int | None = None,
         now: datetime | None = None,
     ) -> BudgetReservation:
         if not run_id or len(run_id) > 64:
@@ -106,6 +117,7 @@ class BudgetManager:
             requested_model=requested_model,
             input_bytes=input_bytes,
             max_output_tokens=max_output_tokens,
+            estimated_input_tokens=estimated_input_tokens,
         )
         utc_date = (now or datetime.now(UTC)).astimezone(UTC).date()
         reservation_id = uuid4()

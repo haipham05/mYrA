@@ -322,6 +322,7 @@ class BabelDocTranslationProcessor:
                             "skipped_units": event.get("skipped"),
                             "failure_count": event.get("failed"),
                             "failure_reasons": event.get("failure_reasons", {}),
+                            "failure_causes": event.get("failure_causes", {}),
                             "skip_reasons": event.get("skip_reasons", {}),
                             "failure_units": event.get("failure_units", [])[:20],
                         },
@@ -331,6 +332,7 @@ class BabelDocTranslationProcessor:
                         metadata=self._trace_metadata(
                             translation_id=str(job.id),
                             failure_reasons=event.get("failure_reasons", {}),
+                            failure_causes=event.get("failure_causes", {}),
                             skip_reasons=event.get("skip_reasons", {}),
                             failure_units=event.get("failure_units", []),
                         ),
@@ -438,6 +440,7 @@ class BabelDocTranslationProcessor:
                             if rejected_prose_units
                             else {}
                         ),
+                        "failure_causes": {},
                         "failure_units": failure_units,
                     },
                 )

@@ -50,6 +50,18 @@ def test_reservation_uses_peak_price_and_utf8_safety_bound() -> None:
     assert amount == Decimal("0.005516")
 
 
+def test_image_reservation_accepts_provider_documented_token_estimate() -> None:
+    amount, estimated_tokens = estimate_reservation(
+        requested_model="deepseek-flash",
+        input_bytes=2_000_000,
+        max_output_tokens=512,
+        estimated_input_tokens=1_100,
+    )
+
+    assert estimated_tokens == 1_100
+    assert amount == Decimal("0.000945")
+
+
 def test_settlement_reconciles_estimate_before_next_reservation(budget_manager) -> None:
     first = reserve(budget_manager)
     with pytest.raises(BudgetDeniedError, match="per-run budget"):

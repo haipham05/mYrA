@@ -17,7 +17,7 @@ from app.crud.assistant_run import (
     save_assistant_step,
     start_assistant_step,
 )
-from app.db.models import AssistantRun, Message, Paper
+from app.db.models import AssistantApprovalAction, AssistantRun, AssistantRunStep, Message, Paper
 from app.observability.context import OperationContext, use_operation_context
 from app.observability.telemetry import TelemetryAdapter, get_telemetry
 from app.schemas.assistant import (
@@ -30,11 +30,13 @@ from app.schemas.assistant import (
 )
 from app.services.assistant_router import AssistantRouter
 from app.services.assistant_tools import (
-    AssistantToolInput,
     ToolContext,
     ToolStatus,
+    build_assistant_approval_arguments,
     build_tool_registry,
     execute_tool,
+    recover_approved_translation,
+    recover_persisted_research_result,
     tool_requires_approval,
     validate_tool_input,
 )
@@ -144,41 +146,115 @@ class AssistantRunProcessor:
                     )
                     return
 
+                tool_fingerprint = _fingerprint(
+                    {"request_hash": request_hash, "decision": decision.model_dump(mode="json")}
+                )
+                approved_action = None
+                recovered_translation = None
                 if definition.available and tool_requires_approval(definition, tool_input):
-                    approved_arguments = {
-                        "message": request.message,
-                        "scope": request.scope.value,
-                        "paper_ids": [
-                            str(item)
-                            for item in (decision.resolved_paper_ids or request.selected_paper_ids)
-                        ],
-                        "action_summary": decision.action_summary,
-                        "tool_arguments": tool_input.arguments.model_dump(mode="json"),
-                    }
-                    try:
-                        approved_action = get_valid_approved_assistant_action(
-                            db,
-                            run_id,
-                            action_type=decision.intent.value,
-                            expected_arguments=approved_arguments,
-                            paper_ids=decision.resolved_paper_ids or request.selected_paper_ids,
+                    if decision.intent is AssistantIntent.TRANSLATE:
+                        prior_action = (
+                            db.query(AssistantApprovalAction)
+                            .filter(
+                                AssistantApprovalAction.run_id == run_id,
+                                AssistantApprovalAction.action_type == decision.intent.value,
+                                AssistantApprovalAction.status == "APPROVED",
+                            )
+                            .order_by(
+                                AssistantApprovalAction.decided_at.desc(),
+                                AssistantApprovalAction.id.desc(),
+                            )
+                            .first()
                         )
-                    except ValueError:
-                        self._finish_failure(
-                            db,
-                            run_id,
-                            worker_id,
-                            attempt_count,
-                            code="APPROVAL_NO_LONGER_VALID",
-                            result_type="approval_invalidated",
-                            message=(
-                                "The approved action no longer matches the current request or "
-                                "source. Please review and submit it again."
-                            ),
-                            decision=decision,
-                            route_result=route_result,
+                        has_prior_approval = prior_action is not None
+                        interrupted_step = (
+                            db.query(AssistantRunStep)
+                            .filter(
+                                AssistantRunStep.run_id == run_id,
+                                AssistantRunStep.step_key
+                                == f"assistant.tool.{decision.intent.value}",
+                                AssistantRunStep.input_fingerprint == tool_fingerprint,
+                                AssistantRunStep.status.in_(("RUNNING", "UNKNOWN", "COMPLETED")),
+                            )
+                            .first()
                         )
-                        return
+                        if prior_action is not None and interrupted_step is not None:
+                            recovered_translation = recover_approved_translation(
+                                ToolContext(
+                                    db=db,
+                                    chat_service=self._chat_service,
+                                    assistant_run_id=run_id,
+                                    approved_action_id=prior_action.id,
+                                    worker_id=worker_id,
+                                    attempt_count=attempt_count,
+                                ),
+                                tool_input,
+                            )
+                            if recovered_translation is not None:
+                                approved_action = prior_action
+                    if approved_action is None:
+                        try:
+                            approved_arguments, approval_paper_ids = (
+                                build_assistant_approval_arguments(
+                                    db,
+                                    run_id=run_id,
+                                    request=request,
+                                    decision=decision,
+                                    tool_input=tool_input,
+                                )
+                            )
+                            approved_action = get_valid_approved_assistant_action(
+                                db,
+                                run_id,
+                                action_type=decision.intent.value,
+                                expected_arguments=approved_arguments,
+                                paper_ids=approval_paper_ids,
+                            )
+                        except ValueError as exc:
+                            if decision.intent is AssistantIntent.TRANSLATE:
+                                try:
+                                    existing_approval = get_valid_approved_assistant_action(
+                                        db,
+                                        run_id,
+                                        action_type=decision.intent.value,
+                                        expected_arguments={},
+                                        paper_ids=(
+                                            decision.resolved_paper_ids
+                                            or request.selected_paper_ids
+                                        ),
+                                    )
+                                except ValueError:
+                                    existing_approval = None
+                                if existing_approval is None and not has_prior_approval:
+                                    self._finish_needs_input(
+                                        db,
+                                        run_id,
+                                        worker_id,
+                                        attempt_count,
+                                        RouteDecision(
+                                            intent=AssistantIntent.CLARIFY,
+                                            missing_information=["ready_paper"],
+                                            clarification=str(exc),
+                                            action_summary="Select one READY paper for translation",
+                                        ),
+                                        route_result,
+                                    )
+                                    return
+                            self._finish_failure(
+                                db,
+                                run_id,
+                                worker_id,
+                                attempt_count,
+                                code="APPROVAL_NO_LONGER_VALID",
+                                result_type="approval_invalidated",
+                                message=(
+                                    "The approved action no longer matches the current request or "
+                                    "source. Please review and submit it again."
+                                ),
+                                decision=decision,
+                                route_result=route_result,
+                            )
+                            return
                     if approved_action is None:
                         self._finish_approval_wait(
                             db,
@@ -188,13 +264,11 @@ class AssistantRunProcessor:
                             request,
                             decision,
                             route_result,
-                            tool_input,
+                            approved_arguments,
+                            approval_paper_ids,
                         )
                         return
 
-                tool_fingerprint = _fingerprint(
-                    {"request_hash": request_hash, "decision": decision.model_dump(mode="json")}
-                )
                 step, should_execute = start_assistant_step(
                     db,
                     run_id,
@@ -208,11 +282,46 @@ class AssistantRunProcessor:
                 if not should_execute:
                     if step.status == "COMPLETED" and step.output_payload is not None:
                         tool_result_payload = step.output_payload
-                    elif decision.intent is AssistantIntent.QA:
+                    elif recovered_translation is not None:
+                        tool_result_payload = recovered_translation.model_dump(mode="json")
+                        save_assistant_step(
+                            db,
+                            run_id,
+                            worker_id=worker_id,
+                            attempt_count=attempt_count,
+                            step_key=f"assistant.tool.{decision.intent.value}",
+                            ordinal=2,
+                            input_fingerprint=tool_fingerprint,
+                            output_payload=tool_result_payload,
+                            tool_name=decision.intent.value,
+                            external_effect_id=str(
+                                recovered_translation.structured_payload["translation_id"]
+                            ),
+                        )
+                    elif decision.intent in {
+                        AssistantIntent.QA,
+                        AssistantIntent.RESEARCH,
+                        AssistantIntent.GAP_ANALYSIS,
+                        AssistantIntent.EXPERIMENT_PLAN,
+                    }:
                         completed_message = (
                             db.query(Message).filter(Message.assistant_run_id == run_id).first()
                         )
-                        if completed_message is None:
+                        recovered_payload = None
+                        if completed_message is not None:
+                            if decision.intent is AssistantIntent.QA:
+                                recovered_payload = self._tool_result_from_message(
+                                    completed_message
+                                )
+                            else:
+                                recovered_result = recover_persisted_research_result(
+                                    decision.intent,
+                                    tool_input,
+                                    completed_message,
+                                )
+                                if recovered_result is not None:
+                                    recovered_payload = recovered_result.model_dump(mode="json")
+                        if recovered_payload is None:
                             self._finish_failure(
                                 db,
                                 run_id,
@@ -228,7 +337,7 @@ class AssistantRunProcessor:
                                 route_result=route_result,
                             )
                             return
-                        tool_result_payload = self._tool_result_from_message(completed_message)
+                        tool_result_payload = recovered_payload
                         save_assistant_step(
                             db,
                             run_id,
@@ -273,6 +382,9 @@ class AssistantRunProcessor:
                                     db=db,
                                     chat_service=self._chat_service,
                                     assistant_run_id=run_id,
+                                    approved_action_id=(
+                                        approved_action.id if approved_action is not None else None
+                                    ),
                                     worker_id=worker_id,
                                     attempt_count=attempt_count,
                                 ),
@@ -316,9 +428,20 @@ class AssistantRunProcessor:
                             input_fingerprint=tool_fingerprint,
                             output_payload=tool_result_payload,
                             tool_name=decision.intent.value,
-                            external_effect_id=str(run_id)
-                            if decision.intent is AssistantIntent.QA
-                            else None,
+                            external_effect_id=(
+                                str(run_id)
+                                if decision.intent is AssistantIntent.QA
+                                else str(
+                                    tool_result_payload.get("structured_payload", {}).get(
+                                        "translation_id"
+                                    )
+                                )
+                                if decision.intent is AssistantIntent.TRANSLATE
+                                and tool_result_payload.get("structured_payload", {}).get(
+                                    "translation_id"
+                                )
+                                else None
+                            ),
                         )
                         if observation is not None:
                             observation.update(
@@ -491,7 +614,8 @@ class AssistantRunProcessor:
         request: AssistantRunRequest,
         decision: RouteDecision,
         route_result: dict[str, object],
-        tool_input: AssistantToolInput,
+        approved_arguments: dict[str, object],
+        paper_ids: list[UUID],
     ) -> None:
         action = create_assistant_approval(
             db,
@@ -499,14 +623,8 @@ class AssistantRunProcessor:
             worker_id=worker_id,
             attempt_count=attempt,
             action_type=decision.intent.value,
-            arguments={
-                "message": request.message,
-                "scope": request.scope.value,
-                "paper_ids": [str(item) for item in decision.resolved_paper_ids],
-                "action_summary": decision.action_summary,
-                "tool_arguments": tool_input.arguments.model_dump(mode="json"),
-            },
-            paper_ids=decision.resolved_paper_ids or request.selected_paper_ids,
+            arguments=approved_arguments,
+            paper_ids=paper_ids,
         )
         result = AssistantRunResult(
             result_type="approval_required",

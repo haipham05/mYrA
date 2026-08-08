@@ -1,5 +1,6 @@
 import asyncio
-from uuid import uuid4
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine
@@ -13,7 +14,16 @@ from app.crud.assistant_run import (
     resume_assistant_run,
 )
 from app.db.base import Base
-from app.db.models import AssistantApprovalAction, AssistantRun, Memory
+from app.db.models import (
+    AssistantApprovalAction,
+    AssistantRun,
+    AssistantRunStep,
+    Memory,
+    Message,
+    Paper,
+    ProjectTranslationGlossaryEntry,
+    TranslationDocument,
+)
 from app.schemas.assistant import (
     AssistantIntent,
     AssistantRouteResult,
@@ -21,7 +31,14 @@ from app.schemas.assistant import (
     RouteDecision,
     RouteOutcome,
 )
-from app.services.assistant_run_processor import AssistantRunProcessor
+from app.services.assistant_run_processor import AssistantRunProcessor, _fingerprint
+from app.services.assistant_tools import (
+    TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE,
+    ToolContext,
+    build_tool_registry,
+    execute_tool,
+    validate_tool_input,
+)
 
 
 @pytest.fixture
@@ -33,7 +50,13 @@ def session_factory():
     engine.dispose()
 
 
-def _queue_run(factory, *, intent_override: str | None = None):
+def _queue_run(
+    factory,
+    *,
+    intent_override: str | None = None,
+    paper_status: str = "PROCESSING",
+    source_sha256: str | None = None,
+):
     with factory() as db:
         from app.db.models import Conversation, Paper, Project
 
@@ -41,7 +64,13 @@ def _queue_run(factory, *, intent_override: str | None = None):
         db.add(project)
         db.flush()
         conversation = Conversation(project_id=project.id)
-        paper = Paper(project_id=project.id, filename="paper.pdf", storage_path="paper.pdf")
+        paper = Paper(
+            project_id=project.id,
+            filename="paper.pdf",
+            storage_path="paper.pdf",
+            status=paper_status,
+            document_sha256=source_sha256,
+        )
         db.add_all([conversation, paper])
         db.commit()
         payload = {
@@ -161,6 +190,98 @@ async def test_run_processor_executes_routed_qa_and_persists_each_stage(session_
     )
     assert chat.calls[0][2]["paper_scope"] == "selection"
     assert len(chat.calls[0][2]["selected_paper_ids"]) == 1
+
+
+@pytest.mark.anyio
+async def test_interrupted_research_recovers_persisted_message_without_regeneration(
+    session_factory,
+):
+    run_id = _queue_run(session_factory, intent_override="research")
+
+    class ResearchRoute(_RouteStub):
+        async def route(self, request, **kwargs):
+            self.calls += 1
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.RESEARCH,
+                    arguments={"goal": "Summarize the selected evidence", "subquestions": []},
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Draft a bounded research synthesis",
+                ),
+            )
+
+    with session_factory() as db:
+        claimed = claim_next_assistant_run(db, worker_id="worker-recovery")
+        assert claimed is not None and claimed.id == run_id
+        attempt = claimed.attempt_count
+        decision = RouteDecision(
+            intent=AssistantIntent.RESEARCH,
+            arguments={"goal": "Summarize the selected evidence", "subquestions": []},
+            resolved_paper_ids=claimed.request_payload["selected_paper_ids"],
+            action_summary="Draft a bounded research synthesis",
+        )
+        tool_fingerprint = _fingerprint(
+            {"request_hash": claimed.request_hash, "decision": decision.model_dump(mode="json")}
+        )
+        db.add(
+            AssistantRunStep(
+                run_id=run_id,
+                step_key="assistant.tool.research",
+                ordinal=2,
+                tool_name="research",
+                status="UNKNOWN",
+                input_fingerprint=tool_fingerprint,
+                attempt_count=attempt - 1,
+            )
+        )
+        db.add(
+            Message(
+                conversation_id=claimed.conversation_id,
+                assistant_run_id=run_id,
+                role="ASSISTANT",
+                content="Persisted research draft from the completed provider call.",
+                model_name="deepseek-flash",
+                provider_usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            )
+        )
+        db.commit()
+
+    class NoGenerationChat:
+        calls = 0
+
+        async def answer_question(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("recovery must not call the model again")
+
+    chat = NoGenerationChat()
+    route = ResearchRoute(AssistantIntent.RESEARCH)
+    processor = AssistantRunProcessor(
+        session_factory=session_factory,
+        router=route,  # type: ignore[arg-type]
+        chat_service=chat,  # type: ignore[arg-type]
+    )
+    await processor.process(run_id, worker_id="worker-recovery", attempt_count=attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        step = (
+            db.query(AssistantRunStep)
+            .filter_by(run_id=run_id, step_key="assistant.tool.research")
+            .one()
+        )
+        messages = db.query(Message).filter_by(assistant_run_id=run_id).all()
+        assert run is not None and run.status == "NEEDS_INPUT"
+        assert "couldn't find verified evidence" in run.result_payload["display_text"]
+        assert "Persisted research draft" not in run.result_payload["display_text"]
+        assert run.result_payload["usage"]["total_tokens"] == 15
+        assert run.result_payload["structured_payload"]["coverage_status"] == (
+            "not_persisted_before_interruption"
+        )
+        assert step.status == "COMPLETED"
+        assert step.external_effect_id == str(messages[0].id)
+        assert len(messages) == 1
+    assert chat.calls == 0
 
 
 @pytest.mark.anyio
@@ -339,6 +460,333 @@ async def test_note_mutation_waits_for_approval_then_runs_once(session_factory) 
         assert memories[0].title == "Useful limitation"
         assert memories[0].content == "The paper evaluates only a narrow set of tasks."
         assert db.query(AssistantApprovalAction).filter_by(run_id=run_id).one().status == "APPROVED"
+
+
+@pytest.mark.anyio
+async def test_translation_waits_for_fixed_consent_then_enqueues_once(session_factory) -> None:
+    source_hash = "a" * 64
+    run_id = _queue_run(session_factory, paper_status="READY", source_sha256=source_hash)
+
+    class TranslateRoute:
+        async def route(self, request, **kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.TRANSLATE,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Translate this paper",
+                    arguments={"target_language": "vi"},
+                ),
+            )
+
+    processor = AssistantRunProcessor(
+        session_factory=session_factory,
+        router=TranslateRoute(),  # type: ignore[arg-type]
+        chat_service=_ChatStub(),  # type: ignore[arg-type]
+    )
+    with session_factory() as db:
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        first_attempt = claim.attempt_count
+        run = db.get(AssistantRun, run_id)
+        assert run is not None
+        project_id = run.project_id
+        paper_id = run.request_payload["selected_paper_ids"][0]
+        db.add_all(
+            [
+                ProjectTranslationGlossaryEntry(
+                    project_id=project_id,
+                    source_term="attention",
+                    preferred_translation="chú ý",
+                ),
+                ProjectTranslationGlossaryEntry(
+                    project_id=project_id,
+                    source_term="transformer",
+                    preferred_translation="mô hình biến áp",
+                ),
+            ]
+        )
+        db.commit()
+
+    await processor.process(run_id, worker_id="worker-a", attempt_count=first_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        action = db.query(AssistantApprovalAction).filter_by(run_id=run_id).one()
+        assert run is not None and run.status == "AWAITING_APPROVAL"
+        assert action.status == "PENDING"
+        assert db.query(TranslationDocument).count() == 0
+        translation_proposal = action.arguments["translation"]
+        assert (
+            translation_proposal["external_processing_disclosure"]
+            == TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE
+        )
+        assert translation_proposal["source_sha256"] == source_hash
+        assert translation_proposal["target_language"] == "vi"
+        assert translation_proposal["output_format"] == "translated_pdf_only"
+        assert translation_proposal["glossary_entry_count"] == 2
+        assert len(translation_proposal["glossary_snapshot_identity"]) == 64
+        action_id = action.id
+        approved, transitioned = decide_assistant_approval(db, action_id, approve=True)
+        assert transitioned and approved.status == "APPROVED"
+        next_claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert next_claim is not None
+        second_attempt = next_claim.attempt_count
+
+    await processor.process(run_id, worker_id="worker-a", attempt_count=second_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        translation = db.query(TranslationDocument).one()
+        assert run is not None and run.status == "SUCCEEDED"
+        assert translation.paper_id == UUID(str(paper_id))
+        assert translation.project_id == project_id
+        assert translation.acknowledge_external_processing is True
+        assert translation.glossary_snapshot == [
+            {"source_term": "attention", "preferred_translation": "chú ý"},
+            {"source_term": "transformer", "preferred_translation": "mô hình biến áp"},
+        ]
+        result_id = run.result_payload["structured_payload"]["translation_id"]
+        assert result_id == str(translation.id)
+
+        request = AssistantRunRequest.model_validate(run.request_payload)
+        decision = RouteDecision(
+            intent=AssistantIntent.TRANSLATE,
+            resolved_paper_ids=[UUID(str(paper_id))],
+            action_summary="Translate this paper",
+            arguments={"target_language": "vi"},
+        )
+        definition = build_tool_registry()[AssistantIntent.TRANSLATE]
+        tool_input = validate_tool_input(definition, request, decision)
+        replay = await execute_tool(
+            definition,
+            ToolContext(
+                db=db,
+                chat_service=_ChatStub(),  # type: ignore[arg-type]
+                assistant_run_id=run_id,
+                approved_action_id=action_id,
+            ),
+            tool_input,
+        )
+        assert replay.status.value == "SUCCEEDED"
+        assert replay.structured_payload["translation_id"] == result_id
+        assert replay.structured_payload["created"] is False
+        assert db.query(TranslationDocument).count() == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("crash_after_step_save", [False, True])
+async def test_translation_job_is_recovered_after_assistant_step_save_crash(
+    session_factory, monkeypatch, crash_after_step_save
+) -> None:
+    source_hash = "c" * 64
+    run_id = _queue_run(session_factory, paper_status="READY", source_sha256=source_hash)
+
+    class TranslateRoute:
+        async def route(self, request, **kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.TRANSLATE,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Translate this paper",
+                    arguments={"target_language": "vi"},
+                ),
+            )
+
+    processor = AssistantRunProcessor(
+        session_factory=session_factory,
+        router=TranslateRoute(),  # type: ignore[arg-type]
+        chat_service=_ChatStub(),  # type: ignore[arg-type]
+    )
+    with session_factory() as db:
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        first_attempt = claim.attempt_count
+    await processor.process(run_id, worker_id="worker-a", attempt_count=first_attempt)
+
+    with session_factory() as db:
+        action = db.query(AssistantApprovalAction).filter_by(run_id=run_id).one()
+        approved, transitioned = decide_assistant_approval(db, action.id, approve=True)
+        assert transitioned and approved.status == "APPROVED"
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        second_attempt = claim.attempt_count
+
+    from app.services import assistant_run_processor as processor_module
+
+    original_save_step = processor_module.save_assistant_step
+
+    def fail_tool_step_persistence(*args, **kwargs):
+        if kwargs.get("step_key") == "assistant.tool.translate":
+            if crash_after_step_save:
+                original_save_step(*args, **kwargs)
+                raise RuntimeError("simulated process crash after step persistence")
+            raise RuntimeError("simulated process crash before step persistence")
+        return original_save_step(*args, **kwargs)
+
+    monkeypatch.setattr(processor_module, "save_assistant_step", fail_tool_step_persistence)
+    crash_timing = "after" if crash_after_step_save else "before"
+    with pytest.raises(RuntimeError, match=f"simulated process crash {crash_timing}"):
+        await processor.process(run_id, worker_id="worker-a", attempt_count=second_attempt)
+
+    with session_factory() as db:
+        translation = db.query(TranslationDocument).one()
+        step = (
+            db.query(AssistantRunStep)
+            .filter_by(run_id=run_id, step_key="assistant.tool.translate")
+            .one()
+        )
+        assert translation.idempotency_key.startswith(f"assistant:{run_id}:")
+        assert step.status == ("COMPLETED" if crash_after_step_save else "RUNNING")
+        db.add(
+            ProjectTranslationGlossaryEntry(
+                project_id=translation.project_id,
+                source_term="attention",
+                preferred_translation="chú ý",
+            )
+        )
+        run = db.get(AssistantRun, run_id)
+        assert run is not None
+        run.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        db.commit()
+        claim = claim_next_assistant_run(db, worker_id="worker-b")
+        assert claim is not None
+        recovered_attempt = claim.attempt_count
+
+    async def unexpected_tool_execution(*args, **kwargs):
+        raise AssertionError("recovery must not execute the tool again")
+
+    monkeypatch.setattr(processor_module, "save_assistant_step", original_save_step)
+    monkeypatch.setattr(processor_module, "execute_tool", unexpected_tool_execution)
+    await processor.process(run_id, worker_id="worker-b", attempt_count=recovered_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        translation = db.query(TranslationDocument).one()
+        step = (
+            db.query(AssistantRunStep)
+            .filter_by(run_id=run_id, step_key="assistant.tool.translate")
+            .one()
+        )
+        assert run is not None and run.status == "SUCCEEDED"
+        assert run.result_payload["result_type"] == "translation_job"
+        assert run.result_payload["structured_payload"]["translation_id"] == str(translation.id)
+        assert run.result_payload["structured_payload"]["created"] is crash_after_step_save
+        assert step.status == "COMPLETED"
+        assert step.external_effect_id == str(translation.id)
+        assert db.query(TranslationDocument).count() == 1
+        assert db.query(AssistantApprovalAction).filter_by(run_id=run_id).one().status == "APPROVED"
+        assert translation.glossary_snapshot == []
+
+
+@pytest.mark.anyio
+async def test_translation_proposal_rejects_non_ready_paper(session_factory) -> None:
+    run_id = _queue_run(session_factory, paper_status="PROCESSING", source_sha256="b" * 64)
+
+    class TranslateRoute:
+        async def route(self, request, **kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.TRANSLATE,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Translate this paper",
+                    arguments={"target_language": "vi"},
+                ),
+            )
+
+    with session_factory() as db:
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        attempt = claim.attempt_count
+    await AssistantRunProcessor(
+        session_factory=session_factory,
+        router=TranslateRoute(),  # type: ignore[arg-type]
+        chat_service=_ChatStub(),  # type: ignore[arg-type]
+    ).process(run_id, worker_id="worker-a", attempt_count=attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        assert run is not None and run.status == "NEEDS_INPUT"
+        assert db.query(AssistantApprovalAction).filter_by(run_id=run_id).count() == 0
+        assert db.query(TranslationDocument).count() == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("changed_identity", ["source", "glossary"])
+async def test_translation_approval_expires_when_source_or_glossary_changes(
+    session_factory, changed_identity
+) -> None:
+    run_id = _queue_run(session_factory, paper_status="READY", source_sha256="c" * 64)
+
+    class TranslateRoute:
+        async def route(self, request, **kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.TRANSLATE,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Translate this paper",
+                    arguments={"target_language": "vi"},
+                ),
+            )
+
+    processor = AssistantRunProcessor(
+        session_factory=session_factory,
+        router=TranslateRoute(),  # type: ignore[arg-type]
+        chat_service=_ChatStub(),  # type: ignore[arg-type]
+    )
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        assert run is not None
+        paper_id = UUID(run.request_payload["selected_paper_ids"][0])
+        db.add(
+            ProjectTranslationGlossaryEntry(
+                project_id=run.project_id,
+                source_term="attention",
+                preferred_translation="chú ý",
+            )
+        )
+        db.commit()
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        first_attempt = claim.attempt_count
+
+    await processor.process(run_id, worker_id="worker-a", attempt_count=first_attempt)
+
+    with session_factory() as db:
+        action = db.query(AssistantApprovalAction).filter_by(run_id=run_id).one()
+        action_id = action.id
+        decide_assistant_approval(db, action_id, approve=True)
+        if changed_identity == "source":
+            paper = db.get(Paper, paper_id)
+            assert paper is not None
+            paper.document_sha256 = "d" * 64
+        else:
+            run = db.get(AssistantRun, run_id)
+            assert run is not None
+            db.add(
+                ProjectTranslationGlossaryEntry(
+                    project_id=run.project_id,
+                    source_term="transformer",
+                    preferred_translation="mô hình biến áp",
+                )
+            )
+        db.commit()
+        next_claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert next_claim is not None
+        second_attempt = next_claim.attempt_count
+
+    await processor.process(run_id, worker_id="worker-a", attempt_count=second_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        action = db.get(AssistantApprovalAction, action_id)
+        assert run is not None and run.status == "FAILED"
+        assert run.safe_error == "APPROVAL_NO_LONGER_VALID"
+        assert action is not None and action.status == "STALE"
+        assert db.query(TranslationDocument).count() == 0
 
 
 @pytest.mark.anyio

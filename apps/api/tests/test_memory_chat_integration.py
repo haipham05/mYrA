@@ -9,6 +9,7 @@ from app.crud.chat import create_conversation, list_messages
 from app.crud.memory import create_memory, list_memories
 from app.db.base import Base
 from app.db.models import (
+    AssistantRun,
     ChunkElement,
     Memory,
     MemorySource,
@@ -31,7 +32,60 @@ from app.schemas.memory import (
     MemoryStatus,
     MemoryType,
 )
-from app.services.chat_service import ChatService, _recent_conversation_messages
+from app.services.chat_service import (
+    AssistantRunCancelled,
+    ChatService,
+    _recent_conversation_messages,
+)
+
+
+@pytest.mark.anyio
+async def test_cancelled_run_does_not_dispatch_paid_generation(db: Session) -> None:
+    project = Project(name="Cancellation project")
+    db.add(project)
+    db.commit()
+    conversation = create_conversation(db, project_id=project.id, title="Cancellation")
+    run = AssistantRun(
+        project_id=project.id,
+        conversation_id=conversation.id,
+        idempotency_key="cancel-before-generation",
+        request_hash="a" * 64,
+        request_payload={},
+        status="RUNNING",
+        cancel_requested=True,
+        attempt_count=1,
+        lease_owner="worker-cancel",
+    )
+    db.add(run)
+    db.commit()
+
+    class EmptyRetriever:
+        def retrieve(self, *_args, **_kwargs):
+            return []
+
+    class FakeEmbeddingProvider:
+        def embed_query(self, _query):
+            return [0.1]
+
+    with (
+        patch(
+            "app.services.embedding.get_embedding_provider", return_value=FakeEmbeddingProvider()
+        ),
+        patch("app.services.chat_service.retrieve_project_memories", return_value=[]),
+        patch(
+            "app.services.chat_service.get_llm_provider",
+            side_effect=AssertionError("cancelled run must not dispatch the provider"),
+        ),
+    ):
+        with pytest.raises(AssistantRunCancelled):
+            await ChatService(retriever=EmptyRetriever()).answer_question(
+                db,
+                conversation.id,
+                "Explain the selected evidence",
+                assistant_run_id=run.id,
+                run_worker_id="worker-cancel",
+                run_attempt_count=1,
+            )
 
 
 @pytest.fixture

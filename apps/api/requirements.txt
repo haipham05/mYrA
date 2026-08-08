@@ -1409,7 +1409,9 @@ pypdfium2==5.13.0 \
     --hash=sha256:d96929bde3bd64c771ab3558ca1ffd7704cc4d872ab92cd9f8f8b8a20f7f36b8 \
     --hash=sha256:d96beb7f379e6c76d874ca93fcd182ac3168dd499056407070f9927fb1061b8e \
     --hash=sha256:da5c7b74eebf40b5c1fbe1de01aa1edc8827a79fb1efd999616bc20dcaf77ba4
-    # via docling-slim
+    # via
+    #   docling-slim
+    #   myra-api
 python-dateutil==2.9.0.post0 \
     --hash=sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3 \
     --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427

@@ -21,6 +21,19 @@ from typing import Any
 PROTOCOL_VERSION = 1
 PDF2ZH_VERSION = "2.9.0"
 BABELDOC_VERSION = "0.6.2"
+_PREPROCESS_DECLINE_CAUSES = frozenset(
+    {
+        "vertical_paragraph",
+        "no_composition",
+        "pure_numeric",
+        "placeholder_only",
+        "formula_only",
+        "debug_unicode_composition",
+        "below_minimum_length",
+        "unsupported_composition",
+        "unknown_decline",
+    }
+)
 LAYOUT_MODEL_SHA3_256 = "60be061226930524958b5465c8c04af3d7c03bcb0beb66454f5da9f792e3cf2a"
 PROTOCOL_STDOUT = sys.stdout
 _ACTIVE_RECORDER: TranslationCheckpointRecorder | None = None
@@ -190,6 +203,7 @@ class TranslationCheckpointRecorder:
         validation_source = record.get("preprocessed_input") or source
         if _protected_tokens(validation_source) != _protected_tokens(translated_text):
             record["status"] = "invalid"
+            record["failure_reason"] = "protected_placeholder_mismatch"
             self.failed += 1
             return
         unchanged_prose = _is_unchanged_english_prose(
@@ -198,10 +212,12 @@ class TranslationCheckpointRecorder:
         preserve_official_title = record.get("layout_label") == "title" and unchanged_prose
         if unchanged_prose and not preserve_official_title:
             record["status"] = "unchanged_prose"
+            record["failure_reason"] = "unchanged_prose"
             self.failed += 1
             return
         if len(source) > 65_536 or len(translated_text) > 65_536:
             record["status"] = "oversized"
+            record["failure_reason"] = "unit_too_large"
             self.failed += 1
             return
         context_hash = (
@@ -248,6 +264,14 @@ class TranslationCheckpointRecorder:
                     self.skipped += 1
                 else:
                     record["status"] = "untranslated"
+                    decline_reason = record.get("preprocess_decline_reason")
+                    if decline_reason not in _PREPROCESS_DECLINE_CAUSES:
+                        decline_reason = None
+                    record["failure_reason"] = (
+                        decline_reason or "preprocessing_not_selected"
+                        if record.get("preprocessed_input") is None
+                        else "missing_validated_checkpoint"
+                    )
                     self.failed += 1
         return {
             "total": len(self.records),
@@ -289,12 +313,26 @@ class TranslationCheckpointRecorder:
                 reasons[reason] = reasons.get(reason, 0) + 1
         return reasons
 
+    def failure_causes(self) -> dict[str, int]:
+        causes: dict[str, int] = {}
+        for record in self.records.values():
+            if record["status"] not in {"invalid", "unchanged_prose", "oversized", "untranslated"}:
+                continue
+            decline_reason = record.get("preprocess_decline_reason")
+            if decline_reason not in _PREPROCESS_DECLINE_CAUSES:
+                decline_reason = None
+            reason = decline_reason or record.get("failure_reason")
+            if reason:
+                causes[reason] = causes.get(reason, 0) + 1
+        return causes
+
     def failure_units(self) -> list[dict[str, Any]]:
         return [
             {
                 "page_number": record["page_number"],
                 "ordinal": record["ordinal"],
                 "status": record["status"],
+                "failure_reason": record.get("failure_reason"),
                 "source_chars": len(record["source_quote"]),
                 "layout_label": record["layout_label"],
             }
@@ -311,6 +349,7 @@ class TranslationCheckpointRecorder:
                 "type": "segment_summary",
                 **self.finish(),
                 "failure_reasons": self.failure_reasons(),
+                "failure_causes": self.failure_causes(),
                 "skip_reasons": self.skip_reasons(),
                 "failure_units": self.failure_units(),
             }
@@ -319,6 +358,54 @@ class TranslationCheckpointRecorder:
 
 def _protected_tokens(text: str) -> tuple[str, ...]:
     return tuple(_PROTECTED_TOKEN.findall(text))
+
+
+def _classify_preprocess_decline(
+    paragraph: Any,
+    translate_input: Any,
+    *,
+    minimum_text_length: int,
+    is_pure_numeric: Any,
+    is_placeholder_only: Any,
+) -> str | None:
+    """Classify BabelDOC 0.6.2's no-input branches without exposing paragraph text."""
+    if getattr(paragraph, "vertical", False):
+        return "vertical_paragraph"
+
+    compositions = getattr(paragraph, "pdf_paragraph_composition", None)
+    if not compositions:
+        return "no_composition"
+    if is_pure_numeric(paragraph):
+        return "pure_numeric"
+    if len(compositions) == 1 and getattr(compositions[0], "pdf_formula", None):
+        return "formula_only"
+    if is_placeholder_only(paragraph):
+        return "placeholder_only"
+
+    if translate_input is not None:
+        input_text = getattr(translate_input, "unicode", None)
+        if isinstance(input_text, str) and len(input_text) < minimum_text_length:
+            return "below_minimum_length"
+        return None
+
+    if len(compositions) == 1:
+        composition = compositions[0]
+        if getattr(composition, "pdf_same_style_unicode_characters", None):
+            return "debug_unicode_composition"
+
+    known_fields = (
+        "pdf_line",
+        "pdf_same_style_characters",
+        "pdf_character",
+        "pdf_formula",
+        "pdf_same_style_unicode_characters",
+    )
+    if any(
+        not any(getattr(composition, field, None) for field in known_fields)
+        for composition in compositions
+    ):
+        return "unsupported_composition"
+    return "unknown_decline"
 
 
 _ENGLISH_FUNCTION_WORDS = frozenset(
@@ -665,22 +752,54 @@ class SiliconFlowFreeTranslator:
 
         provider_results: dict[Any, str] = {}
         if misses:
-            provider_text = prefix
-            if any(item.get("first_occurrence_glossary_terms") for item in misses):
-                provider_text += (
-                    "For an item with first_occurrence_glossary_terms, include the English term "
-                    "followed by its preferred Vietnamese form in parentheses at its first "
-                    "document occurrence. Use Vietnamese only for later occurrences.\n\n"
-                )
-            provider_text += json.dumps(misses, ensure_ascii=False, indent=2)
-            if suffix:
-                provider_text += suffix
-            for result in _clean_model_json(self._request(provider_text)):
-                result_id = result.get("id")
-                output = result.get("output")
-                if not isinstance(output, str):
+
+            def request_batch(
+                batch: list[dict[str, Any]], *, retry_unchanged: bool = False
+            ) -> dict[Any, str]:
+                provider_text = prefix
+                if retry_unchanged:
+                    provider_text += (
+                        "The previous output left these prose items in English. Translate each "
+                        "item into Vietnamese now. Preserve every protected placeholder exactly. "
+                        "Return only the requested JSON items.\n\n"
+                    )
+                if any(item.get("first_occurrence_glossary_terms") for item in batch):
+                    provider_text += (
+                        "For an item with first_occurrence_glossary_terms, include the "
+                        "English term "
+                        "followed by its preferred Vietnamese form in parentheses at its first "
+                        "document occurrence. Use Vietnamese only for later occurrences.\n\n"
+                    )
+                provider_text += json.dumps(batch, ensure_ascii=False, indent=2)
+                if suffix:
+                    provider_text += suffix
+                parsed_results: dict[Any, str] = {}
+                for result in _clean_model_json(self._request(provider_text)):
+                    result_id = result.get("id")
+                    output = result.get("output")
+                    if not isinstance(output, str):
+                        raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                    parsed_results[result_id] = output
+                return parsed_results
+
+            provider_results = request_batch(misses)
+            unchanged_items: list[dict[str, Any]] = []
+            for item in misses:
+                output = provider_results.get(item.get("id"))
+                if output is None:
                     raise SafeEngineError("PROVIDER_UNAVAILABLE")
-                provider_results[result_id] = output
+                if _protected_tokens(item["input"]) != _protected_tokens(output):
+                    raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                layout_label = item.get("layout_label")
+                unchanged = _is_unchanged_english_prose(
+                    item["input"], output, layout_label=layout_label
+                )
+                # BabelDOC deliberately preserves official titles; keep that behavior.
+                if unchanged and str(layout_label or "").casefold().strip() != "title":
+                    unchanged_items.append(item)
+
+            if unchanged_items:
+                provider_results.update(request_batch(unchanged_items, retry_unchanged=True))
 
         combined: list[dict[str, Any]] = []
         for index, item in enumerate(items):
@@ -899,8 +1018,18 @@ def _checkpoint_hooks(
     il_translator: Any, llm_translator: Any, recorder: TranslationCheckpointRecorder
 ):
     """Guard and temporarily wrap only the verified BabelDOC 0.6.2 IL seams."""
+    from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
+        is_placeholder_only_paragraph,
+        is_pure_numeric_paragraph,
+    )
+
     required_signatures = (
         (il_translator, "translate", {"docs"}),
+        (
+            il_translator,
+            "get_translate_input",
+            {"paragraph", "page_font_map", "disable_rich_text_translate"},
+        ),
         (
             il_translator,
             "pre_translate_paragraph",
@@ -922,15 +1051,46 @@ def _checkpoint_hooks(
             raise SafeEngineError("ENGINE_VERSION_MISMATCH")
         originals.append((target, name, original))
 
+    original_get_input = il_translator.get_translate_input
     original_pre = il_translator.pre_translate_paragraph
     original_post = il_translator.post_translate_paragraph
     original_single = il_translator.translate_paragraph
     original_batch = llm_translator.translate_paragraph
     original_whole = llm_translator.translate
 
+    def capture_translate_input(
+        self, paragraph, page_font_map=None, disable_rich_text_translate=None
+    ):
+        # Call BabelDOC's implementation exactly once, then classify its return.
+        result = original_get_input(self, paragraph, page_font_map, disable_rich_text_translate)
+        record = recorder.get(paragraph)
+        if record:
+            reason = _classify_preprocess_decline(
+                paragraph,
+                result,
+                minimum_text_length=self.translation_config.min_text_length,
+                is_pure_numeric=is_pure_numeric_paragraph,
+                is_placeholder_only=is_placeholder_only_paragraph,
+            )
+            if reason:
+                record["preprocess_decline_reason"] = reason
+            else:
+                record.pop("preprocess_decline_reason", None)
+        return result
+
     def pre_translate(self, paragraph, tracker, page_font_map=None, xobj_font_map=None):
         result = original_pre(self, paragraph, tracker, page_font_map, xobj_font_map)
         if isinstance(result, tuple) and len(result) == 2:
+            record = recorder.get(paragraph)
+            if record and result[0] is None and not record.get("preprocess_decline_reason"):
+                reason = _classify_preprocess_decline(
+                    paragraph,
+                    None,
+                    minimum_text_length=self.translation_config.min_text_length,
+                    is_pure_numeric=is_pure_numeric_paragraph,
+                    is_placeholder_only=is_placeholder_only_paragraph,
+                )
+                record["preprocess_decline_reason"] = reason or "unknown_decline"
             recorder.note_preprocessed(paragraph, result[0])
         return result
 
@@ -985,6 +1145,7 @@ def _checkpoint_hooks(
         finally:
             recorder.emit_summary()
 
+    il_translator.get_translate_input = capture_translate_input
     il_translator.pre_translate_paragraph = pre_translate
     il_translator.post_translate_paragraph = post_translate
     il_translator.translate_paragraph = single_translate

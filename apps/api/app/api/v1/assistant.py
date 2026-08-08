@@ -5,6 +5,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.api.v1.artifacts import _response as artifact_response
+from app.crud.artifact import create_artifact, list_artifacts
 from app.crud.assistant_run import (
     IdempotencyConflict,
     create_assistant_run,
@@ -17,18 +19,32 @@ from app.crud.assistant_run import (
 )
 from app.db.models import AssistantApprovalAction, AssistantRun
 from app.db.session import get_db
+from app.schemas.artifact import ArtifactCreate, ArtifactResponse, ArtifactType
 from app.schemas.assistant import (
     AssistantApprovalResponse,
+    AssistantRunArtifactSaveRequest,
     AssistantRunRequest,
     AssistantRunResponse,
     AssistantRunResult,
     AssistantRunResumeRequest,
 )
 from app.schemas.discovery import CatalogCandidate
+from app.schemas.evidence import Citation, EvidenceItem
 from app.services.discovery.download import ImportDownloadError
 from app.services.discovery.importer import import_approved_candidate
+from app.services.research_report import report_source_manifest
 
 router = APIRouter(tags=["assistant"])
+
+_RUN_ARTIFACT_TYPES = {
+    "reading_brief": ArtifactType.READING_BRIEF,
+    "comparison": ArtifactType.COMPARISON,
+    "claim_verification": ArtifactType.CLAIM_CHECK,
+    "research_report": ArtifactType.REPORT,
+    "research_draft": ArtifactType.REPORT,
+    "gap_analysis": ArtifactType.GAP_ANALYSIS,
+    "experiment_proposal": ArtifactType.EXPERIMENT_PROPOSAL,
+}
 
 
 def _run_response(run: AssistantRun) -> AssistantRunResponse:
@@ -111,6 +127,88 @@ def submit_assistant_run(
 @router.get("/runs/{run_id}", response_model=AssistantRunResponse)
 def inspect_assistant_run(run_id: UUID, db: Session = Depends(get_db)) -> AssistantRunResponse:
     return _run_response(_get_run_or_404(db, run_id))
+
+
+@router.post(
+    "/runs/{run_id}/artifact",
+    response_model=ArtifactResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def save_assistant_run_artifact(
+    run_id: UUID,
+    request: AssistantRunArtifactSaveRequest,
+    db: Session = Depends(get_db),
+) -> ArtifactResponse:
+    """Explicitly save a completed, cited assistant draft as a versioned project artifact."""
+    run = _get_run_or_404(db, run_id)
+    result = run.result_payload if isinstance(run.result_payload, dict) else {}
+    result_type = result.get("result_type")
+    artifact_type = _RUN_ARTIFACT_TYPES.get(result_type)
+    structured = result.get("structured_payload")
+    if run.status != "SUCCEEDED" or artifact_type is None or not isinstance(structured, dict):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only completed research drafts can be saved as artifacts",
+        )
+
+    existing = next(
+        (
+            artifact
+            for artifact in list_artifacts(db, run.project_id)
+            if any(
+                revision.scope_snapshot.get("assistant_run_id") == str(run.id)
+                for revision in artifact.revisions
+            )
+        ),
+        None,
+    )
+    if existing is not None:
+        response = artifact_response(db, existing)
+        assert isinstance(response, ArtifactResponse)
+        return response
+
+    citations = [Citation.model_validate(item) for item in result.get("citations", [])]
+    evidence = [EvidenceItem.model_validate(item) for item in result.get("evidence", [])]
+    manifest = structured.get("source_manifest")
+    if not isinstance(manifest, list):
+        manifest = report_source_manifest(citations, evidence)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A verified source is required before saving this artifact",
+        )
+
+    request_payload = run.request_payload if isinstance(run.request_payload, dict) else {}
+    route_decision = run.route_decision if isinstance(run.route_decision, dict) else {}
+    paper_ids = route_decision.get("resolved_paper_ids") or request_payload.get(
+        "selected_paper_ids", []
+    )
+    title = request.title or run.action_summary or result_type.replace("_", " ").title()
+    data = ArtifactCreate(
+        artifact_type=artifact_type,
+        title=title,
+        payload={
+            "markdown": result.get("display_text", ""),
+            "structured_payload": structured,
+            "citations": result.get("citations", []),
+            "run_id": str(run.id),
+        },
+        scope_snapshot={
+            "assistant_run_id": str(run.id),
+            "scope": request_payload.get("scope", "project"),
+            "paper_ids": paper_ids,
+        },
+        source_manifest=manifest,
+        config_snapshot={
+            "intent": run.intent,
+            "model_name": structured.get("model_name"),
+        },
+        usage=result.get("usage") or {},
+    )
+    artifact = create_artifact(db, project_id=run.project_id, data=data)
+    response = artifact_response(db, artifact)
+    assert isinstance(response, ArtifactResponse)
+    return response
 
 
 @router.post("/runs/{run_id}/cancel", response_model=AssistantRunResponse)

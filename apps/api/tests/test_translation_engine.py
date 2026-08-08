@@ -23,6 +23,62 @@ def _paragraph(text: str, debug_id: str = "p-1") -> SimpleNamespace:
     return SimpleNamespace(unicode=text, debug_id=debug_id, layout_label="text")
 
 
+def _translate_batch_with_responses(
+    source: str,
+    responses: list[str],
+    *,
+    layout_label: str = "text",
+    glossary_terms: list[dict[str, str]] | None = None,
+) -> tuple[str, list[str], dict, engine_runner.TranslationCheckpointRecorder]:
+    paragraph = _paragraph(source)
+    paragraph.layout_label = layout_label
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    record["first_occurrence_terms"] = glossary_terms or []
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    item = {"id": 0, "input": source, "layout_label": layout_label}
+    request_texts: list[str] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, output: str) -> None:
+            self.output = output
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, str]:
+            return {"content": json.dumps([{"id": 0, "output": self.output}], ensure_ascii=False)}
+
+    class FakeClient:
+        def post(self, _url: str, **kwargs) -> FakeResponse:
+            request_texts.append(kwargs["json"]["text"])
+            if not responses:
+                pytest.fail("unexpected additional provider request")
+            return FakeResponse(responses.pop(0))
+
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    translator.client.close()
+    translator.client = FakeClient()
+    with recorder.batch_scope():
+        recorder.note_preprocessed(paragraph, source)
+        response = translator.llm_translate(prefix + json.dumps([item]))
+    translated = json.loads(response)[0]["output"]
+    recorder.complete(record, translated)
+    return translated, request_texts, record, recorder
+
+
 def test_engine_environment_does_not_inherit_application_secrets(monkeypatch) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "do-not-forward")
     monkeypatch.setenv("DATABASE_URL", "postgresql://private")
@@ -84,6 +140,39 @@ def test_protocol_rejects_completion_with_untranslated_segments() -> None:
         _safe_event(event)
 
 
+def test_protocol_keeps_failure_causes_bounded_and_sanitized() -> None:
+    event = {
+        "type": "segment_summary",
+        "total": 1,
+        "completed": 0,
+        "skipped": 0,
+        "failed": 1,
+        "failure_reasons": {"untranslated": 1},
+        "failure_causes": {"preprocessing_not_selected": 1},
+        "skip_reasons": {},
+        "failure_units": [
+            {
+                "page_number": 1,
+                "ordinal": 2,
+                "status": "untranslated",
+                "failure_reason": "preprocessing_not_selected",
+                "source_chars": 40,
+                "layout_label": "plain text",
+            }
+        ],
+    }
+
+    assert _safe_event(event)["failure_causes"] == {"preprocessing_not_selected": 1}
+    event["failure_causes"] = {"vertical_paragraph": 1, "unknown_decline": 1}
+    assert _safe_event(event)["failure_causes"] == {
+        "vertical_paragraph": 1,
+        "unknown_decline": 1,
+    }
+    event["failure_units"][0]["failure_reason"] = "raw quote must not cross the protocol"
+    with pytest.raises(TranslationEngineError, match="ENGINE_PROTOCOL_ERROR"):
+        _safe_event(event)
+
+
 def test_protocol_keeps_only_safe_failure_unit_metadata() -> None:
     event = _safe_event(
         {
@@ -107,12 +196,14 @@ def test_protocol_keeps_only_safe_failure_unit_metadata() -> None:
         }
     )
     assert event["failure_reasons"] == {"unchanged_prose": 1, "untranslated": 1}
+    assert event["failure_causes"] == {}
     assert event["skip_reasons"] == {"below_engine_minimum": 3, "numeric_or_symbol_only": 2}
     assert event["failure_units"] == [
         {
             "page_number": 2,
             "ordinal": 4,
             "status": "unchanged_prose",
+            "failure_reason": None,
             "source_chars": 84,
             "layout_label": "text",
         }
@@ -219,7 +310,9 @@ def test_checkpoint_recorder_emits_safe_summary_once_on_engine_failure(monkeypat
     events = [json.loads(line) for line in output.getvalue().splitlines()]
     assert len(events) == 1
     assert events[0]["failure_reasons"] == {"untranslated": 1}
+    assert events[0]["failure_causes"] == {"missing_validated_checkpoint": 1}
     assert events[0]["failure_units"][0]["source_chars"] == len(paragraph.unicode)
+    assert events[0]["failure_units"][0]["failure_reason"] == "missing_validated_checkpoint"
     assert "source_quote" not in events[0]["failure_units"][0]
 
 
@@ -238,6 +331,153 @@ def test_checkpoint_recorder_fails_unvisited_required_prose() -> None:
 
     assert counts == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
     assert recorder.failure_reasons() == {"untranslated": 1}
+    assert recorder.failure_causes() == {"preprocessing_not_selected": 1}
+
+
+def test_checkpoint_recorder_distinguishes_unselected_from_missing_checkpoint() -> None:
+    selected = _paragraph("A prose unit selected for translation by the engine.")
+    not_selected = _paragraph("A prose unit not selected for translation by the engine.")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(
+            page=[SimpleNamespace(page_number=1, pdf_paragraph=[selected, not_selected])]
+        )
+    )
+    recorder.note_preprocessed(selected, selected.unicode)
+
+    recorder.finish()
+
+    assert recorder.failure_causes() == {
+        "missing_validated_checkpoint": 1,
+        "preprocessing_not_selected": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("paragraph", "translate_input", "numeric", "placeholder_only", "expected"),
+    [
+        (_paragraph("vertical"), None, False, False, "vertical_paragraph"),
+        (
+            SimpleNamespace(unicode="", pdf_paragraph_composition=[]),
+            None,
+            False,
+            False,
+            "no_composition",
+        ),
+        (
+            SimpleNamespace(
+                unicode="42", pdf_paragraph_composition=[SimpleNamespace(pdf_line=object())]
+            ),
+            None,
+            True,
+            False,
+            "pure_numeric",
+        ),
+        (
+            SimpleNamespace(
+                unicode="{formula}",
+                pdf_paragraph_composition=[SimpleNamespace(pdf_line=object())],
+            ),
+            None,
+            False,
+            True,
+            "placeholder_only",
+        ),
+        (
+            SimpleNamespace(
+                unicode="x",
+                pdf_paragraph_composition=[SimpleNamespace(pdf_formula=object())],
+            ),
+            None,
+            False,
+            False,
+            "formula_only",
+        ),
+        (
+            SimpleNamespace(
+                unicode="debug",
+                pdf_paragraph_composition=[
+                    SimpleNamespace(pdf_same_style_unicode_characters=object())
+                ],
+            ),
+            None,
+            False,
+            False,
+            "debug_unicode_composition",
+        ),
+        (
+            SimpleNamespace(
+                unicode="long enough raw text",
+                pdf_paragraph_composition=[SimpleNamespace(pdf_line=object())],
+            ),
+            SimpleNamespace(unicode="tiny"),
+            False,
+            False,
+            "below_minimum_length",
+        ),
+        (
+            SimpleNamespace(
+                unicode="unknown",
+                pdf_paragraph_composition=[SimpleNamespace(unrecognized=object())],
+            ),
+            None,
+            False,
+            False,
+            "unsupported_composition",
+        ),
+        (
+            SimpleNamespace(
+                unicode="unknown",
+                pdf_paragraph_composition=[SimpleNamespace(pdf_line=object())],
+            ),
+            None,
+            False,
+            False,
+            "unknown_decline",
+        ),
+    ],
+)
+def test_preprocess_decline_classifier_uses_known_structure_only(
+    paragraph, translate_input, numeric: bool, placeholder_only: bool, expected: str
+) -> None:
+    if expected == "vertical_paragraph":
+        paragraph.vertical = True
+
+    reason = engine_runner._classify_preprocess_decline(
+        paragraph,
+        translate_input,
+        minimum_text_length=5,
+        is_pure_numeric=lambda _paragraph: numeric,
+        is_placeholder_only=lambda _paragraph: placeholder_only,
+    )
+
+    assert reason == expected
+
+
+def test_preprocess_decline_diagnostics_do_not_change_skip_or_completion_counts() -> None:
+    skipped = _paragraph("{equation}")
+    required = _paragraph("A required prose paragraph omitted by preprocessing.")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[skipped, required])])
+    )
+    recorder.get(skipped)["preprocess_decline_reason"] = "formula_only"
+    recorder.get(required)["preprocess_decline_reason"] = "no_composition"
+
+    counts = recorder.finish()
+
+    assert counts == {"total": 2, "completed": 0, "skipped": 1, "failed": 1}
+    assert recorder.failure_causes() == {
+        "no_composition": 1,
+    }
 
 
 def test_checkpoint_recorder_skips_only_short_unselected_content() -> None:
@@ -445,6 +685,60 @@ def test_llm_adapter_sends_only_missed_units_when_resuming_partial_batch() -> No
     assert len(client.payloads) == 1
     assert "Second paragraph" in client.payloads[0]["text"]
     assert "First {v1}" not in client.payloads[0]["text"]
+
+
+def test_llm_adapter_retries_unchanged_prose_once_and_preserves_glossary_placeholders() -> None:
+    translated, request_texts, record, recorder = _translate_batch_with_responses(
+        "The attention {v1} model improves the result in practice.",
+        [
+            "The attention {v1} model improves the result in practice.",
+            "Mô hình chú ý {v1} cải thiện kết quả trong thực tiễn.",
+        ],
+        glossary_terms=[{"english": "attention", "vietnamese": "chú ý"}],
+    )
+
+    assert len(request_texts) == 2
+    assert "previous output left these prose items in English" in request_texts[1]
+    assert "first_occurrence_glossary_terms" in request_texts[1]
+    assert translated == "Mô hình attention (chú ý) {v1} cải thiện kết quả trong thực tiễn."
+    assert record["status"] == "completed"
+    assert recorder.finish()["completed"] == 1
+
+
+def test_llm_adapter_bounds_unchanged_prose_retry_and_keeps_failure_untranslated() -> None:
+    source = "The model improves the result in practice for this task."
+    translated, request_texts, record, recorder = _translate_batch_with_responses(
+        source, [source, source]
+    )
+
+    assert len(request_texts) == 2
+    assert translated == source
+    assert record["status"] == "unchanged_prose"
+    assert recorder.finish()["failed"] == 1
+
+
+def test_llm_adapter_does_not_retry_unchanged_scientific_protected_content() -> None:
+    source = "E = mc^2 {v1}"
+    translated, request_texts, record, recorder = _translate_batch_with_responses(
+        source, [source], layout_label="formula"
+    )
+
+    assert len(request_texts) == 1
+    assert translated == source
+    assert record["status"] == "completed"
+    assert recorder.finish()["completed"] == 1
+
+
+def test_llm_adapter_keeps_normal_batch_response_on_single_request() -> None:
+    translated, request_texts, record, recorder = _translate_batch_with_responses(
+        "The model improves the result in practice for this task.",
+        ["该模型在此任务中提高了实际效果。"],
+    )
+
+    assert len(request_texts) == 1
+    assert translated == "该模型在此任务中提高了实际效果。"
+    assert record["status"] == "completed"
+    assert recorder.finish()["completed"] == 1
 
 
 def test_siliconflow_transport_retries_at_most_three_times(monkeypatch) -> None:

@@ -14,6 +14,7 @@ dependencies = [
     "neo4j>=5.18,<6.0",
     "psycopg2-binary>=2.9.9",
     "pypdf>=4.0,<6.0",
+    "pypdfium2==5.13.0",
     "python-multipart>=0.0.9",
     "redis>=5.2,<7.0",
     "sentence-transformers>=3.0,<7.0",

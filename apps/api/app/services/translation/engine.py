@@ -131,6 +131,28 @@ def _safe_event(value: Any) -> dict[str, Any]:
             for key, count in reasons.items()
         ):
             raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
+        failure_causes = value.get("failure_causes", {})
+        allowed_failure_causes = {
+            "protected_placeholder_mismatch",
+            "unchanged_prose",
+            "unit_too_large",
+            "preprocessing_not_selected",
+            "missing_validated_checkpoint",
+            "vertical_paragraph",
+            "no_composition",
+            "pure_numeric",
+            "placeholder_only",
+            "formula_only",
+            "debug_unicode_composition",
+            "below_minimum_length",
+            "unsupported_composition",
+            "unknown_decline",
+        }
+        if not isinstance(failure_causes, dict) or not all(
+            key in allowed_failure_causes and isinstance(count, int) and count >= 0
+            for key, count in failure_causes.items()
+        ):
+            raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
         skip_reasons = value.get("skip_reasons", {})
         if not isinstance(skip_reasons, dict) or not all(
             key
@@ -153,6 +175,7 @@ def _safe_event(value: Any) -> dict[str, Any]:
             or not isinstance(unit.get("ordinal"), int)
             or not isinstance(unit.get("source_chars"), int)
             or unit.get("status") not in {"invalid", "unchanged_prose", "oversized", "untranslated"}
+            or unit.get("failure_reason") not in allowed_failure_causes | {None}
             or (unit.get("layout_label") is not None and not isinstance(unit["layout_label"], str))
             for unit in units
         ):
@@ -161,12 +184,14 @@ def _safe_event(value: Any) -> dict[str, Any]:
             "type": "segment_summary",
             **counts,
             "failure_reasons": reasons,
+            "failure_causes": failure_causes,
             "skip_reasons": skip_reasons,
             "failure_units": [
                 {
                     "page_number": unit["page_number"],
                     "ordinal": unit["ordinal"],
                     "status": unit["status"],
+                    "failure_reason": unit.get("failure_reason"),
                     "source_chars": unit["source_chars"],
                     "layout_label": (
                         unit["layout_label"][:100]
