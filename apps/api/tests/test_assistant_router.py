@@ -175,7 +175,10 @@ async def test_provider_error_returns_safe_retryable_routing_result() -> None:
 
 @pytest.mark.anyio
 async def test_explicit_intent_override_skips_paid_routing_call() -> None:
-    request = _request(intent_override="compare")
+    request = _request(
+        message="The paper states that attention combines query, key, and value representations.",
+        intent_override="verify_claim",
+    )
 
     class MustNotCall:
         async def generate(self, **kwargs: object) -> str:
@@ -184,8 +187,9 @@ async def test_explicit_intent_override_skips_paid_routing_call() -> None:
     result = await AssistantRouter(provider=MustNotCall()).route(request)
 
     assert result.outcome is RouteOutcome.ROUTED
-    assert result.decision.intent is AssistantIntent.COMPARE
+    assert result.decision.intent is AssistantIntent.VERIFY_CLAIM
     assert result.decision.resolved_paper_ids == request.selected_paper_ids
+    assert result.decision.arguments == {"claim": request.message}
 
 
 @pytest.mark.anyio

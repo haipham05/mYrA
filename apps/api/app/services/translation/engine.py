@@ -162,6 +162,10 @@ def _safe_event(value: Any) -> dict[str, Any]:
                 "protected_scientific_content",
                 "placeholder_only",
                 "numeric_or_symbol_only",
+                "preserved_vertical_layout_content",
+                "author_contact_metadata",
+                "preserved_fallback_layout_content",
+                "preserved_short_layout_label",
             }
             and isinstance(count, int)
             and count >= 0

@@ -119,6 +119,32 @@ def test_successful_run_poll_returns_tool_result_with_unknown_usage(assistant_ap
     assert result.json()["result"]["usage"] == {}
 
 
+def test_successful_run_poll_returns_nested_provider_usage(assistant_api_context):
+    client, session, project, conversation, paper = assistant_api_context
+    submitted = client.post(
+        f"/api/v1/conversations/{conversation.id}/runs",
+        json=_request_body(project, conversation, paper),
+    )
+    run = session.get(AssistantRun, UUID(submitted.json()["id"]))
+    assert run is not None
+    run.status = "SUCCEEDED"
+    run.usage = {
+        "routing": {"prompt_tokens": 24, "completion_tokens": 8},
+        "tool": {
+            "prompt_tokens": 237,
+            "completion_tokens": 139,
+            "total_tokens": 376,
+            "cache_miss_tokens": 237,
+        },
+    }
+    session.commit()
+
+    result = client.get(f"/api/v1/runs/{run.id}")
+
+    assert result.status_code == 200
+    assert result.json()["usage"] == run.usage
+
+
 def test_headless_qa_journey_returns_persisted_source_reference(assistant_api_context):
     client, session, project, conversation, paper = assistant_api_context
     paper.status = PaperStatus.READY.value

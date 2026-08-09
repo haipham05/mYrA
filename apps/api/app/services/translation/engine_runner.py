@@ -21,6 +21,9 @@ from typing import Any
 PROTOCOL_VERSION = 1
 PDF2ZH_VERSION = "2.9.0"
 BABELDOC_VERSION = "0.6.2"
+TRANSLATION_LANG_IN = "English"
+TRANSLATION_LANG_OUT = "Vietnamese"
+TRANSLATION_POLICY_VERSION = "siliconflowfree-v1"
 _PREPROCESS_DECLINE_CAUSES = frozenset(
     {
         "vertical_paragraph",
@@ -40,6 +43,11 @@ _ACTIVE_RECORDER: TranslationCheckpointRecorder | None = None
 _PROTECTED_TOKEN = re.compile(
     r"\{v\d+\}|\{[A-Za-z][\w.-]*\}|%[sd]|\[\[.*?\]\]|%%.*?%%|</?style\b[^>]*>|</?b\d+>"
 )
+
+
+def _checkpoint_base_key(identity: dict[str, Any]) -> str:
+    identity_wire = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(identity_wire.encode()).hexdigest()
 
 
 class SafeEngineError(Exception):
@@ -146,10 +154,11 @@ class TranslationCheckpointRecorder:
                     "glossary_sha256": self.glossary_sha256,
                     "pdf2zh_version": PDF2ZH_VERSION,
                     "babeldoc_version": BABELDOC_VERSION,
+                    "lang_in": TRANSLATION_LANG_IN,
+                    "lang_out": TRANSLATION_LANG_OUT,
+                    "translation_policy_version": TRANSLATION_POLICY_VERSION,
                 }
-                record["base_key"] = hashlib.sha256(
-                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-                ).hexdigest()
+                record["base_key"] = _checkpoint_base_key(identity)
                 self.records[id(paragraph)] = record
                 offset += len(quote) + 1
                 global_ordinal += 1
@@ -181,10 +190,12 @@ class TranslationCheckpointRecorder:
             return
         if text is None:
             reason = self._intentional_skip_reason(record)
-            if reason and record["status"] != "skipped":
-                record["status"] = "skipped"
-                record["skip_reason"] = reason
-                self.skipped += 1
+            if reason:
+                self._skip(record, reason)
+            return
+        reason = self._intentional_skip_reason(record)
+        if reason and reason not in {"protected_scientific_content", "placeholder_only"}:
+            self._skip(record, reason)
             return
         record["preprocessed_input"] = text
         batch = getattr(self.local, "batch", None)
@@ -199,6 +210,8 @@ class TranslationCheckpointRecorder:
         return hashlib.sha256(f"{record['base_key']}:{context_hash}".encode()).hexdigest()
 
     def complete(self, record: dict[str, Any], translated_text: str) -> None:
+        if record["status"] == "skipped":
+            return
         source = record["source_quote"]
         validation_source = record.get("preprocessed_input") or source
         if _protected_tokens(validation_source) != _protected_tokens(translated_text):
@@ -210,6 +223,15 @@ class TranslationCheckpointRecorder:
             validation_source, translated_text, layout_label=record.get("layout_label")
         )
         preserve_official_title = record.get("layout_label") == "title" and unchanged_prose
+        if unchanged_prose and not preserve_official_title:
+            skip_reason = (
+                "preserved_fallback_layout_content"
+                if record.get("layout_label") == "fallback_line"
+                else self._intentional_skip_reason(record)
+            )
+            if skip_reason:
+                self._skip(record, skip_reason)
+                return
         if unchanged_prose and not preserve_official_title:
             record["status"] = "unchanged_prose"
             record["failure_reason"] = "unchanged_prose"
@@ -259,9 +281,7 @@ class TranslationCheckpointRecorder:
                 # preservation is objectively clear, an unvisited unit is unresolved.
                 reason = self._intentional_skip_reason(record)
                 if reason:
-                    record["status"] = "skipped"
-                    record["skip_reason"] = reason
-                    self.skipped += 1
+                    self._skip(record, reason)
                 else:
                     record["status"] = "untranslated"
                     decline_reason = record.get("preprocess_decline_reason")
@@ -293,9 +313,31 @@ class TranslationCheckpointRecorder:
             return "protected_scientific_content"
         if _PROTECTED_TOKEN.fullmatch(normalized):
             return "placeholder_only"
-        if re.fullmatch(r"[\d\s.,:%/+−–—=()\[\]{}]+", normalized):
+        if record.get("preprocess_decline_reason") == "vertical_paragraph":
+            # BabelDOC excludes rotated text from its prose translator. Preserve it
+            # as layout content rather than failing the whole PDF or pretending it
+            # was translated; figures and plots retain their embedded labels too.
+            return "preserved_vertical_layout_content"
+        if re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", normalized):
+            return "author_contact_metadata"
+        if label == "fallback_line" and record.get("preprocessed_input") is None:
+            return "preserved_fallback_layout_content"
+        if (
+            label == "abandon"
+            and len(normalized) <= 60
+            and not normalized.endswith((".", "?", "!"))
+        ):
+            return "preserved_short_layout_label"
+        if re.fullmatch(r"[\d\s.,:%/+−–—=()\[\]{}·]+", normalized):
             return "numeric_or_symbol_only"
         return None
+
+    def _skip(self, record: dict[str, Any], reason: str) -> None:
+        if record["status"] == "skipped":
+            return
+        record["status"] = "skipped"
+        record["skip_reason"] = reason
+        self.skipped += 1
 
     def failure_reasons(self) -> dict[str, int]:
         reasons: dict[str, int] = {}
@@ -560,8 +602,8 @@ def _validate_request(request: Any) -> dict[str, Any]:
     if (
         not isinstance(request, dict)
         or request.get("protocol_version") != PROTOCOL_VERSION
-        or request.get("lang_in") != "English"
-        or request.get("lang_out") != "Vietnamese"
+        or request.get("lang_in") != TRANSLATION_LANG_IN
+        or request.get("lang_out") != TRANSLATION_LANG_OUT
     ):
         raise SafeEngineError("INVALID_ENGINE_REQUEST")
     for key in ("input_pdf", "output_dir", "working_dir", "layout_model"):
@@ -697,6 +739,10 @@ class SiliconFlowFreeTranslator:
     def __str__(self) -> str:
         return f"{self.name} {self.lang_in} {self.lang_out}"
 
+    def _provider_error(self) -> SafeEngineError:
+        self.failure_code = "PROVIDER_UNAVAILABLE"
+        return SafeEngineError(self.failure_code)
+
     def translate(self, text: str, ignore_cache: bool = False, rate_limit_params=None) -> str:
         del ignore_cache, rate_limit_params
         self.translate_call_count += 1
@@ -708,6 +754,8 @@ class SiliconFlowFreeTranslator:
                 return cached
         result = self._request(text)
         if record:
+            if _protected_tokens(text) != _protected_tokens(result):
+                raise self._provider_error()
             record["context_hash"] = hashlib.sha256(text.encode()).hexdigest()
             result = _apply_first_occurrence_terms(result, record.get("first_occurrence_terms", []))
         return result
@@ -728,6 +776,10 @@ class SiliconFlowFreeTranslator:
                         cached, record.get("first_occurrence_terms", [])
                     )
                 record["context_hash"] = context_hash
+                result = self._request(text)
+                if source and _protected_tokens(source) != _protected_tokens(result):
+                    raise self._provider_error()
+                return result
             return self._request(text)
 
         prefix, suffix, items = parsed
@@ -773,12 +825,19 @@ class SiliconFlowFreeTranslator:
                 provider_text += json.dumps(batch, ensure_ascii=False, indent=2)
                 if suffix:
                     provider_text += suffix
+                try:
+                    results = _clean_model_json(self._request(provider_text))
+                except SafeEngineError as exc:
+                    self.failure_code = exc.code
+                    raise
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    raise self._provider_error() from exc
                 parsed_results: dict[Any, str] = {}
-                for result in _clean_model_json(self._request(provider_text)):
+                for result in results:
                     result_id = result.get("id")
                     output = result.get("output")
                     if not isinstance(output, str):
-                        raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                        raise self._provider_error()
                     parsed_results[result_id] = output
                 return parsed_results
 
@@ -787,9 +846,9 @@ class SiliconFlowFreeTranslator:
             for item in misses:
                 output = provider_results.get(item.get("id"))
                 if output is None:
-                    raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                    raise self._provider_error()
                 if _protected_tokens(item["input"]) != _protected_tokens(output):
-                    raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                    raise self._provider_error()
                 layout_label = item.get("layout_label")
                 unchanged = _is_unchanged_english_prose(
                     item["input"], output, layout_label=layout_label
@@ -811,7 +870,7 @@ class SiliconFlowFreeTranslator:
                 if translated is None:
                     raise SafeEngineError("PROVIDER_UNAVAILABLE")
             if _protected_tokens(item["input"]) != _protected_tokens(translated):
-                raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                raise self._provider_error()
             translated = _apply_first_occurrence_terms(
                 translated, records[index].get("first_occurrence_terms", [])
             )
@@ -912,7 +971,9 @@ async def _translate(request: dict[str, Any]) -> None:
     )
     _ACTIVE_RECORDER = recorder
     limiter = SharedRateLimiter(2)
-    translator = SiliconFlowFreeTranslator("English", "Vietnamese", limiter, recorder)
+    translator = SiliconFlowFreeTranslator(
+        TRANSLATION_LANG_IN, TRANSLATION_LANG_OUT, limiter, recorder
+    )
     glossary_entries = [
         GlossaryEntry(item["source"], item["target"]) for item in request.get("glossary", [])
     ]
@@ -920,8 +981,8 @@ async def _translate(request: dict[str, Any]) -> None:
     config = TranslationConfig(
         translator=translator,
         input_file=input_pdf,
-        lang_in="English",
-        lang_out="Vietnamese",
+        lang_in=TRANSLATION_LANG_IN,
+        lang_out=TRANSLATION_LANG_OUT,
         doc_layout_model=OnnxModel(str(layout_model)),
         output_dir=output_dir,
         working_dir=working_dir,
@@ -1102,7 +1163,7 @@ def _checkpoint_hooks(
             )
         source = record.get("preprocessed_input") if record else None
         if source is not None and _protected_tokens(source) != _protected_tokens(translated_text):
-            raise SafeEngineError("ENGINE_FAILURE")
+            raise SafeEngineError("PROVIDER_UNAVAILABLE")
         result = original_post(self, paragraph, tracker, translate_input, translated_text)
         if record:
             recorder.complete(record, translated_text)

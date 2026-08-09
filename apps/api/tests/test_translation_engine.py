@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -238,6 +240,67 @@ def test_checkpoint_recorder_emits_page_quote_offsets_and_hashes(monkeypatch) ->
     assert counts == {"total": 1, "completed": 1, "skipped": 0, "failed": 0}
 
 
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("lang_in", "Vietnamese"),
+        ("lang_out", "English"),
+        ("translation_policy_version", "another-provider-v2"),
+    ],
+)
+def test_checkpoint_identity_includes_language_pair_and_policy(field, changed_value) -> None:
+    paragraph = _paragraph("A stable source paragraph.")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+
+    identity = {
+        "source_pdf_sha256": recorder.source_sha256,
+        "page_number": record["page_number"],
+        "ordinal": record["ordinal"],
+        "page_ordinal": record["page_ordinal"],
+        "source_sha256": record["source_sha256"],
+        "glossary_sha256": recorder.glossary_sha256,
+        "pdf2zh_version": engine_runner.PDF2ZH_VERSION,
+        "babeldoc_version": engine_runner.BABELDOC_VERSION,
+        "lang_in": engine_runner.TRANSLATION_LANG_IN,
+        "lang_out": engine_runner.TRANSLATION_LANG_OUT,
+        "translation_policy_version": engine_runner.TRANSLATION_POLICY_VERSION,
+    }
+
+    assert identity["lang_in"] == "English"
+    assert identity["lang_out"] == "Vietnamese"
+    assert record["base_key"] == engine_runner._checkpoint_base_key(identity)
+    changed_identity = {**identity, field: changed_value}
+    assert engine_runner._checkpoint_base_key(changed_identity) != record["base_key"]
+
+
+def test_translation_engine_request_requires_fixed_english_vietnamese_pair() -> None:
+    request = {
+        "protocol_version": engine_runner.PROTOCOL_VERSION,
+        "lang_in": engine_runner.TRANSLATION_LANG_IN,
+        "lang_out": engine_runner.TRANSLATION_LANG_OUT,
+        "input_pdf": "/tmp/source.pdf",
+        "output_dir": "/tmp/output",
+        "working_dir": "/tmp/work",
+        "layout_model": "/tmp/layout.onnx",
+        "source_pdf_sha256": "a" * 64,
+    }
+
+    assert engine_runner._validate_request(request) is request
+    with pytest.raises(engine_runner.SafeEngineError) as error:
+        engine_runner._validate_request({**request, "lang_out": "English"})
+
+    assert error.value.code == "INVALID_ENGINE_REQUEST"
+
+
 def test_checkpoint_recorder_rejects_dropped_protected_placeholders(monkeypatch) -> None:
     output = io.StringIO()
     monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
@@ -332,6 +395,144 @@ def test_checkpoint_recorder_fails_unvisited_required_prose() -> None:
     assert counts == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
     assert recorder.failure_reasons() == {"untranslated": 1}
     assert recorder.failure_causes() == {"preprocessing_not_selected": 1}
+
+
+def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
+    monkeypatch,
+) -> None:
+    """Exercise the pinned hook seams without importing BabelDOC or calling a provider."""
+    helper_name = "babeldoc.format.pdf.document_il.utils.paragraph_helper"
+    helper = types.ModuleType(helper_name)
+    helper.is_placeholder_only_paragraph = lambda _paragraph: False
+    helper.is_pure_numeric_paragraph = lambda paragraph: (
+        bool(paragraph.unicode.strip())
+        and all(char.isdigit() or char in " .,%+-" for char in paragraph.unicode.strip())
+    )
+    monkeypatch.setitem(sys.modules, helper_name, helper)
+
+    prose = _paragraph("The proposed method reduces attention cost.", "translated")
+    prose.pdf_paragraph_composition = [SimpleNamespace(pdf_line=True)]
+    equation = _paragraph("E = mc^2", "equation")
+    equation.layout_label = "equation"
+    equation.pdf_paragraph_composition = [SimpleNamespace(pdf_formula=True)]
+    numeric = _paragraph("93.5%", "numeric")
+    numeric.pdf_paragraph_composition = [SimpleNamespace(pdf_line=True)]
+    declined = _paragraph("A prose unit declined during preprocessing.", "declined")
+    declined.pdf_paragraph_composition = []
+    uncheckpointed = _paragraph(
+        "A selected prose unit without a validated result.", "uncheckpointed"
+    )
+    uncheckpointed.pdf_paragraph_composition = [SimpleNamespace(pdf_line=True)]
+    paragraphs = [prose, equation, numeric, declined, uncheckpointed]
+    docs = SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=paragraphs)])
+    translations = {id(prose): "Phương pháp đề xuất giảm chi phí chú ý."}
+    events: list[dict] = []
+    monkeypatch.setattr(engine_runner, "_emit", events.append)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+
+    class FakeILTranslator:
+        def __init__(self, translation_config, llm_translator):
+            self.translation_config = translation_config
+            self.llm_translator = llm_translator
+            self.inputs: dict[int, str | None] = {}
+
+        def translate(self, docs):
+            return docs
+
+        def get_translate_input(self, paragraph, page_font_map, disable_rich_text_translate):
+            del page_font_map, disable_rich_text_translate
+            if paragraph is equation or paragraph is numeric or paragraph is declined:
+                return None
+            return paragraph.unicode
+
+        def pre_translate_paragraph(self, paragraph, tracker, page_font_map, xobj_font_map):
+            del xobj_font_map
+            translate_input = self.get_translate_input(paragraph, page_font_map, False)
+            self.inputs[id(paragraph)] = translate_input
+            return translate_input, tracker
+
+        def post_translate_paragraph(self, paragraph, tracker, translate_input, translated_text):
+            del paragraph, tracker, translate_input
+            return translated_text
+
+        def translate_paragraph(self, paragraph, page):
+            del page
+            return self.llm_translator.translate_paragraph([paragraph])
+
+    class FakeLLMTranslator:
+        def __init__(self, translation_config, il_translator):
+            self.translation_config = translation_config
+            self.il_translator = il_translator
+
+        def translate(self, docs):
+            for page in docs.page:
+                for paragraph in page.pdf_paragraph:
+                    translate_input, tracker = self.il_translator.pre_translate_paragraph(
+                        paragraph, object(), None, None
+                    )
+                    if translate_input is None or paragraph is uncheckpointed:
+                        continue
+                    self.il_translator.translate_paragraph(paragraph, page)
+            return docs
+
+        def translate_paragraph(self, batch_paragraph):
+            results = []
+            for paragraph in batch_paragraph:
+                translate_input = self.il_translator.inputs[id(paragraph)]
+                translated_text = translations[id(paragraph)]
+                results.append(
+                    self.il_translator.post_translate_paragraph(
+                        paragraph, object(), translate_input, translated_text
+                    )
+                )
+            return results
+
+    config = SimpleNamespace(
+        min_text_length=5,
+        glossaries=[],
+    )
+    il_translator = FakeILTranslator(config, None)
+    llm_translator = FakeLLMTranslator(config, il_translator)
+    il_translator.llm_translator = llm_translator
+
+    with engine_runner._checkpoint_hooks(FakeILTranslator, FakeLLMTranslator, recorder):
+        llm_translator.translate(docs)
+        counts = recorder.finish()
+        recorder.emit_summary()
+
+    assert counts == {"total": 5, "completed": 1, "skipped": 2, "failed": 2}
+    assert counts["total"] == counts["completed"] + counts["skipped"] + counts["failed"]
+    assert recorder.get(prose)["status"] == "completed"
+    assert recorder.get(equation)["skip_reason"] == "protected_scientific_content"
+    assert recorder.get(numeric)["skip_reason"] == "numeric_or_symbol_only"
+    assert recorder.get(declined)["failure_reason"] == "no_composition"
+    assert recorder.get(declined)["preprocess_decline_reason"] == "no_composition"
+    assert recorder.get(uncheckpointed)["failure_reason"] == "missing_validated_checkpoint"
+    assert [event["type"] for event in events] == ["checkpoint", "segment_summary"]
+
+    checkpoint, summary = events
+    assert checkpoint["segment"]["source_quote"] == prose.unicode
+    assert checkpoint["segment"]["translated_text"] == translations[id(prose)]
+    assert summary["skip_reasons"] == {
+        "protected_scientific_content": 1,
+        "numeric_or_symbol_only": 1,
+    }
+    assert summary["failure_causes"] == {
+        "no_composition": 1,
+        "missing_validated_checkpoint": 1,
+    }
+    summary_wire = json.dumps(summary)
+    protocol_wire = json.dumps(events)
+    for paragraph in paragraphs:
+        assert paragraph.unicode not in summary_wire
+    assert all("source_quote" not in unit for unit in summary["failure_units"])
+    assert prose.unicode in protocol_wire  # only the validated checkpoint carries its source span
+    for paragraph in paragraphs[1:]:
+        assert paragraph.unicode not in protocol_wire
 
 
 def test_checkpoint_recorder_distinguishes_unselected_from_missing_checkpoint() -> None:
@@ -478,6 +679,71 @@ def test_preprocess_decline_diagnostics_do_not_change_skip_or_completion_counts(
     assert recorder.failure_causes() == {
         "no_composition": 1,
     }
+
+
+def test_checkpoint_recorder_preserves_vertical_layout_content_without_hiding_other_failures() -> (
+    None
+):
+    metadata = _paragraph("arXiv:1901.02860v3 [cs.LG] 2 Jun 2019")
+    prose = _paragraph("A meaningful paragraph set vertically in the page margin.")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[metadata, prose])])
+    )
+    recorder.get(metadata)["preprocess_decline_reason"] = "vertical_paragraph"
+    recorder.get(prose)["preprocess_decline_reason"] = "no_composition"
+
+    counts = recorder.finish()
+
+    assert counts == {"total": 2, "completed": 0, "skipped": 1, "failed": 1}
+    assert recorder.skip_reasons() == {"preserved_vertical_layout_content": 1}
+    assert recorder.failure_causes() == {"no_composition": 1}
+
+
+def test_checkpoint_recorder_preserves_metadata_and_unselected_layout_fragments() -> None:
+    numeric = _paragraph("1.0 · 1020")
+    reference = _paragraph("Vinyals & Kaiser el al. (2014) [37]")
+    author_contact = _paragraph("Ashish Vaswani∗ Google Brain avaswani@google.com")
+    short_label = _paragraph("Scaled Dot-Product Attention")
+    required = _paragraph("A required prose paragraph missing its validated translation.")
+    reference.layout_label = "fallback_line"
+    short_label.layout_label = "abandon"
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(
+            page=[
+                SimpleNamespace(
+                    page_number=1,
+                    pdf_paragraph=[numeric, reference, author_contact, short_label, required],
+                )
+            ]
+        )
+    )
+    recorder.get(numeric)["preprocess_decline_reason"] = "pure_numeric"
+    recorder.note_preprocessed(numeric, None)
+    recorder.note_preprocessed(reference, None)
+    recorder.note_preprocessed(author_contact, author_contact.unicode)
+    recorder.complete(recorder.get(author_contact), author_contact.unicode)
+    recorder.note_preprocessed(short_label, short_label.unicode)
+    recorder.complete(recorder.get(short_label), short_label.unicode)
+    recorder.note_preprocessed(required, required.unicode)
+
+    assert recorder.finish() == {"total": 5, "completed": 0, "skipped": 4, "failed": 1}
+    assert recorder.skip_reasons() == {
+        "numeric_or_symbol_only": 1,
+        "preserved_fallback_layout_content": 1,
+        "author_contact_metadata": 1,
+        "preserved_short_layout_label": 1,
+    }
+    assert recorder.failure_causes() == {"missing_validated_checkpoint": 1}
 
 
 def test_checkpoint_recorder_skips_only_short_unselected_content() -> None:
@@ -727,6 +993,110 @@ def test_llm_adapter_does_not_retry_unchanged_scientific_protected_content() -> 
     assert translated == source
     assert record["status"] == "completed"
     assert recorder.finish()["completed"] == 1
+
+
+def test_llm_single_paragraph_fallback_reuses_existing_prompt_checkpoint(monkeypatch) -> None:
+    source = "The output contains {v1} and {v2} values."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, source)
+    fallback_prompt = "BabelDOC's single-paragraph fallback prompt"
+    key = recorder.key_for(record, hashlib.sha256(fallback_prompt.encode()).hexdigest())
+    translated_checkpoint = "Đầu ra chứa {v1} và {v2} giá trị."
+    recorder.checkpoints[key] = translated_checkpoint
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    monkeypatch.setattr(
+        translator,
+        "_request",
+        lambda _text: pytest.fail("valid checkpoint should avoid a provider call"),
+    )
+
+    with recorder.paragraph_scope(paragraph):
+        translated = translator.llm_translate(fallback_prompt)
+
+    assert translated == translated_checkpoint
+
+
+def test_llm_single_paragraph_fallback_keeps_provider_prompt_and_classifies_marker_loss(
+    monkeypatch,
+) -> None:
+    source = "The result contains {v1} and {v2} values."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, source)
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    fallback_prompt = "The pinned BabelDOC single-paragraph request"
+    requests: list[str] = []
+
+    def fake_request(text: str) -> str:
+        requests.append(text)
+        return "Kết quả không còn dấu phân cách."
+
+    monkeypatch.setattr(translator, "_request", fake_request)
+    with (
+        recorder.paragraph_scope(paragraph),
+        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_UNAVAILABLE"),
+    ):
+        translator.llm_translate(fallback_prompt)
+
+    assert requests == [fallback_prompt]
+    assert translator.failure_code == "PROVIDER_UNAVAILABLE"
+    assert record["status"] == "pending"
+
+
+def test_llm_batch_malformed_provider_json_sets_safe_failure_code(monkeypatch) -> None:
+    source = "The formula is {v1} and the result is {v2}."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, source)
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    monkeypatch.setattr(translator, "_request", lambda _text: "not valid JSON")
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    item = {"id": 0, "input": source, "layout_label": "text"}
+
+    with (
+        recorder.batch_scope(),
+        recorder.paragraph_scope(paragraph),
+        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_UNAVAILABLE"),
+    ):
+        recorder.note_preprocessed(paragraph, source)
+        translator.llm_translate(prefix + json.dumps([item]))
+
+    assert translator.failure_code == "PROVIDER_UNAVAILABLE"
+    assert record["status"] == "pending"
 
 
 def test_llm_adapter_keeps_normal_batch_response_on_single_request() -> None:

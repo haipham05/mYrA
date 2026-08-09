@@ -153,6 +153,8 @@ class AssistantRouter:
             arguments = {}
             if request.intent_override is AssistantIntent.GRAPH:
                 arguments = {"action": "query", "question": request.message}
+            elif request.intent_override is AssistantIntent.VERIFY_CLAIM:
+                arguments = {"claim": request.message}
             decision = RouteDecision(
                 intent=request.intent_override,
                 resolved_paper_ids=selected_ids,

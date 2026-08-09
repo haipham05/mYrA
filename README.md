@@ -22,7 +22,13 @@ docker compose start
 
 If containers need creation and their images are already available, use `docker compose up -d --no-build`. Open <http://127.0.0.1:3000>; API health is at <http://127.0.0.1:8000/health> and OpenAPI at <http://127.0.0.1:8000/docs>. Do not run a rebuild, install, or model download as routine startup. Rebuild only the service whose source image or dependency lock actually changed.
 
-The base Compose file runs the API, web app, worker, and optional Neo4j service. Add `-f docker-compose.local.yml` to use the local PostgreSQL/pgvector and filesystem profile. The opt-in `cloud-data` profile keeps application processes local while using the configured Supabase/GCS adapters. Choose one data profile explicitly; never copy or migrate owner data automatically.
+The base Compose file runs the API, web app, worker, and Neo4j service. The existing configured setup uses the selected profile in its local environment; `MYRA_RUNTIME_PROFILE=cloud-data` keeps processes local while using configured Supabase/GCS adapters. To initialize the separate local PostgreSQL/pgvector and filesystem profile, run `python3 scripts/init_local_runtime.py`, then use both Compose files:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --no-build
+```
+
+Choose a data profile explicitly; never copy or migrate owner data automatically.
 
 Optional overlays reuse the existing application services:
 
@@ -35,7 +41,7 @@ Translation has a separate worker and overlay (`docker-compose.translation.yml`)
 
 ## Development and checks
 
-The repository uses Python 3.12/FastAPI with `uv`, and Next.js/TypeScript with npm. Read `AGENTS.md` and `apps/web/AGENTS.md` before making changes; local planning documents may be ignored and owner-supplied.
+The repository uses Python 3.12/FastAPI with `uv`, and Next.js/TypeScript with npm. If supplied in your workspace, read `AGENTS.md` and `apps/web/AGENTS.md` before making changes; local contributor plans may be ignored and owner-supplied.
 
 API checks from `apps/api/`:
 
@@ -60,4 +66,4 @@ Use isolated databases and mocked providers for ordinary tests. Live cloud/model
 
 ## Design and project status
 
-`docs/SYSTEM_DESIGN.md` describes the current single-user, local-first architecture and distinguishes implemented behavior from optional or planned capabilities. `docs/ASSISTANT_HTTP_API.md` shows how to submit and inspect an assistant run without the browser. No license has been selected; do not treat this project as open source under an assumed license.
+`docs/ASSISTANT_HTTP_API.md` shows how to submit and inspect an assistant run without the browser. Detailed system-design and development-status documents may be owner-local and Git-ignored, so do not assume a fresh clone includes them. No license has been selected; do not treat this project as open source under an assumed license.

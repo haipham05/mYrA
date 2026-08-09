@@ -183,7 +183,7 @@ class AssistantRunResponse(BaseModel):
     stage: str | None = None
     result: AssistantRunResult | None = None
     safe_error: str | None = None
-    usage: dict[str, int | float | str | None] | None = None
+    usage: dict[str, dict[str, int | float | str | None] | None] | None = None
     created_at: datetime
     updated_at: datetime
 

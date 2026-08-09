@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable
 from pathlib import Path
@@ -310,8 +311,53 @@ class BabelDocTranslationProcessor:
                 ],
                 "checkpoint_results": checkpoints,
             }
+            render_started_at: float | None = None
+
+            def emit_render_event(
+                *,
+                outcome: str,
+                segment_counts: Any = None,
+                output_bytes: int | None = None,
+                classification: str | None = None,
+            ) -> None:
+                safe_counts = None
+                if isinstance(segment_counts, dict):
+                    safe_counts = {
+                        name: value
+                        for name in ("total", "completed", "skipped", "failed")
+                        if isinstance((value := segment_counts.get(name)), int)
+                        and not isinstance(value, bool)
+                        and value >= 0
+                    }
+                output: dict[str, Any] = {
+                    "outcome": outcome,
+                    "render_progress_observed": render_started_at is not None,
+                    "duration_ms": (
+                        round((time.perf_counter() - render_started_at) * 1000, 3)
+                        if render_started_at is not None
+                        else None
+                    ),
+                    "segment_counts": safe_counts,
+                    "output_bytes": output_bytes,
+                }
+                if classification:
+                    output["classification"] = classification
+                try:
+                    telemetry.event(
+                        "translation.render",
+                        metadata=self._trace_metadata(translation_id=str(job.id)),
+                        output=output,
+                    )
+                except Exception:
+                    logger.warning(
+                        "translation_render_telemetry_failed",
+                        extra={"stage": "render", "outcome": outcome},
+                    )
 
             async def on_engine_progress(event: dict[str, Any]) -> None:
+                nonlocal render_started_at
+                if event.get("stage") == "rendering" and render_started_at is None:
+                    render_started_at = time.perf_counter()
                 if event.get("type") == "segment_summary":
                     logger.info(
                         "translation_segment_validation",
@@ -405,6 +451,11 @@ class BabelDocTranslationProcessor:
                         on_checkpoint=on_checkpoint,
                     )
                 except TranslationEngineError as exc:
+                    if render_started_at is not None:
+                        emit_render_event(
+                            outcome="failed",
+                            classification=exc.code,
+                        )
                     raise TranslationProcessingError(
                         exc.code,
                         "Translation provider or engine did not complete this request.",
@@ -458,6 +509,11 @@ class BabelDocTranslationProcessor:
                 raise TranslationProcessingError(
                     "ENGINE_PROTOCOL_ERROR", "Translation output was unavailable.", retryable=False
                 )
+            emit_render_event(
+                outcome="complete",
+                segment_counts=counts,
+                output_bytes=output_path.stat().st_size,
+            )
             with telemetry.stage(
                 "translation.validation",
                 metadata=self._trace_metadata(translation_id=str(job.id), segment_counts=counts),
