@@ -60,6 +60,52 @@ def test_assistant_run_request_rejects_duplicate_paper_ids() -> None:
         )
 
 
+def test_visual_selection_is_bound_to_single_selected_paper_and_current_hash() -> None:
+    paper_id = uuid4()
+    request = AssistantRunRequest.model_validate(
+        _request(
+            scope="paper",
+            selected_paper_ids=[paper_id],
+            visual_selection={
+                "paper_id": paper_id,
+                "page_number": 2,
+                "document_sha256": "a" * 64,
+                "crop": {"left": 0.1, "top": 0.2, "right": 0.8, "bottom": 0.9},
+            },
+        )
+    )
+    assert request.visual_selection is not None
+    assert request.visual_selection.paper_id == paper_id
+
+    with pytest.raises(ValueError, match="single paper as the run scope"):
+        AssistantRunRequest.model_validate(
+            _request(
+                scope="selection",
+                selected_paper_ids=[paper_id],
+                visual_selection={
+                    "paper_id": paper_id,
+                    "page_number": 2,
+                    "document_sha256": "a" * 64,
+                    "crop": {"left": 0.1, "top": 0.2, "right": 0.8, "bottom": 0.9},
+                },
+            )
+        )
+
+    with pytest.raises(ValidationError, match="positive width and height"):
+        AssistantRunRequest.model_validate(
+            _request(
+                scope="paper",
+                selected_paper_ids=[paper_id],
+                visual_selection={
+                    "paper_id": paper_id,
+                    "page_number": 2,
+                    "document_sha256": "a" * 64,
+                    "crop": {"left": 0.8, "top": 0.2, "right": 0.1, "bottom": 0.9},
+                },
+            )
+        )
+
+
 def test_route_decision_rejects_unknown_intent_and_unbounded_arguments() -> None:
     base = {"intent": "qa", "action_summary": "Answer from selected papers"}
 

@@ -1,62 +1,43 @@
 # mYrA — My Research Assistant
 
-mYrA is an early development scaffold for a research assistant. The current application contains a FastAPI health endpoint and a Next.js page that reports whether the API is reachable. Product design and milestone plans are maintained as local, untracked documents.
+mYrA is a single-user research workspace for organizing scientific papers, asking source-grounded questions, comparing literature, and keeping research notes. The web app and API run locally; answer generation uses the configured DeepSeek API, so local deployment still needs network access. No account login is provided: keep the app on loopback or behind a trusted private boundary.
 
-## Prerequisites
+## What works today
 
-- Docker with the Compose plugin for the two-service setup.
-- For host development: Python 3.12, [uv](https://docs.astral.sh/uv/), and Node.js 22 with npm.
+- PDF library, Docling ingestion, local BGE-M3 embeddings/reranking, hybrid retrieval, and page/quote citations.
+- Conversational QA, paper reading, comparison, claim verification, discovery proposals, notes, and saved research artifacts.
+- SQL-backed ingestion and assistant runs with progress, cancellation, approvals, and HTTP APIs.
+- Optional GraphRAG, translation, and Langfuse observability overlays.
 
-## Run with Docker
+Translation and visual analysis still have known provider/document coverage limits; see `DEVELOPMENT_STATUS.md` (owner-supplied local file) and the feature plans when available. A checked-in directory or endpoint alone does not mean every planned workflow is complete.
 
-From the repository root:
+## Existing installation
+
+Use the already configured Docker images and local state. From the repository root:
 
 ```bash
-docker compose up --build
+docker compose ps --all
+docker compose start
 ```
 
-Open <http://localhost:3000>. The page should show **API: Connected**. The API health endpoint is <http://localhost:8000/health> and returns `{"status":"ok","service":"myra-api"}`. Stop the foreground Compose process with Ctrl+C.
+If containers need creation and their images are already available, use `docker compose up -d --no-build`. Open <http://127.0.0.1:3000>; API health is at <http://127.0.0.1:8000/health> and OpenAPI at <http://127.0.0.1:8000/docs>. Do not run a rebuild, install, or model download as routine startup. Rebuild only the service whose source image or dependency lock actually changed.
 
-## Enable GraphRAG on an existing installation
+The base Compose file runs the API, web app, worker, and optional Neo4j service. Add `-f docker-compose.local.yml` to use the local PostgreSQL/pgvector and filesystem profile. The opt-in `cloud-data` profile keeps application processes local while using the configured Supabase/GCS adapters. Choose one data profile explicitly; never copy or migrate owner data automatically.
 
-With configured Supabase/GCS/DeepSeek, the current schema, existing images, and
-cached BGE weights, reuse the API, worker and local Neo4j:
+Optional overlays reuse the existing application services:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.graph.yml up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --no-build
 ```
 
-Open a project's Graph Explorer from the workspace. Indexing calls DeepSeek and
-stores only source-verified facts; unsupported candidates are rejected. This
-profile reads at most eight child chunks per paper, so an empty result does not
-prove the paper has no relationships. It adds no services or public ports and
-does not edit `.env`. Use both Compose files for subsequent starts/recreation;
-running only the base file restores its configured feature setting. Models must
-already be cached because the profile loads them offline.
+Translation has a separate worker and overlay (`docker-compose.translation.yml`). Follow `infrastructure/observability/README.md` for Langfuse initialization; translation availability depends on its isolated runtime and configured service. Do not expose these no-login services to the public internet. Langfuse is available at <http://127.0.0.1:3001> when its overlay is initialized and running.
 
-## Run on the host
+## Development and checks
 
-In one terminal, start the API:
+The repository uses Python 3.12/FastAPI with `uv`, and Next.js/TypeScript with npm. Read `AGENTS.md` and `apps/web/AGENTS.md` before making changes; local planning documents may be ignored and owner-supplied.
 
-```bash
-cd apps/api
-uv sync --all-groups
-uv run uvicorn app.main:app --reload
-```
-
-In another terminal, start the web app:
-
-```bash
-cd apps/web
-npm ci
-npm run dev
-```
-
-The frontend uses `http://localhost:8000` by default. To change Compose settings, copy `.env.example` to `.env`; Compose loads it for the API and passes `NEXT_PUBLIC_API_URL` to the web container. For host development, export API settings in the API terminal and put browser-visible settings in `apps/web/.env.local`. Keep credentials out of Git. The cloud variables are placeholders until database and storage integration is implemented.
-
-## Validate changes
-
-Run these commands from `apps/api/`:
+API checks from `apps/api/`:
 
 ```bash
 uv run ruff format --check .
@@ -64,25 +45,19 @@ uv run ruff check .
 uv run pytest
 ```
 
-When API dependencies change, update `uv.lock` and regenerate the image's pinned requirements from `apps/api/`:
-
-```bash
-uv lock
-uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file requirements.txt
-```
-
-Run these commands from `apps/web/`:
+Web checks from `apps/web/`:
 
 ```bash
 npm run format:check
 npm run lint
 npm run typecheck
 npm test
+npm run test:e2e
 npm run build
 ```
 
-## Cloud resources
+Use isolated databases and mocked providers for ordinary tests. Live cloud/model tests are opt-in and must stay within the documented approved scope. Never print or commit `.env` values, credentials, local databases, papers, or generated observability keys.
 
-The Milestone 0 hybrid development profile uses a Supabase PostgreSQL project with the `vector` extension and a private Google Cloud Storage bucket. Their identifiers belong in local configuration; see `.env.example` for the required variable names. No database schema or object-storage adapter is part of this scaffold.
+## Design and project status
 
-No license has been selected yet; do not treat this repository as open source until one is added.
+`docs/SYSTEM_DESIGN.md` describes the current single-user, local-first architecture and distinguishes implemented behavior from optional or planned capabilities. `docs/ASSISTANT_HTTP_API.md` shows how to submit and inspect an assistant run without the browser. No license has been selected; do not treat this project as open source under an assumed license.

@@ -514,6 +514,8 @@ async def test_ordinary_factual_qa_unchanged(db: Session):
     assert len(interpretation_claims) == 1
     assert interpretation_claims[0].evidence_ids == ["E1"]
     assert "suggests" in interpretation_claims[0].claim_text
+    mock_repo.verify_connectivity.assert_not_called()
+    mock_repo.search_nodes.assert_not_called()
 
     # Verify no contradiction instructions or outage notice in prompt
     _, kwargs = mock_llm.generate.call_args
@@ -755,6 +757,29 @@ async def test_graph_outage_handling(db: Session):
         in kwargs["system_prompt"]
     )
 
+    # An explicit Graph request can be phrased as a factual question. It must
+    # still disclose that graph lookup was unavailable and text evidence was used.
+    factual_conv = create_conversation(db, project_id=project.id, title="Explicit graph factual")
+    with patch("app.services.chat_service.get_llm_provider", return_value=mock_llm):
+        factual_response = await chat_service.answer_question(
+            db=db,
+            conversation_id=factual_conv.id,
+            question="What does this paper say about Adam and SGD?",
+            graph_lookup=True,
+        )
+
+    assert factual_response.citations
+    assert "Graph service is currently offline; using text retrieval." in factual_response.content
+    _, factual_kwargs = mock_llm.generate.call_args
+    assert (
+        "[NOTE: Graph service is currently offline; using text retrieval.]"
+        in factual_kwargs["user_prompt"]
+    )
+    assert (
+        "[NOTE: Graph service is currently offline; using text retrieval.]"
+        in factual_kwargs["system_prompt"]
+    )
+
 
 # =============================================================================
 # Test 6: Ingestion and Paper status remain decoupled
@@ -820,15 +845,13 @@ async def test_ingestion_and_paper_status_remain_decoupled(db: Session):
     assert job.error_message is None, f"Job failed with error: {job.error_message}"
     assert paper.status == PaperStatus.READY.value
 
-    # Graph event was enqueued atomically in PostgreSQL
+    # Graph indexing is opt-in and must not be enqueued by ordinary ingestion.
     event = (
         db.query(GraphEvent)
         .filter(GraphEvent.paper_id == paper.id, GraphEvent.project_id == proj.id)
         .first()
     )
-    assert event is not None
-    assert event.status == "PENDING"
-    assert event.action == "UPSERT"
+    assert event is None
 
 
 # =============================================================================
@@ -1013,7 +1036,10 @@ def test_graph_telemetry_distinguishes_neo4j_outage_and_unresolved_evidence(db, 
     )
     assert items == []
     assert outage == "Graph service is not configured; using text retrieval."
-    assert recorder.spans[0][2].updates[-1]["metadata"]["outcome"] == "unavailable"
+    assert recorder.spans[0][0] == "graph.route"
+    assert recorder.spans[0][2].updates[-1]["metadata"]["outcome"] == "routed"
+    assert recorder.spans[1][0] == "graph.query"
+    assert recorder.spans[1][2].updates[-1]["metadata"]["outcome"] == "unavailable"
 
     monkeypatch.setattr(
         "app.services.graphrag.router.retrieve_graph_candidates_for_query",
@@ -1032,8 +1058,8 @@ def test_graph_telemetry_distinguishes_neo4j_outage_and_unresolved_evidence(db, 
     )
     assert items == []
     assert outage is None
-    assert recorder.spans[1][2].updates[-1]["metadata"]["outcome"] == "success"
-    resolution = recorder.spans[2][2].updates[-1]["metadata"]
+    assert recorder.spans[4][2].updates[-1]["metadata"]["outcome"] == "success"
+    resolution = recorder.spans[5][2].updates[-1]["metadata"]
     assert resolution["candidate_fact_count"] == 1
     assert resolution["verified_evidence_count"] == 0
     assert resolution["outcome"] == "unresolved"

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import PdfViewer, { findRangeForQuote } from "./PdfViewer";
+import PdfViewer, { findRangeForQuote, normalizeCropBox } from "./PdfViewer";
 import type { Citation, Paper } from "@/types";
 
 vi.mock("pdfjs-dist", () => {
@@ -160,6 +160,17 @@ describe("PdfViewer & Exact Range Matching", () => {
         toJSON: () => {},
       } as DOMRect;
     };
+  });
+
+  it("normalizes a dragged visual crop and rejects tiny regions", () => {
+    expect(normalizeCropBox(20, 30, 220, 130, 400, 200)).toEqual({
+      left: 0.05,
+      top: 0.15,
+      right: 0.55,
+      bottom: 0.65,
+    });
+    expect(normalizeCropBox(100, 100, 101, 101, 400, 200)).toBeNull();
+    expect(normalizeCropBox(0, 0, 20, 20, 0, 0)).toBeNull();
   });
 
   afterEach(() => vi.unstubAllGlobals());

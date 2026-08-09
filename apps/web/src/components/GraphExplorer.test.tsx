@@ -12,7 +12,6 @@ import {
   fetchGraphStatus,
   fetchNodeNeighbors,
   searchGraphNodes,
-  triggerGraphIndex,
   GraphUnavailableError,
 } from "@/lib/graph";
 import type {
@@ -31,7 +30,6 @@ vi.mock("@/lib/graph", async (importOriginal) => {
     searchGraphNodes: vi.fn(),
     fetchNodeNeighbors: vi.fn(),
     fetchFactDetail: vi.fn(),
-    triggerGraphIndex: vi.fn(),
   };
 });
 
@@ -526,10 +524,10 @@ describe("GraphExplorer Component", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText("Neo4j Offline")).toBeInTheDocument();
+      expect(screen.getByText("Graph unavailable")).toBeInTheDocument();
       expect(
         screen.getByText(
-          "Graph service is currently offline. Showing local snapshot view.",
+          /Graph exploration is disabled or temporarily unavailable[\s\S]*Core paper Q&A and comparisons remain available/,
         ),
       ).toBeInTheDocument();
     });
@@ -544,10 +542,10 @@ describe("GraphExplorer Component", () => {
     render(<GraphExplorer projectId={mockProjectId} apiUrl={mockApiUrl} />);
 
     await waitFor(() => {
-      expect(screen.getByText("Neo4j Offline")).toBeInTheDocument();
+      expect(screen.getByText("Graph unavailable")).toBeInTheDocument();
       expect(
         screen.getByText(
-          "Graph service is currently offline. Showing local snapshot view.",
+          /Graph exploration is disabled or temporarily unavailable[\s\S]*Core paper Q&A and comparisons remain available/,
         ),
       ).toBeInTheDocument();
     });
@@ -584,39 +582,21 @@ describe("GraphExplorer Component", () => {
     expect(screen.getByText("1-Hop Connections (2)")).toBeInTheDocument();
   });
 
-  // Test 9: Triggers graph indexing on Index Papers button click with confirmation
-  it("triggers graph indexing on Index Papers button click with confirmation", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-    vi.mocked(triggerGraphIndex).mockResolvedValueOnce({
-      dry_run: false,
-      eligible_paper_ids: ["paper-1"],
-      enqueued_count: 3,
-      skipped_count: 0,
-      target_project_id: mockProjectId,
-    });
-
+  it("keeps graph indexing out of the explorer and hides service diagnostics by default", async () => {
     render(<GraphExplorer projectId={mockProjectId} apiUrl={mockApiUrl} />);
 
-    const indexBtn = screen.getByRole("button", { name: "Index Papers" });
-    fireEvent.click(indexBtn);
+    expect(
+      screen.queryByRole("button", { name: "Index Papers" }),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByText("Graph available")).toBeInTheDocument();
+    const serviceDetails = screen
+      .getByText("Service details")
+      .closest("details");
+    expect(serviceDetails).not.toHaveAttribute("open");
 
-    await waitFor(() => {
-      expect(window.confirm).toHaveBeenCalledWith(
-        "Index papers for this project into the knowledge graph?",
-      );
-      expect(triggerGraphIndex).toHaveBeenCalledWith(
-        mockApiUrl,
-        mockProjectId,
-        undefined,
-        10,
-        false,
-      );
-    });
-
-    await waitFor(() => {
-      expect(
-        screen.getByText("Enqueued 3 papers for graph indexing."),
-      ).toBeInTheDocument();
-    });
+    fireEvent.click(screen.getByText("Service details"));
+    expect(serviceDetails).toHaveAttribute("open");
+    expect(screen.getByText("Queued events")).toBeInTheDocument();
+    expect(screen.getByText("0")).toBeInTheDocument();
   });
 });

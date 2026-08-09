@@ -19,6 +19,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import Settings
+from app.crud.assistant_run import get_valid_approved_assistant_action
 from app.crud.memory import (
     MemoryVersionConflictError,
     create_memory,
@@ -30,6 +32,7 @@ from app.crud.translation import TranslationConflict, create_translation
 from app.db.models import (
     AssistantApprovalAction,
     AssistantRun,
+    GraphEvent,
     Message,
     Paper,
     ProjectTranslationGlossaryEntry,
@@ -52,6 +55,7 @@ from app.schemas.memory import (
     MemoryType,
     MemoryUpdate,
 )
+from app.services.budget import BudgetDeniedError
 from app.services.cache import get_cache
 from app.services.chat_service import ChatService
 from app.services.claim_verification import ClaimAssessment, ClaimSource, verify_claim
@@ -64,6 +68,8 @@ from app.services.comparison_synthesis import (
 )
 from app.services.discovery.catalogs import CatalogSearchError, search_arxiv, search_openalex
 from app.services.discovery.deduplicate import deduplicate_candidates
+from app.services.graphrag.indexing import enqueue_existing_papers_for_graph
+from app.services.graphrag.neo4j_repository import Neo4jRepository
 from app.services.llm import (
     DeepSeekLLMProvider,
     GenerationOptions,
@@ -80,6 +86,14 @@ from app.services.source_resolution import (
     build_selected_passage_evidence,
     resolve_exact_source_anchor,
 )
+from app.services.vision import (
+    DeepSeekVisionProvider,
+    VisionProviderError,
+    VisionRequest,
+    analyze_figure_cached,
+)
+from app.services.visual_assets import NormalizedCropBox, VisualAssetError, extract_visual_asset
+from app.storage.factory import get_storage
 
 
 class ToolStatus(StrEnum):
@@ -200,7 +214,8 @@ class VisionArguments(ToolArguments):
 
 
 class GraphArguments(ToolArguments):
-    question: str = Field(min_length=1, max_length=1000)
+    action: Literal["query", "index"] = "query"
+    question: str | None = Field(default=None, max_length=1000)
 
 
 class AssistantToolInput(BaseModel):
@@ -387,6 +402,41 @@ def build_assistant_approval_arguments(
         arguments["translation"] = _translation_proposal_details(
             db, project_id=run.project_id, paper_id=paper_ids[0]
         )
+    elif decision.intent is AssistantIntent.GRAPH and isinstance(
+        tool_input.arguments, GraphArguments
+    ):
+        if tool_input.arguments.action == "index":
+            if not paper_ids or len(paper_ids) > 6:
+                raise ValueError("Select one to six READY papers before requesting graph indexing.")
+            telemetry = get_telemetry()
+            with telemetry.stage(
+                "graph.index_propose",
+                metadata={"paper_count": len(paper_ids), "outcome": "started", "cache": "none"},
+            ) as observation:
+                papers = (
+                    db.query(Paper)
+                    .filter(
+                        Paper.project_id == request.project_id,
+                        Paper.id.in_(paper_ids),
+                    )
+                    .all()
+                )
+                if observation is not None:
+                    observation.update(
+                        output={"eligible_count": len(papers)},
+                        metadata={"outcome": "eligible"},
+                    )
+            if len(papers) != len(set(paper_ids)) or any(
+                paper.status != "READY" or not paper.document_sha256 for paper in papers
+            ):
+                raise ValueError("Graph indexing requires current READY papers in this project.")
+            arguments["graph_index"] = {
+                "paper_ids": [str(paper_id) for paper_id in paper_ids],
+                "source_sha256": {
+                    str(paper.id): paper.document_sha256
+                    for paper in sorted(papers, key=lambda p: p.id.hex)
+                },
+            }
     return arguments, paper_ids
 
 
@@ -515,6 +565,96 @@ async def _translate(context: ToolContext, tool_input: AssistantToolInput) -> As
     return _translation_job_result(translation, created=created)
 
 
+async def _vision(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    selection = tool_input.request.visual_selection
+    paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
+    if selection is None or paper_ids != [selection.paper_id]:
+        return AssistantToolResult(
+            status=ToolStatus.NEEDS_INPUT,
+            result_type="visual_selection_required",
+            display_text=(
+                "Select one paper and a figure or table region in its PDF, then ask again. "
+                "Visual analysis is separate from text citations."
+            ),
+            available_actions=["select_figure_region"],
+        )
+
+    settings = Settings.from_environment()
+    telemetry = get_telemetry()
+    try:
+        with telemetry.stage(
+            "vision.asset_select",
+            metadata={
+                "paper_id": str(selection.paper_id),
+                "page_number": selection.page_number,
+                "document_sha256": selection.document_sha256,
+                "outcome": "started",
+            },
+        ) as observation:
+            asset = await extract_visual_asset(
+                session=context.db,
+                storage=get_storage(settings),
+                project_id=tool_input.request.project_id,
+                paper_id=selection.paper_id,
+                page_number=selection.page_number,
+                crop=NormalizedCropBox(**selection.crop.model_dump()),
+                expected_document_sha256=selection.document_sha256,
+            )
+            if observation is not None:
+                observation.update(
+                    output={"crop_sha256": asset.source["crop_sha256"]},
+                    metadata={"outcome": "succeeded", "image_bytes": len(asset.png_bytes)},
+                )
+        result = await analyze_figure_cached(
+            provider=DeepSeekVisionProvider(settings=settings),
+            cache=get_cache(settings),
+            request=VisionRequest(
+                question=tool_input.arguments.question,
+                image_bytes=asset.png_bytes,
+            ),
+            source_metadata=asset.source,
+        )
+    except (VisionProviderError, VisualAssetError, BudgetDeniedError, ValueError) as exc:
+        code = (
+            "BUDGET_DENIED"
+            if isinstance(exc, BudgetDeniedError)
+            else getattr(exc, "code", "SOURCE_UNAVAILABLE")
+        )
+        return AssistantToolResult(
+            status=ToolStatus.UNAVAILABLE,
+            result_type="visual_analysis_unavailable",
+            display_text="I could not analyze that selected figure safely.",
+            warnings=[str(code)],
+        )
+
+    usage = None
+    reported_model = None
+    if result.generation is not None:
+        reported_model = result.generation.reported_model
+        if result.generation.usage is not None:
+            usage = {
+                "prompt_tokens": result.generation.usage.prompt_tokens,
+                "completion_tokens": result.generation.usage.completion_tokens,
+                "total_tokens": result.generation.usage.total_tokens,
+            }
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="visual_analysis",
+        display_text=(
+            result.analysis.interpretation
+            or "The selected visual is described in the observations below."
+        ),
+        structured_payload={
+            "analysis": result.analysis.model_dump(mode="json"),
+            "visual_source": result.source.model_dump(mode="json"),
+            "cache_status": result.cache_status if get_cache(settings).enabled else "disabled",
+            "requested_model": "deepseek-flash",
+            "reported_model": reported_model,
+        },
+        usage=usage,
+    )
+
+
 def _translation_job_result(
     translation: TranslationDocument, *, created: bool
 ) -> AssistantToolResult:
@@ -604,6 +744,69 @@ def recover_approved_translation(
     if glossary_identity != approved_snapshot.get("glossary_snapshot_identity"):
         return None
     return _translation_job_result(translation, created=False)
+
+
+def recover_approved_graph_index(
+    context: ToolContext,
+    tool_input: AssistantToolInput,
+    action: AssistantApprovalAction,
+) -> AssistantToolResult | None:
+    """Recover an already-enqueued, approved graph batch without enqueueing it again."""
+    if (
+        action.run_id != context.assistant_run_id
+        or action.action_type != AssistantIntent.GRAPH.value
+        or action.status != "APPROVED"
+        or not isinstance(tool_input.arguments, GraphArguments)
+        or tool_input.arguments.action != "index"
+    ):
+        return None
+    try:
+        expected, paper_ids = build_assistant_approval_arguments(
+            context.db,
+            run_id=action.run_id,
+            request=tool_input.request,
+            decision=tool_input.decision,
+            tool_input=tool_input,
+        )
+        approved = get_valid_approved_assistant_action(
+            context.db,
+            action.run_id,
+            action_type=AssistantIntent.GRAPH.value,
+            expected_arguments=expected,
+            paper_ids=paper_ids,
+        )
+    except ValueError:
+        return None
+    if approved is None or approved.id != action.id:
+        return None
+
+    target_ids = [UUID(value) for value in expected["graph_index"]["paper_ids"]]
+    generation_ids = [f"approved_{action.id.hex}_{paper_id.hex}" for paper_id in target_ids]
+    events = (
+        context.db.query(GraphEvent)
+        .filter(GraphEvent.project_id == tool_input.request.project_id)
+        .filter(GraphEvent.paper_id.in_(target_ids))
+        .filter(GraphEvent.generation_id.in_(generation_ids))
+        .all()
+    )
+    if len(events) != len(target_ids):
+        return None
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="graph_index_jobs",
+        display_text=(
+            f"Graph indexing was already queued for {len(events)} approved paper(s); "
+            "the saved job state has been recovered."
+        ),
+        structured_payload={
+            "project_id": str(tool_input.request.project_id),
+            "paper_ids": target_ids,
+            "queued_count": sum(event.status in {"PENDING", "PROCESSING"} for event in events),
+            "completed_count": sum(event.status == "COMPLETED" for event in events),
+            "failed_count": sum(event.status == "FAILED" for event in events),
+            "approval_id": str(action.id),
+        },
+    )
 
 
 def _note_payload(memory: Any) -> dict[str, Any]:
@@ -740,7 +943,12 @@ async def _notes(context: ToolContext, tool_input: AssistantToolInput) -> Assist
     )
 
 
-async def _qa(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+async def _qa(
+    context: ToolContext,
+    tool_input: AssistantToolInput,
+    *,
+    graph_lookup: bool | None = None,
+) -> AssistantToolResult:
     source_selection = tool_input.request.source_selection
     resolved_paper_ids = tool_input.decision.resolved_paper_ids
     requested_paper_ids = resolved_paper_ids or tool_input.request.selected_paper_ids or []
@@ -826,6 +1034,7 @@ async def _qa(context: ToolContext, tool_input: AssistantToolInput) -> Assistant
         run_attempt_count=context.attempt_count,
         response_guidance=response_guidance,
         additional_evidence=[selected_evidence] if source_selection is not None else None,
+        graph_lookup=graph_lookup,
     )
     return AssistantToolResult(
         status=ToolStatus.SUCCEEDED,
@@ -835,6 +1044,126 @@ async def _qa(context: ToolContext, tool_input: AssistantToolInput) -> Assistant
         citations=response.citations,
         evidence=[item.model_dump(mode="json") for item in response.evidence],
         usage=response.provider_usage,
+    )
+
+
+async def _graph(context: ToolContext, tool_input: AssistantToolInput) -> AssistantToolResult:
+    arguments = tool_input.arguments
+    if not isinstance(arguments, GraphArguments):
+        raise TypeError("graph arguments were not validated")
+
+    if arguments.action == "query":
+        question = (
+            arguments.question
+            or tool_input.decision.standalone_question
+            or tool_input.request.message
+        )
+        decision = tool_input.decision.model_copy(update={"standalone_question": question})
+        result = await _qa(
+            context,
+            tool_input.model_copy(update={"decision": decision}),
+            graph_lookup=True,
+        )
+        result.structured_payload = {
+            **result.structured_payload,
+            "graph_lookup": "requested",
+            "graph_coverage": "verified indexed facts only; not proof of corpus-wide absence",
+        }
+        return result
+
+    if context.assistant_run_id is None or context.approved_action_id is None:
+        return AssistantToolResult(
+            status=ToolStatus.NEEDS_INPUT,
+            result_type="graph_index_approval_required",
+            display_text="Graph indexing must be requested and approved through the assistant.",
+            available_actions=["request_graph_indexing"],
+        )
+
+    settings = Settings.from_environment()
+    if not settings.graphrag_enabled:
+        return AssistantToolResult(
+            status=ToolStatus.UNAVAILABLE,
+            result_type="graph_indexing_unavailable",
+            display_text="Graph indexing is disabled in the current local configuration.",
+        )
+    repository = None
+    try:
+        repository = Neo4jRepository.from_settings(settings)
+        if repository is None or not repository.verify_connectivity():
+            return AssistantToolResult(
+                status=ToolStatus.UNAVAILABLE,
+                result_type="graph_indexing_unavailable",
+                display_text="Graph indexing is unavailable because the graph service is offline.",
+            )
+    except Exception:
+        return AssistantToolResult(
+            status=ToolStatus.UNAVAILABLE,
+            result_type="graph_indexing_unavailable",
+            display_text="Graph indexing is unavailable because the graph service is offline.",
+        )
+    finally:
+        if repository is not None:
+            repository.close()
+
+    action, paper_ids = build_assistant_approval_arguments(
+        context.db,
+        run_id=context.assistant_run_id,
+        request=tool_input.request,
+        decision=tool_input.decision,
+        tool_input=tool_input,
+    )
+    approved = get_valid_approved_assistant_action(
+        context.db,
+        context.assistant_run_id,
+        action_type=AssistantIntent.GRAPH.value,
+        expected_arguments=action,
+        paper_ids=paper_ids,
+    )
+    if approved is None or approved.id != context.approved_action_id:
+        return AssistantToolResult(
+            status=ToolStatus.NEEDS_INPUT,
+            result_type="graph_index_approval_invalid",
+            display_text=(
+                "The graph-indexing approval is missing or no longer matches these papers."
+            ),
+        )
+
+    target_ids = [UUID(value) for value in action["graph_index"]["paper_ids"]]
+    telemetry = get_telemetry()
+    with telemetry.stage(
+        "graph.index_publish",
+        metadata={"paper_count": len(target_ids), "outcome": "started", "cache": "none"},
+    ) as observation:
+        result = enqueue_existing_papers_for_graph(
+            db=context.db,
+            project_id=tool_input.request.project_id,
+            paper_ids=target_ids,
+            limit=len(target_ids),
+            dry_run=False,
+            generation_namespace=approved.id.hex,
+        )
+        if observation is not None:
+            observation.update(
+                output={
+                    "queued_count": result["enqueued_count"],
+                    "skipped_count": result["skipped_count"],
+                },
+                metadata={"outcome": "succeeded"},
+            )
+    return AssistantToolResult(
+        status=ToolStatus.SUCCEEDED,
+        result_type="graph_index_jobs",
+        display_text=(
+            f"Queued graph indexing for {result['enqueued_count']} paper(s); "
+            f"{result['skipped_count']} were already queued or no longer eligible."
+        ),
+        structured_payload={
+            "project_id": str(tool_input.request.project_id),
+            "paper_ids": target_ids,
+            "queued_count": result["enqueued_count"],
+            "skipped_count": result["skipped_count"],
+            "approval_id": str(approved.id),
+        },
     )
 
 
@@ -1776,8 +2105,21 @@ def build_tool_registry() -> Mapping[AssistantIntent, ToolDefinition]:
         max_papers=1,
         available=True,
     )
-    register(AssistantIntent.VISION, VisionArguments, min_papers=1)
-    register(AssistantIntent.GRAPH, GraphArguments, min_papers=1)
+    register(
+        AssistantIntent.VISION,
+        VisionArguments,
+        _vision,
+        min_papers=1,
+        max_papers=1,
+        available=True,
+    )
+    register(
+        AssistantIntent.GRAPH,
+        GraphArguments,
+        _graph,
+        max_papers=6,
+        available=True,
+    )
     # QA's handler receives the already-configured existing chat service in ToolContext.
     definitions[AssistantIntent.QA] = ToolDefinition(
         intent=AssistantIntent.QA,
@@ -1804,6 +2146,13 @@ def validate_tool_input(
 ) -> AssistantToolInput:
     arguments = definition.arguments_model.model_validate(decision.arguments)
     paper_ids = decision.resolved_paper_ids or request.selected_paper_ids
+    if (
+        definition.intent is AssistantIntent.GRAPH
+        and isinstance(arguments, GraphArguments)
+        and arguments.action == "index"
+        and not 1 <= len(paper_ids) <= 6
+    ):
+        raise ValueError("select_one_to_six_papers_for_graph_indexing")
     if len(paper_ids) > definition.max_papers:
         raise ValueError("too many papers for this action")
     if len(paper_ids) < definition.min_papers:
@@ -1815,6 +2164,9 @@ def tool_requires_approval(definition: ToolDefinition, tool_input: AssistantTool
     if definition.intent is AssistantIntent.NOTES:
         arguments = tool_input.arguments
         return isinstance(arguments, NotesArguments) and arguments.action != "list"
+    if definition.intent is AssistantIntent.GRAPH:
+        arguments = tool_input.arguments
+        return isinstance(arguments, GraphArguments) and arguments.action == "index"
     return definition.requires_approval
 
 

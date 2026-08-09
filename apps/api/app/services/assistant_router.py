@@ -123,12 +123,41 @@ class AssistantRouter:
             )
             return AssistantRouteResult(outcome=RouteOutcome.ROUTED, decision=decision)
 
+        # Selecting a visual region is an explicit, user-visible action. Route it
+        # deterministically so the model cannot invent or redirect crop geometry.
+        if request.visual_selection is not None:
+            if request.intent_override not in (None, AssistantIntent.VISION):
+                decision = RouteDecision(
+                    intent=AssistantIntent.CLARIFY,
+                    missing_information=["conflicting_action_and_visual_selection"],
+                    clarification=(
+                        "A selected figure region can only use visual analysis. Clear the region "
+                        "selection to choose another action."
+                    ),
+                    action_summary="Clarify the selected visual action",
+                )
+                return AssistantRouteResult(
+                    outcome=RouteOutcome.NEEDS_CLARIFICATION, decision=decision
+                )
+            decision = RouteDecision(
+                intent=AssistantIntent.VISION,
+                resolved_paper_ids=[request.visual_selection.paper_id],
+                standalone_question=request.message,
+                arguments={"question": request.message},
+                action_summary="Analyze the selected paper figure",
+            )
+            return AssistantRouteResult(outcome=RouteOutcome.ROUTED, decision=decision)
+
         # An explicit user action is authoritative and requires no paid routing call.
         if request.intent_override is not None:
+            arguments = {}
+            if request.intent_override is AssistantIntent.GRAPH:
+                arguments = {"action": "query", "question": request.message}
             decision = RouteDecision(
                 intent=request.intent_override,
                 resolved_paper_ids=selected_ids,
                 standalone_question=request.message,
+                arguments=arguments,
                 action_summary=f"Use {request.intent_override.value.replace('_', ' ')}",
             )
             return AssistantRouteResult(outcome=RouteOutcome.ROUTED, decision=decision)

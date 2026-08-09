@@ -154,6 +154,24 @@ def test_rejects_wrong_project_and_unready_paper_before_storage_read(research_db
     assert error.value.code == "PAPER_NOT_READY"
 
 
+def test_rejects_stale_client_selected_pdf_version_before_reading_storage(research_db):
+    session, project, paper, _, storage, _ = research_db
+    with pytest.raises(VisualAssetError) as error:
+        asyncio.run(
+            extract_visual_asset(
+                session=session,
+                storage=storage,
+                project_id=project.id,
+                paper_id=paper.id,
+                page_number=1,
+                crop=NormalizedCropBox(0, 0, 1, 1),
+                expected_document_sha256="f" * 64,
+            )
+        )
+
+    assert error.value.code == "SOURCE_CHANGED"
+
+
 def test_rejects_changed_source_hash(research_db):
     session, project, paper, _, storage, _ = research_db
     asyncio.run(storage.put(paper.storage_path, b"not the original pdf"))

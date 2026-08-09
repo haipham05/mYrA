@@ -9,7 +9,6 @@ import {
   fetchNodeDetail,
   fetchNodeNeighbors,
   searchGraphNodes,
-  triggerGraphIndex,
   GraphUnavailableError,
 } from "@/lib/graph";
 import type {
@@ -52,8 +51,6 @@ export default function GraphExplorer({
   // Status and metrics
   const [status, setStatus] = useState<GraphStatus | null>(null);
   const [isOffline, setIsOffline] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [isIndexing, setIsIndexing] = useState(false);
 
   // Filters & view
   const [viewMode, setViewMode] = useState<"visual" | "list">("visual");
@@ -65,7 +62,7 @@ export default function GraphExplorer({
   const [totalNodes, setTotalNodes] = useState(0);
   const [skip, setSkip] = useState(0);
   const limit = 10;
-  const [isLoadingNodes, setIsLoadingNodes] = useState(false);
+  const [isLoadingNodes, setIsLoadingNodes] = useState(true);
   const [nodesError, setNodesError] = useState<string | null>(null);
 
   // Selected Node & Neighbors
@@ -94,19 +91,6 @@ export default function GraphExplorer({
   const [pan, setPan] = useState({ x: 0, y: 0 });
 
   // 1. Fetch Status
-  const loadStatus = useCallback(async () => {
-    try {
-      const data = await fetchGraphStatus(apiUrl, projectId);
-      setStatus(data);
-      setIsOffline(!data.neo4j_available);
-    } catch (err) {
-      if (err instanceof GraphUnavailableError) {
-        setIsOffline(true);
-      }
-      setStatus(null);
-    }
-  }, [apiUrl, projectId]);
-
   useEffect(() => {
     let ignore = false;
     async function fetchStatus() {
@@ -116,11 +100,9 @@ export default function GraphExplorer({
           setStatus(data);
           setIsOffline(!data.neo4j_available);
         }
-      } catch (err) {
+      } catch {
         if (!ignore) {
-          if (err instanceof GraphUnavailableError) {
-            setIsOffline(true);
-          }
+          setIsOffline(true);
           setStatus(null);
         }
       }
@@ -132,35 +114,6 @@ export default function GraphExplorer({
   }, [apiUrl, projectId]);
 
   // 2. Search Nodes
-  const loadNodes = useCallback(
-    async (queryText: string, typeText: string, currentSkip: number) => {
-      setIsLoadingNodes(true);
-      setNodesError(null);
-      try {
-        const res = await searchGraphNodes(apiUrl, projectId, {
-          query: queryText,
-          entityType: typeText,
-          skip: currentSkip,
-          limit,
-        });
-        setNodes(res.items || []);
-        setTotalNodes(res.total || 0);
-      } catch (err) {
-        if (err instanceof GraphUnavailableError) {
-          setIsOffline(true);
-        }
-        setNodes([]);
-        setTotalNodes(0);
-        setNodesError(
-          err instanceof Error ? err.message : "Failed to load graph nodes.",
-        );
-      } finally {
-        setIsLoadingNodes(false);
-      }
-    },
-    [apiUrl, projectId, limit],
-  );
-
   useEffect(() => {
     let ignore = false;
     async function fetchNodes() {
@@ -187,6 +140,8 @@ export default function GraphExplorer({
             err instanceof Error ? err.message : "Failed to load graph nodes.",
           );
         }
+      } finally {
+        if (!ignore) setIsLoadingNodes(false);
       }
     }
     fetchNodes();
@@ -353,37 +308,6 @@ export default function GraphExplorer({
     };
   }, [initialFactId, loadFact]);
 
-  // 5. Index Papers Action
-  const handleIndexPapers = async () => {
-    const confirmed = window.confirm(
-      "Index papers for this project into the knowledge graph?",
-    );
-    if (!confirmed) return;
-
-    setIsIndexing(true);
-    setToastMessage(null);
-    try {
-      const res = await triggerGraphIndex(
-        apiUrl,
-        projectId,
-        undefined,
-        10,
-        false,
-      );
-      setToastMessage(
-        `Enqueued ${res.enqueued_count} papers for graph indexing.`,
-      );
-      loadStatus();
-      loadNodes(searchQuery, entityTypeFilter, skip);
-    } catch (err) {
-      setToastMessage(
-        `Indexing failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      setIsIndexing(false);
-    }
-  };
-
   // Helper for entity badge colors
   const getTypeBadgeClass = (type: string) => {
     switch (type) {
@@ -414,8 +338,6 @@ export default function GraphExplorer({
     }
   };
 
-  const entityCount = status ? status.node_count : totalNodes;
-  const factCount = status ? status.fact_count : 0;
   const totalPages = Math.ceil(totalNodes / limit);
   const currentPage = Math.floor(skip / limit) + 1;
 
@@ -424,51 +346,68 @@ export default function GraphExplorer({
       {/* Top Header Bar */}
       <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-zinc-200 bg-white p-4 shadow-2xs">
         <div className="flex flex-wrap items-center gap-3">
-          {/* Status Badge */}
-          {!isOffline && status?.neo4j_available ? (
+          {/* Keep availability visible; operational counters stay collapsed. */}
+          {status?.graphrag_enabled && status.neo4j_available && !isOffline ? (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800">
               <span className="h-2 w-2 rounded-full bg-emerald-500" />
-              Neo4j Connected
+              Graph available
+            </span>
+          ) : status === null && !isOffline ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1 text-xs font-semibold text-zinc-700">
+              Checking graph availability…
             </span>
           ) : (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
               <span className="h-2 w-2 rounded-full bg-amber-500" />
-              Neo4j Offline
+              Graph unavailable
             </span>
           )}
-
-          {/* Metrics */}
-          <div className="flex items-center gap-4 text-xs text-zinc-600 pl-2 border-l border-zinc-200">
-            <span>
-              Entity Count:{" "}
-              <strong className="font-semibold text-zinc-900">
-                {entityCount}
-              </strong>
-            </span>
-            <span>
-              Fact Count:{" "}
-              <strong className="font-semibold text-zinc-900">
-                {factCount}
-              </strong>
-            </span>
-          </div>
         </div>
 
-        {/* Action Button: Index Papers */}
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={handleIndexPapers}
-            disabled={isIndexing}
-            className="inline-flex items-center justify-center rounded-lg bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white shadow-2xs hover:bg-zinc-800 disabled:opacity-50 transition"
-          >
-            {isIndexing ? "Indexing..." : "Index Papers"}
-          </button>
-        </div>
+        <details className="text-xs text-zinc-600">
+          <summary className="cursor-pointer select-none rounded-md px-2 py-1 font-medium hover:bg-zinc-100">
+            Service details
+          </summary>
+          <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 rounded-lg border border-zinc-200 bg-zinc-50 p-3 sm:grid-cols-3">
+            <div>
+              <dt>GraphRAG</dt>
+              <dd>
+                {status?.graphrag_enabled
+                  ? "Enabled"
+                  : "Disabled or unavailable"}
+              </dd>
+            </div>
+            <div>
+              <dt>Neo4j</dt>
+              <dd>{status?.neo4j_available ? "Available" : "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Entities</dt>
+              <dd>{status?.node_count ?? totalNodes}</dd>
+            </div>
+            <div>
+              <dt>Facts</dt>
+              <dd>{status?.fact_count ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Queued events</dt>
+              <dd>{status?.pending_events_count ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Completed / failed events</dt>
+              <dd>
+                {status
+                  ? `${status.completed_events_count} / ${status.failed_events_count}`
+                  : "Unavailable"}
+              </dd>
+            </div>
+          </dl>
+        </details>
       </div>
 
       {/* Outage Notice if Neo4j is offline */}
-      {(isOffline || (status && !status.neo4j_available)) && (
+      {(isOffline ||
+        (status && (!status.graphrag_enabled || !status.neo4j_available))) && (
         <div
           role="alert"
           className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-xs text-amber-900"
@@ -476,23 +415,10 @@ export default function GraphExplorer({
           <div className="flex items-center gap-2 font-semibold">
             <span>⚠️</span>
             <span>
-              Graph service is currently offline. Showing local snapshot view.
+              Graph exploration is disabled or temporarily unavailable. Core
+              paper Q&amp;A and comparisons remain available.
             </span>
           </div>
-        </div>
-      )}
-
-      {/* Toast / Action Message */}
-      {toastMessage && (
-        <div className="flex items-center justify-between rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-xs text-blue-800">
-          <span>{toastMessage}</span>
-          <button
-            type="button"
-            onClick={() => setToastMessage(null)}
-            className="text-blue-600 hover:text-blue-900 ml-4 font-bold"
-          >
-            ✕
-          </button>
         </div>
       )}
 

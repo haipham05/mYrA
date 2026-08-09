@@ -18,6 +18,7 @@ from app.db.models import (
     AssistantApprovalAction,
     AssistantRun,
     AssistantRunStep,
+    GraphEvent,
     Memory,
     Message,
     Paper,
@@ -460,6 +461,83 @@ async def test_note_mutation_waits_for_approval_then_runs_once(session_factory) 
         assert memories[0].title == "Useful limitation"
         assert memories[0].content == "The paper evaluates only a narrow set of tasks."
         assert db.query(AssistantApprovalAction).filter_by(run_id=run_id).one().status == "APPROVED"
+
+
+@pytest.mark.anyio
+async def test_graph_indexing_is_persistently_approved_before_queue_publication(
+    session_factory, monkeypatch
+) -> None:
+    run_id = _queue_run(
+        session_factory,
+        intent_override=AssistantIntent.GRAPH.value,
+        paper_status="READY",
+        source_sha256="a" * 64,
+    )
+
+    class GraphIndexRoute:
+        async def route(self, request, **kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.GRAPH,
+                    standalone_question=request.message,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Index the selected paper into the graph",
+                    arguments={"action": "index"},
+                ),
+            )
+
+    class RepoStub:
+        def verify_connectivity(self):
+            return True
+
+        def close(self):
+            return None
+
+    from app.config import Settings
+
+    monkeypatch.setattr(
+        "app.services.assistant_tools.Settings.from_environment",
+        lambda: Settings(graphrag_enabled=True),
+    )
+    monkeypatch.setattr(
+        "app.services.assistant_tools.Neo4jRepository.from_settings",
+        lambda _settings: RepoStub(),
+    )
+    processor = AssistantRunProcessor(
+        session_factory=session_factory,
+        router=GraphIndexRoute(),  # type: ignore[arg-type]
+        chat_service=_ChatStub(),  # type: ignore[arg-type]
+    )
+
+    with session_factory() as db:
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        first_attempt = claim.attempt_count
+    await processor.process(run_id, worker_id="worker-a", attempt_count=first_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        action = db.query(AssistantApprovalAction).filter_by(run_id=run_id).one()
+        assert run is not None and run.status == "AWAITING_APPROVAL"
+        assert action.status == "PENDING"
+        assert action.arguments["graph_index"]["paper_ids"] == action.arguments["paper_ids"]
+        assert db.query(GraphEvent).count() == 0
+        approved, transitioned = decide_assistant_approval(db, action.id, approve=True)
+        assert transitioned and approved.status == "APPROVED"
+        claim = claim_next_assistant_run(db, worker_id="worker-a")
+        assert claim is not None
+        second_attempt = claim.attempt_count
+    await processor.process(run_id, worker_id="worker-a", attempt_count=second_attempt)
+
+    with session_factory() as db:
+        run = db.get(AssistantRun, run_id)
+        events = db.query(GraphEvent).all()
+        assert run is not None and run.status == "SUCCEEDED"
+        assert len(events) == 1
+        assert events[0].generation_id.startswith("approved_")
+        assert run.result_payload["result_type"] == "graph_index_jobs"
+        assert run.result_payload["structured_payload"]["queued_count"] == 1
 
 
 @pytest.mark.anyio

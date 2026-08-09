@@ -14,6 +14,46 @@ const paper: Paper = {
 };
 
 describe("PaperUploader library controls", () => {
+  it("collapses paper browsing while keeping scope and current paper visible", () => {
+    render(
+      <PaperUploader
+        projectId="project-1"
+        apiUrl="http://127.0.0.1:8000"
+        papers={[paper]}
+        total={1}
+        offset={0}
+        selectedPaper={paper}
+        onPaperSelect={vi.fn()}
+        onUploadSuccess={vi.fn()}
+        onSearch={vi.fn().mockResolvedValue(undefined)}
+        paperScope="paper"
+        selectedPaperIds={[paper.id]}
+        onScopeChange={vi.fn().mockResolvedValue(undefined)}
+        onSelectedPaperIdsChange={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: "Collapse library" });
+    fireEvent.click(toggle);
+
+    expect(
+      screen.getByRole("button", { name: "Expand library" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByPlaceholderText("Search title, author, or filename"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Chat searches")).toHaveValue("paper");
+    expect(
+      screen.getByText("Current paper: A Useful Paper"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand library" }));
+    expect(
+      screen.getByPlaceholderText("Search title, author, or filename"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("A Useful Paper")).toBeInTheDocument();
+  });
+
   it("searches metadata and filename with bounded pagination", async () => {
     const onSearch = vi.fn().mockResolvedValue(undefined);
     const onScopeChange = vi.fn().mockResolvedValue(undefined);
@@ -114,8 +154,9 @@ describe("PaperUploader library controls", () => {
     );
 
     expect(
-      await screen.findByText(/1 ingestion job still processing · EMBEDDING/),
+      await screen.findByText(/1 ingestion job still processing/),
     ).toBeInTheDocument();
+    expect(screen.queryByText("EMBEDDING")).not.toBeInTheDocument();
     expect(screen.getByText("45%")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Upload PDF" })).toBeEnabled();
   });
@@ -190,6 +231,60 @@ describe("PaperUploader library controls", () => {
     );
     expect(
       screen.queryByRole("button", { name: "Retry" }),
+    ).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  it("replaces raw server error details with a safe retry message", async () => {
+    const failedPaper: Paper = {
+      ...paper,
+      status: "FAILED",
+      latest_job: {
+        id: "job-failed",
+        status: "FAILED",
+        stage: "FAILED",
+        progress: 0,
+        is_retryable: true,
+        retry_count: 1,
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: async () => ({
+          detail: "Bearer sk-super-secret at /srv/private/config.toml",
+        }),
+      }),
+    );
+
+    render(
+      <PaperUploader
+        projectId="project-1"
+        apiUrl="http://127.0.0.1:8000"
+        papers={[failedPaper]}
+        total={1}
+        offset={0}
+        selectedPaper={failedPaper}
+        onPaperSelect={vi.fn()}
+        onUploadSuccess={vi.fn()}
+        onSearch={vi.fn().mockResolvedValue(undefined)}
+        paperScope="project"
+        selectedPaperIds={[]}
+        onScopeChange={vi.fn().mockResolvedValue(undefined)}
+        onSelectedPaperIdsChange={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(
+      await screen.findByText(
+        "Could not restart paper processing. Refresh and try again.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/private\/config\.toml|super-secret/),
     ).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });

@@ -730,6 +730,7 @@ class ChatService:
         run_attempt_count: int | None = None,
         response_guidance: str | None = None,
         additional_evidence: list[EvidenceItem] | None = None,
+        graph_lookup: bool | None = None,
     ) -> MessageResponse:
         if assistant_run_id is not None:
             existing = (
@@ -770,6 +771,7 @@ class ChatService:
                 run_attempt_count,
                 response_guidance,
                 additional_evidence,
+                graph_lookup,
             )
 
     async def _answer_question(
@@ -787,6 +789,7 @@ class ChatService:
         run_attempt_count: int | None = None,
         response_guidance: str | None = None,
         additional_evidence: list[EvidenceItem] | None = None,
+        graph_lookup: bool | None = None,
     ) -> MessageResponse:
         start_time = time.perf_counter()
         conv = get_conversation(db, conversation_id)
@@ -952,15 +955,22 @@ class ChatService:
                 if status == AnchorStatus.VERIFIED and ev_item and anchor:
                     supplementary_evidence.append(ev_item.model_copy(update={"anchors": [anchor]}))
 
-        # 2c. Retrieve graph evidence
-        graph_evidence_items, graph_notice = retrieve_graph_evidence(
-            db=db,
-            repo=self.graph_repo,
-            project_id=project_id,
-            query=retrieval_question,
-            intent=intent,
-            selected_paper_ids=selected_paper_ids,
+        # Graph retrieval is a supplement for routed relationship questions or explicit
+        # GraphRAG requests. Ordinary factual QA stays on the text/memory path.
+        should_lookup_graph = (
+            graph_lookup if graph_lookup is not None else intent is not GraphIntent.FACTUAL
         )
+        graph_evidence_items: list[EvidenceItem] = []
+        graph_notice = None
+        if should_lookup_graph:
+            graph_evidence_items, graph_notice = retrieve_graph_evidence(
+                db=db,
+                repo=self.graph_repo,
+                project_id=project_id,
+                query=retrieval_question,
+                intent=intent,
+                selected_paper_ids=selected_paper_ids,
+            )
         for g_item in graph_evidence_items:
             supplementary_evidence.append(g_item)
 
@@ -974,7 +984,7 @@ class ChatService:
         )
 
         system_prompt = build_chat_system_prompt(
-            intent, graph_notice if intent != GraphIntent.FACTUAL else None
+            intent, graph_notice if should_lookup_graph else None
         )
 
         evidence_text_parts = []
@@ -993,7 +1003,7 @@ class ChatService:
             if evidence_text_parts
             else "No relevant evidence found."
         )
-        if graph_notice and intent != GraphIntent.FACTUAL:
+        if graph_notice and should_lookup_graph:
             evidence_block = f"[NOTE: {graph_notice}]\n\n{evidence_block}"
 
         user_prompt = build_chat_user_prompt(
@@ -1326,6 +1336,13 @@ class ChatService:
                 "Insufficient evidence available in the uploaded papers to answer this question."
             )
             validated_citations = []
+
+        if (
+            graph_notice
+            and should_lookup_graph
+            and graph_notice.casefold() not in formatted_answer.casefold()
+        ):
+            formatted_answer = f"{formatted_answer}\n\nGraph note: {graph_notice}"
 
         if observation is not None:
             observation.update(

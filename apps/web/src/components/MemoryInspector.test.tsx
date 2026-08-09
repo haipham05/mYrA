@@ -73,7 +73,9 @@ describe("MemoryInspector Component", () => {
       <MemoryInspector projectId="proj-1" apiUrl="http://127.0.0.1:8000" />,
     );
 
-    expect(screen.getByText(/Project Research Memory/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Notes and decisions" }),
+    ).toBeInTheDocument();
     await waitFor(() => {
       expect(
         screen.getByText(/No memories found matching the selected filters/i),
@@ -100,7 +102,9 @@ describe("MemoryInspector Component", () => {
       ).toBeInTheDocument();
     });
 
-    expect(screen.getByText("DECISION")).toBeInTheDocument();
+    expect(
+      screen.getByText("Decision", { selector: "span" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("ACTIVE")).toBeInTheDocument();
     expect(screen.getByText("v1")).toBeInTheDocument();
     expect(screen.getByText("SUPERSEDED")).toBeInTheDocument();
@@ -179,7 +183,7 @@ describe("MemoryInspector Component", () => {
     const editBtns = screen.getAllByRole("button", { name: "Edit" });
     fireEvent.click(editBtns[0]);
 
-    expect(screen.getByText(/Edit Memory \(v1\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Edit note \(v1\)/i)).toBeInTheDocument();
 
     // Submit edit
     const saveBtn = screen.getByRole("button", { name: "Save Changes" });
@@ -247,9 +251,49 @@ describe("MemoryInspector Component", () => {
       ).toBeInTheDocument();
     });
 
-    const jumpBtn = screen.getByRole("button", { name: /View Chat Message/i });
+    const jumpBtn = screen.getByRole("button", { name: /Open conversation/i });
     fireEvent.click(jumpBtn);
     expect(onSelectSource).toHaveBeenCalledWith(mockMemories[0].sources[0]);
+  });
+
+  it("shows a researcher-facing paper source link with its page", async () => {
+    const onSelectSource = vi.fn();
+    const paperFact: Memory = {
+      ...mockMemories[0],
+      id: "paper-fact-1",
+      memory_type: "PAPER_FACT",
+      sources: [
+        {
+          id: "paper-source-1",
+          memory_id: "paper-fact-1",
+          source_type: "PAPER_CHUNK",
+          paper_id: "paper-1",
+          page_number: 7,
+          quote_text: "A source-backed statement.",
+          created_at: "2026-09-27T10:00:00Z",
+        },
+      ],
+    };
+    vi.spyOn(global, "fetch").mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [paperFact], total: 1 }),
+    } as Response);
+
+    render(
+      <MemoryInspector
+        projectId="proj-1"
+        apiUrl="http://127.0.0.1:8000"
+        onSelectSource={onSelectSource}
+      />,
+    );
+
+    const openSource = await screen.findByRole("button", {
+      name: "Open paper source (p. 7)",
+    });
+    expect(screen.getByText("Paper source:")).toBeInTheDocument();
+    expect(screen.getByText("Paper fact")).toBeInTheDocument();
+    fireEvent.click(openSource);
+    expect(onSelectSource).toHaveBeenCalledWith(paperFact.sources[0]);
   });
 
   it("sends expected_version in supersede URL and refreshes list", async () => {

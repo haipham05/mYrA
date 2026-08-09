@@ -3,7 +3,7 @@
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class VisualObservation(BaseModel):
@@ -30,6 +30,17 @@ class VisualAnalysis(BaseModel):
     readings: list[VisualReading] = Field(default_factory=list, max_length=20)
     interpretation: str = Field(default="", max_length=4000)
     uncertainty_notes: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def require_analysis_content(self) -> "VisualAnalysis":
+        if not (
+            self.observations
+            or self.readings
+            or self.interpretation.strip()
+            or self.uncertainty_notes
+        ):
+            raise ValueError("visual analysis contains no observations")
+        return self
 
 
 class VisualSourceReference(BaseModel):
@@ -58,3 +69,27 @@ class VisualSourceReference(BaseModel):
             crop_box_normalized_top_left=source["crop_box_normalized_top_left"],
             caption=source.get("caption"),
         )
+
+
+class VisualCropBox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    left: float = Field(ge=0, le=1)
+    top: float = Field(ge=0, le=1)
+    right: float = Field(ge=0, le=1)
+    bottom: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "VisualCropBox":
+        if not (self.left < self.right and self.top < self.bottom):
+            raise ValueError("crop bounds must have positive width and height")
+        return self
+
+
+class VisualSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: UUID
+    page_number: int = Field(ge=1)
+    document_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    crop: VisualCropBox

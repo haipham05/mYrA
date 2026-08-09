@@ -1,9 +1,10 @@
+import asyncio
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.crud.assistant_run import (
     claim_next_assistant_run,
@@ -14,7 +15,10 @@ from app.db.base import Base
 from app.db.models import AssistantApprovalAction, AssistantRun, Conversation, Paper, Project
 from app.db.session import get_db
 from app.main import app
+from app.schemas.assistant import AssistantIntent, AssistantRouteResult, RouteDecision, RouteOutcome
+from app.schemas.evidence import AnchorStatus, Citation, CitationAnchor
 from app.schemas.paper import PaperStatus, PaperUploadResponse
+from app.services.assistant_run_processor import AssistantRunProcessor
 from app.services.discovery.download import ImportDownloadError
 
 
@@ -113,6 +117,92 @@ def test_successful_run_poll_returns_tool_result_with_unknown_usage(assistant_ap
     assert result.status_code == 200
     assert result.json()["result"]["display_text"] == "Grounded answer."
     assert result.json()["result"]["usage"] == {}
+
+
+def test_headless_qa_journey_returns_persisted_source_reference(assistant_api_context):
+    client, session, project, conversation, paper = assistant_api_context
+    paper.status = PaperStatus.READY.value
+    paper.document_sha256 = "a" * 64
+    session.commit()
+    quote = "The selected paper reports an explicit limitation."
+
+    class RouteStub:
+        async def route(self, request, **_kwargs):
+            return AssistantRouteResult(
+                outcome=RouteOutcome.ROUTED,
+                decision=RouteDecision(
+                    intent=AssistantIntent.QA,
+                    standalone_question=request.message,
+                    resolved_paper_ids=request.selected_paper_ids,
+                    action_summary="Answer from the selected paper",
+                ),
+            )
+
+    class ChatStub:
+        async def answer_question(self, *_args, **_kwargs):
+            anchor = CitationAnchor(
+                page_number=3,
+                exact_quote=quote,
+                source_char_start=12,
+                source_char_end=12 + len(quote),
+                document_sha256=paper.document_sha256,
+                parser_version="fixture-parser",
+                anchor_status=AnchorStatus.VERIFIED,
+            )
+            citation = Citation(
+                citation_index=1,
+                evidence_id="E1",
+                paper_id=paper.id,
+                page_number=3,
+                quote=quote,
+                document_sha256=paper.document_sha256,
+                parser_version="fixture-parser",
+                anchor_status=AnchorStatus.VERIFIED,
+                anchors=[anchor],
+            )
+            return type(
+                "HeadlessAnswer",
+                (),
+                {
+                    "id": uuid4(),
+                    "content": "The limitation is reported in the paper [1].",
+                    "model_name": "controlled-test-provider",
+                    "citations": [citation],
+                    "evidence": [],
+                    "provider_usage": None,
+                },
+            )()
+
+    submitted = client.post(
+        f"/api/v1/conversations/{conversation.id}/runs",
+        json=_request_body(project, conversation, paper),
+    )
+    assert submitted.status_code == 202
+    run_id = UUID(submitted.json()["id"])
+
+    factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+    with factory() as worker_db:
+        claim = claim_next_assistant_run(worker_db, worker_id="headless-test-worker")
+        assert claim is not None and claim.id == run_id
+        attempt_count = claim.attempt_count
+
+    asyncio.run(
+        AssistantRunProcessor(
+            session_factory=factory,
+            router=RouteStub(),  # type: ignore[arg-type]
+            chat_service=ChatStub(),  # type: ignore[arg-type]
+        ).process(run_id, worker_id="headless-test-worker", attempt_count=attempt_count)
+    )
+
+    polled = client.get(f"/api/v1/runs/{run_id}")
+    assert polled.status_code == 200
+    result = polled.json()["result"]
+    assert polled.json()["status"] == "SUCCEEDED"
+    assert result["display_text"] == "The limitation is reported in the paper [1]."
+    assert result["citations"][0]["paper_id"] == str(paper.id)
+    assert result["citations"][0]["page_number"] == 3
+    assert result["citations"][0]["quote"] == quote
+    assert result["citations"][0]["anchors"][0]["exact_quote"] == quote
 
 
 def test_research_draft_is_saved_only_when_requested_and_once_per_run(assistant_api_context):

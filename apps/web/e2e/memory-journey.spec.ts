@@ -265,8 +265,8 @@ test.describe("Milestone 4 — Long-Term Research Memory Journey", () => {
     const projectSelect = page.locator("select").first();
     await expect(projectSelect).toHaveValue(project1.id);
 
-    // 2. Click "Project Memory" tab
-    const memoryTab = page.getByRole("button", { name: "Project Memory" });
+    // 2. Open saved notes and decisions
+    const memoryTab = page.getByRole("button", { name: "Notes and decisions" });
     await memoryTab.click();
 
     // 3. Inspect Memory Inspector header and card
@@ -276,7 +276,7 @@ test.describe("Milestone 4 — Long-Term Research Memory Journey", () => {
     await expect(
       aurcCard.getByText("Decision: Choose AURC over ECE"),
     ).toBeVisible();
-    await expect(aurcCard.getByText("DECISION", { exact: true })).toBeVisible();
+    await expect(aurcCard.getByText("Decision", { exact: true })).toBeVisible();
     await expect(aurcCard.getByText("ACTIVE", { exact: true })).toBeVisible();
     await expect(aurcCard.getByText("v1", { exact: true })).toBeVisible();
 
@@ -316,8 +316,8 @@ test.describe("Milestone 4 — Long-Term Research Memory Journey", () => {
     const projectSelect = page.locator("select").first();
     await expect(projectSelect).toHaveValue(project1.id);
 
-    // 2. Click "Project Memory" tab
-    const memoryTab = page.getByRole("button", { name: "Project Memory" });
+    // 2. Open saved notes and decisions
+    const memoryTab = page.getByRole("button", { name: "Notes and decisions" });
     await memoryTab.click();
 
     // 3. Inspect Memory Inspector for paper fact card
@@ -325,12 +325,12 @@ test.describe("Milestone 4 — Long-Term Research Memory Journey", () => {
     await expect(inspector).toBeVisible();
     await expect(inspector.getByText("Attention Mechanism Fact")).toBeVisible();
     await expect(
-      inspector.getByText("PAPER_FACT", { exact: true }),
+      inspector.getByText("Paper fact", { exact: true }),
     ).toBeVisible();
 
-    // 4. Click "View Paper Source (p. 1)" button
+    // 4. Open the verified paper source
     const viewSourceBtn = inspector.getByRole("button", {
-      name: "View Paper Source (p. 1)",
+      name: "Open paper source (p. 1)",
     });
     await expect(viewSourceBtn).toBeVisible();
     await viewSourceBtn.click();

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import ChatPanel from "@/components/ChatPanel";
 import MemoryInspector from "@/components/MemoryInspector";
@@ -21,7 +21,24 @@ import type {
   ProviderBudgetUsage,
   Project,
   SourceSelection,
+  VisualSelection,
+  VisualSourceReference,
 } from "@/types";
+
+function runFailureMessage(code: string | null): string {
+  switch (code?.toUpperCase()) {
+    case "ROUTE_UNAVAILABLE":
+    case "ROUTE_OUTCOME_UNKNOWN":
+      return "The research model could not choose an action. No research action was started; try again later or choose a more specific request.";
+    case "APPROVAL_SOURCE_CHANGED":
+    case "APPROVAL_NO_LONGER_VALID":
+      return "The source changed after approval. Review the current paper and submit the action again.";
+    case "BUDGET_DENIED":
+      return "The spending limit stopped this step before its paid model request. Reduce the request scope or check your remaining allowance before retrying.";
+    default:
+      return "The research request could not be completed. No result was marked complete.";
+  }
+}
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<"workspace" | "memory">(
@@ -36,6 +53,10 @@ export default function Home() {
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const [sourceSelection, setSourceSelection] =
     useState<SourceSelection | null>(null);
+  const [visualSelection, setVisualSelection] =
+    useState<VisualSelection | null>(null);
+  const [visualSourceFocus, setVisualSourceFocus] =
+    useState<VisualSourceReference | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [paperScope, setPaperScope] = useState<
@@ -56,6 +77,12 @@ export default function Home() {
     null,
   );
   const [chatError, setChatError] = useState<string | null>(null);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const memorySourceRequestRef = useRef(0);
+
+  useEffect(() => {
+    activeProjectIdRef.current = selectedProject?.id ?? null;
+  }, [selectedProject?.id]);
 
   const activeSourceSelection =
     sourceSelection &&
@@ -63,6 +90,13 @@ export default function Home() {
     sourceSelection.paper_id === selectedPaper.id &&
     sourceSelection.document_sha256 === selectedPaper.document_sha256
       ? sourceSelection
+      : null;
+  const activeVisualSelection =
+    visualSelection &&
+    selectedPaper &&
+    visualSelection.paper_id === selectedPaper.id &&
+    visualSelection.document_sha256 === selectedPaper.document_sha256
+      ? visualSelection
       : null;
 
   const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
@@ -82,6 +116,23 @@ export default function Home() {
           })
           .catch(() => {});
       }
+    },
+    [apiUrl, papers],
+  );
+
+  const handleVisualSourceClick = useCallback(
+    (source: VisualSourceReference) => {
+      setActiveCitation(null);
+      setVisualSourceFocus(source);
+      const sourcePaper = papers.find((paper) => paper.id === source.paper_id);
+      if (sourcePaper) {
+        setSelectedPaper(sourcePaper);
+        return;
+      }
+      fetch(`${apiUrl}/api/v1/papers/${source.paper_id}`)
+        .then((response) => (response.ok ? response.json() : null))
+        .then((paper: Paper | null) => paper && setSelectedPaper(paper))
+        .catch(() => setChatError("Could not open the visual source paper."));
     },
     [apiUrl, papers],
   );
@@ -106,8 +157,9 @@ export default function Home() {
             cache: "no-store",
           },
         );
-        if (!response.ok)
-          throw new Error("Could not load the proposed action.");
+        if (!response.ok) {
+          throw new Error("Could not refresh the approval status.");
+        }
         const actions: AssistantApprovalResponse[] = await response.json();
         if (isCurrentConversation()) {
           setPendingAction(
@@ -123,8 +175,9 @@ export default function Home() {
         const response = await fetch(`${apiUrl}/api/v1/runs/${run.id}`, {
           cache: "no-store",
         });
-        if (!response.ok)
-          throw new Error("Could not read research run status.");
+        if (!response.ok) {
+          throw new Error("Could not refresh the saved research status.");
+        }
         updateRun(await response.json());
       }
 
@@ -132,9 +185,7 @@ export default function Home() {
       else if (isCurrentConversation()) setPendingAction(null);
 
       if (run.status === "QUEUED" || run.status === "RUNNING") {
-        if (isCurrentConversation()) {
-          setChatError(`This request is still processing (run ${run.id}).`);
-        }
+        // Keep the active run and local recovery key: a timeout is not failure.
         return;
       }
       if (run.status === "NEEDS_INPUT" || run.status === "AWAITING_APPROVAL")
@@ -157,7 +208,14 @@ export default function Home() {
               typeof run.result.usage.model_name === "string"
                 ? run.result.usage.model_name
                 : null,
-            assistantResult: run.result,
+            assistantResult: run.safe_error
+              ? {
+                  ...run.result,
+                  warnings: Array.from(
+                    new Set([...run.result.warnings, run.safe_error]),
+                  ),
+                }
+              : run.result,
             created_at: run.updated_at,
           };
           setMessages((previous) =>
@@ -171,9 +229,7 @@ export default function Home() {
         } else if (run.status === "CANCELLED") {
           setChatError("The research request was cancelled.");
         } else if (run.status === "FAILED") {
-          setChatError(
-            `The research request could not be completed${run.safe_error ? ` (${run.safe_error})` : ""}.`,
-          );
+          setChatError(runFailureMessage(run.safe_error));
         }
       }
     },
@@ -200,9 +256,9 @@ export default function Home() {
       })
       .catch(() => {
         if (!ignore) {
-          window.localStorage.removeItem(`myra.activeRun.${conversation.id}`);
-          setActiveRun(null);
-          setPendingAction(null);
+          setChatError(
+            "Connection to the saved request was interrupted. Its status is kept; reload this conversation to check again.",
+          );
         }
       })
       .finally(() => {
@@ -474,6 +530,7 @@ export default function Home() {
     if (res.ok) {
       const newProj = await res.json();
       setProjects((prev) => [newProj, ...prev]);
+      activeProjectIdRef.current = newProj.id;
       setSelectedProject(newProj);
     }
   };
@@ -499,27 +556,86 @@ export default function Home() {
     }
   };
 
-  // Jump from memory source to paper or conversation in workspace
-  const handleSelectMemorySource = (source: MemorySource) => {
+  // Jump from a saved note to its paper or conversation in the workspace.
+  const handleSelectMemorySource = async (source: MemorySource) => {
+    const requestId = ++memorySourceRequestRef.current;
     setActiveTab("workspace");
+    setChatError(null);
+    setActiveCitation(null);
+
     if (source.source_type === "PAPER_CHUNK" && source.paper_id) {
-      const targetPaper = papers.find((p) => p.id === source.paper_id);
-      if (targetPaper) {
-        setSelectedPaper(targetPaper);
+      const projectId = selectedProject?.id;
+      if (!projectId) {
+        setChatError("Select a project before opening this paper source.");
+        return;
       }
-      if (source.page_number && source.quote_text) {
-        setActiveCitation({
-          citation_index: 1,
-          evidence_id: `mem-src-${source.id}`,
-          paper_id: source.paper_id,
-          page_number: source.page_number,
-          bounding_boxes: source.bounding_boxes || [],
-          quote: source.quote_text,
-          document_sha256: source.document_sha256,
-          parser_version: source.parser_version,
-          anchor_status: source.anchor_status || "unresolved",
-          anchors: source.anchors || [],
-        });
+
+      try {
+        let targetPaper = papers.find(
+          (paper) =>
+            paper.id === source.paper_id && paper.project_id === projectId,
+        );
+        if (!targetPaper) {
+          const response = await fetch(
+            `${apiUrl}/api/v1/papers/${encodeURIComponent(source.paper_id)}`,
+            { cache: "no-store" },
+          );
+          if (!response.ok) {
+            throw new Error("The saved source paper is unavailable.");
+          }
+          const paper: Paper = await response.json();
+          if (paper.project_id !== projectId) {
+            throw new Error(
+              "This source does not belong to the current project.",
+            );
+          }
+          targetPaper = paper;
+        }
+
+        // The project may have changed while the paper lookup was in flight.
+        if (
+          requestId !== memorySourceRequestRef.current ||
+          activeProjectIdRef.current !== projectId
+        ) {
+          return;
+        }
+
+        setSelectedPaper(targetPaper);
+        if (
+          typeof source.page_number === "number" &&
+          Number.isInteger(source.page_number) &&
+          source.page_number > 0
+        ) {
+          setActiveCitation({
+            citation_index: 1,
+            evidence_id: `mem-src-${source.id}`,
+            paper_id: source.paper_id,
+            page_number: source.page_number,
+            bounding_boxes: source.bounding_boxes || [],
+            quote: source.quote_text || "",
+            document_sha256: source.document_sha256,
+            parser_version: source.parser_version,
+            anchor_status: source.anchor_status || "unresolved",
+            anchors: source.anchors || [],
+          });
+        } else {
+          setChatError(
+            "Exact highlight unavailable: this saved source has no page number.",
+          );
+        }
+      } catch (error: unknown) {
+        if (
+          requestId === memorySourceRequestRef.current &&
+          activeProjectIdRef.current === projectId
+        ) {
+          setChatError(
+            error instanceof Error &&
+              error.message ===
+                "This source does not belong to the current project."
+              ? error.message
+              : "Could not open the saved paper source. Try again.",
+          );
+        }
       }
     } else if (source.source_type === "MESSAGE") {
       if (source.conversation_id) {
@@ -528,6 +644,10 @@ export default function Home() {
         );
         if (targetConv) {
           handleSelectConversation(targetConv);
+        } else {
+          setChatError(
+            "The saved conversation is unavailable in this project.",
+          );
         }
       }
     }
@@ -657,26 +777,34 @@ export default function Home() {
             message: content,
             conversation_id: conversation.id,
             project_id: selectedProject.id,
-            scope: activeSourceSelection ? "paper" : paperScope,
+            scope:
+              activeSourceSelection || activeVisualSelection
+                ? "paper"
+                : paperScope,
             selected_paper_ids: activeSourceSelection
               ? [activeSourceSelection.paper_id]
-              : paperScope === "project"
-                ? []
-                : selectedPaperIds,
+              : activeVisualSelection
+                ? [activeVisualSelection.paper_id]
+                : paperScope === "project"
+                  ? []
+                  : selectedPaperIds,
             source_selection: activeSourceSelection ?? undefined,
+            visual_selection: activeVisualSelection ?? undefined,
             idempotency_key: `web-${crypto.randomUUID()}`,
           }),
         },
       );
       if (!submitted.ok) {
-        const errData = await submitted.json().catch(() => ({}));
         throw new Error(
-          errData.detail || "Could not submit the research request.",
+          submitted.status === 409
+            ? "The selected paper or scope changed. Refresh the library and try again."
+            : "Could not start this research request. Check the selected scope and try again.",
         );
       }
 
       const run: AssistantRunResponse = await submitted.json();
       setSourceSelection(null);
+      setVisualSelection(null);
       window.localStorage.setItem(`myra.activeRun.${conversation.id}`, run.id);
       setActiveRun(run);
       setRoutedIntent(run.intent);
@@ -693,7 +821,17 @@ export default function Home() {
       await pollAssistantRun(run);
     } catch (err: unknown) {
       setChatError(
-        err instanceof Error ? err.message : "Network error. Please try again.",
+        err instanceof Error &&
+          (err.message ===
+            "The selected paper or scope changed. Refresh the library and try again." ||
+            err.message ===
+              "Could not start this research request. Check the selected scope and try again.")
+          ? err.message
+          : err instanceof Error &&
+              (err.message === "Could not refresh the saved research status." ||
+                err.message === "Could not refresh the approval status.")
+            ? "The request is saved, but its status could not be refreshed. Reload this conversation to check again."
+            : "Could not connect to the research service. Your request was not confirmed; please try again.",
       );
     } finally {
       setIsAsking(false);
@@ -707,9 +845,9 @@ export default function Home() {
       });
       if (!response.ok) throw new Error("Could not cancel the research run.");
       await pollAssistantRun(await response.json());
-    } catch (err) {
+    } catch {
       setChatError(
-        err instanceof Error ? err.message : "Could not cancel the run.",
+        "Could not confirm cancellation. The request may still be running; refresh its status.",
       );
     }
   };
@@ -728,9 +866,9 @@ export default function Home() {
       const run: AssistantRunResponse = await response.json();
       window.localStorage.setItem(`myra.activeRun.${conversation.id}`, run.id);
       await pollAssistantRun(run);
-    } catch (err) {
+    } catch {
       setChatError(
-        err instanceof Error ? err.message : "Could not continue the run.",
+        "Could not continue the saved request. Refresh and try again.",
       );
     } finally {
       setIsAsking(false);
@@ -753,9 +891,9 @@ export default function Home() {
       });
       if (!runResponse.ok) throw new Error("Could not read the updated run.");
       await pollAssistantRun(await runResponse.json());
-    } catch (err) {
+    } catch {
       setChatError(
-        err instanceof Error ? err.message : "Could not update the action.",
+        "Could not update the approval. Check the current paper and try again.",
       );
     } finally {
       setIsAsking(false);
@@ -774,15 +912,10 @@ export default function Home() {
         body: JSON.stringify(candidate),
       },
     );
-    const body = await response.json();
     if (!response.ok) {
-      throw new Error(
-        typeof body.detail === "string"
-          ? body.detail
-          : "Could not prepare the import proposal.",
-      );
+      throw new Error("Could not prepare the import proposal.");
     }
-    return body as AssistantApprovalResponse;
+    return (await response.json()) as AssistantApprovalResponse;
   };
 
   const handleDecideDiscoveryImport = async (
@@ -793,15 +926,10 @@ export default function Home() {
       `${apiUrl}/api/v1/actions/${actionId}/${approve ? "approve" : "reject"}`,
       { method: "POST" },
     );
-    const body = await response.json();
     if (!response.ok) {
-      throw new Error(
-        typeof body.detail === "string"
-          ? body.detail
-          : "The import proposal could not be updated.",
-      );
+      throw new Error("The import proposal could not be updated.");
     }
-    const action = body as AssistantApprovalResponse;
+    const action = (await response.json()) as AssistantApprovalResponse;
     if (action.import_result) await refreshPapers();
     return action;
   };
@@ -809,6 +937,7 @@ export default function Home() {
   // Handle project selection with immediate state clearing
   const handleSelectProject = (project: Project | null) => {
     if (selectedProject?.id === project?.id) return;
+    activeProjectIdRef.current = project?.id ?? null;
     setSelectedProject(project);
     setSelectedPaper(null);
     setActiveCitation(null);
@@ -839,8 +968,7 @@ export default function Home() {
       },
     );
     if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.detail || "Could not save the conversation scope.");
+      throw new Error("Could not save the conversation scope.");
     }
     const updated: Conversation = await response.json();
     setPaperScope(updated.paper_scope ?? "project");
@@ -928,18 +1056,9 @@ export default function Home() {
                     : "text-zinc-600 hover:text-zinc-900"
                 }`}
               >
-                Project Memory
+                Notes and decisions
               </button>
             </div>
-
-            {selectedProject && (
-              <Link
-                href={`/projects/${selectedProject.id}/graph`}
-                className="px-3 py-1.5 text-xs font-medium rounded-md transition text-zinc-600 hover:text-zinc-900 border border-zinc-200 bg-white hover:bg-zinc-50 shadow-2xs"
-              >
-                Graph Explorer
-              </Link>
-            )}
 
             <ProjectSelector
               projects={projects}
@@ -1096,8 +1215,11 @@ export default function Home() {
                   onDecideAction={handleDecideAction}
                   onProposeDiscoveryImport={handleProposeDiscoveryImport}
                   onDecideDiscoveryImport={handleDecideDiscoveryImport}
+                  onVisualSourceClick={handleVisualSourceClick}
                   sourceSelection={activeSourceSelection}
                   onClearSourceSelection={() => setSourceSelection(null)}
+                  visualSelection={activeVisualSelection}
+                  onClearVisualSelection={() => setVisualSelection(null)}
                 />
               </div>
 
@@ -1108,6 +1230,9 @@ export default function Home() {
                   activeCitation={activeCitation}
                   apiUrl={apiUrl}
                   onExplainSelection={setSourceSelection}
+                  onVisualSelection={setVisualSelection}
+                  focusSource={visualSourceFocus}
+                  onClearVisualFocus={() => setVisualSourceFocus(null)}
                 />
               </div>
             </section>
@@ -1154,6 +1279,26 @@ export default function Home() {
                   });
                 }}
               />
+            )}
+
+            {selectedProject && (
+              <details className="rounded-lg border border-zinc-200 bg-white px-4 py-3 text-xs text-zinc-600">
+                <summary className="cursor-pointer select-none font-medium text-zinc-700">
+                  Optional research tools
+                </summary>
+                <div className="mt-3 flex flex-wrap items-center gap-3">
+                  <Link
+                    href={`/projects/${selectedProject.id}/graph`}
+                    className="font-medium text-zinc-700 underline decoration-zinc-300 underline-offset-2 hover:text-zinc-950"
+                  >
+                    Explore paper relationships
+                  </Link>
+                  <span>
+                    Graph exploration is optional. Request new graph indexing in
+                    chat; it requires approval before processing.
+                  </span>
+                </div>
+              </details>
             )}
           </>
         )}

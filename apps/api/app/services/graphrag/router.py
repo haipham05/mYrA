@@ -345,14 +345,20 @@ def retrieve_graph_evidence(
     - Drops any unverified or stale facts.
     - Returns (verified_evidence_items, outage_notice).
     """
-    if intent is None:
-        intent = route_query_intent(query)
+    telemetry = get_telemetry()
+    with telemetry.stage(
+        "graph.route",
+        metadata={"explicit_graph_request": intent is not None, "cache": "none"},
+    ) as route_span:
+        if intent is None:
+            intent = route_query_intent(query)
+        if route_span is not None:
+            route_span.update(output={"intent": intent.value}, metadata={"outcome": "routed"})
     if selected_paper_ids is not None and not selected_paper_ids:
         return ([], None)
 
-    telemetry = get_telemetry()
     with telemetry.stage(
-        "graph.neo4j_query",
+        "graph.query",
         metadata={"intent": intent.value},
     ) as query_span:
         scope_args = (
@@ -398,14 +404,21 @@ def retrieve_graph_evidence(
             )
 
     if not candidates:
+        with telemetry.stage(
+            "graph.fallback",
+            metadata={"outcome": "text_fallback" if outage_notice else "no_candidates"},
+        ):
+            pass
         return ([], outage_notice)
 
     fact_ids = extract_fact_ids_from_candidates(candidates)
     if not fact_ids:
+        with telemetry.stage("graph.fallback", metadata={"outcome": "no_fact_ids"}):
+            pass
         return ([], outage_notice)
 
     with telemetry.stage(
-        "graph.evidence_resolution",
+        "graph.source_resolve",
         metadata={"candidate_fact_count": len(fact_ids)},
     ) as resolution_span:
         verified_evidence_items = resolve_graph_facts_to_evidence(
@@ -427,4 +440,10 @@ def retrieve_graph_evidence(
                 }
             )
 
+    if not verified_evidence_items:
+        with telemetry.stage(
+            "graph.fallback",
+            metadata={"outcome": "unverified_candidates", "candidate_fact_count": len(fact_ids)},
+        ):
+            pass
     return (verified_evidence_items, outage_notice)

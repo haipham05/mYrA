@@ -3,6 +3,15 @@
 import { useEffect, useState, useCallback } from "react";
 import type { Memory, MemorySource, MemoryType, MemoryStatus } from "@/types";
 
+const MEMORY_TYPE_LABELS: Record<MemoryType, string> = {
+  DECISION: "Decision",
+  PREFERENCE: "Preference",
+  TERMINOLOGY: "Terminology",
+  PROCEDURAL: "Process note",
+  PAPER_FACT: "Paper fact",
+  EPISODIC: "Research note",
+};
+
 interface MemoryInspectorProps {
   projectId: string | null;
   apiUrl: string;
@@ -387,15 +396,15 @@ export default function MemoryInspector({
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-900">
-              Project Research Memory
+              Notes and decisions
             </h2>
             <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-200 text-zinc-700 font-mono">
               {total} {total === 1 ? "entry" : "entries"}
             </span>
           </div>
           <p className="text-xs text-zinc-500 mt-0.5">
-            Durable repository of project decisions, conventions, and user
-            preferences.
+            Saved project decisions, preferences, research notes, and paper
+            sources.
           </p>
         </div>
 
@@ -405,7 +414,7 @@ export default function MemoryInspector({
           disabled={!projectId}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition"
         >
-          <span>+ Add Decision / Preference</span>
+          <span>+ Add note or decision</span>
         </button>
       </div>
 
@@ -513,7 +522,7 @@ export default function MemoryInspector({
                         mem.memory_type,
                       )}`}
                     >
-                      {mem.memory_type}
+                      {MEMORY_TYPE_LABELS[mem.memory_type]}
                     </span>
 
                     {/* Status Badge */}
@@ -597,8 +606,8 @@ export default function MemoryInspector({
                       >
                         <span className="font-semibold text-zinc-700">
                           {s.source_type === "MESSAGE"
-                            ? "Conversation Message"
-                            : "Paper Quote"}
+                            ? "Conversation"
+                            : "Paper source"}
                           :
                         </span>
                         {s.quote_text && (
@@ -619,8 +628,8 @@ export default function MemoryInspector({
                             className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 font-medium transition-colors"
                           >
                             {s.source_type === "PAPER_CHUNK"
-                              ? `View Paper Source${s.page_number ? ` (p. ${s.page_number})` : ""}`
-                              : "View Chat Message"}
+                              ? `Open paper source${s.page_number ? ` (p. ${s.page_number})` : ""}`
+                              : "Open conversation"}
                           </button>
                         ) : !s.paper_id && !s.message_id ? (
                           <span className="text-[10px] text-zinc-400 italic">
@@ -772,7 +781,7 @@ export default function MemoryInspector({
                 disabled={isSubmitting}
                 className="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 font-medium"
               >
-                {isSubmitting ? "Creating..." : "Create Memory"}
+                {isSubmitting ? "Creating..." : "Create note"}
               </button>
             </div>
           </form>
@@ -788,7 +797,7 @@ export default function MemoryInspector({
           >
             <div className="flex justify-between items-center border-b border-zinc-100 pb-3">
               <h3 className="text-sm font-semibold text-zinc-900">
-                Edit Memory (v{editingMemory.version})
+                Edit note (v{editingMemory.version})
               </h3>
               <button
                 type="button"

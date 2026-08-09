@@ -35,6 +35,7 @@ from app.services.assistant_tools import (
     build_assistant_approval_arguments,
     build_tool_registry,
     execute_tool,
+    recover_approved_graph_index,
     recover_approved_translation,
     recover_persisted_research_result,
     tool_requires_approval,
@@ -151,47 +152,64 @@ class AssistantRunProcessor:
                 )
                 approved_action = None
                 recovered_translation = None
+                recovered_graph = None
+                prior_action = None
+                has_prior_approval = False
                 if definition.available and tool_requires_approval(definition, tool_input):
-                    if decision.intent is AssistantIntent.TRANSLATE:
-                        prior_action = (
-                            db.query(AssistantApprovalAction)
-                            .filter(
-                                AssistantApprovalAction.run_id == run_id,
-                                AssistantApprovalAction.action_type == decision.intent.value,
-                                AssistantApprovalAction.status == "APPROVED",
+                    if decision.intent in {AssistantIntent.TRANSLATE, AssistantIntent.GRAPH}:
+                        is_graph_index = decision.intent is AssistantIntent.GRAPH
+                        if (
+                            is_graph_index
+                            and getattr(tool_input.arguments, "action", None) != "index"
+                        ):
+                            is_graph_index = False
+                        if decision.intent is AssistantIntent.TRANSLATE or is_graph_index:
+                            prior_action = (
+                                db.query(AssistantApprovalAction)
+                                .filter(
+                                    AssistantApprovalAction.run_id == run_id,
+                                    AssistantApprovalAction.action_type == decision.intent.value,
+                                    AssistantApprovalAction.status == "APPROVED",
+                                )
+                                .order_by(
+                                    AssistantApprovalAction.decided_at.desc(),
+                                    AssistantApprovalAction.id.desc(),
+                                )
+                                .first()
                             )
-                            .order_by(
-                                AssistantApprovalAction.decided_at.desc(),
-                                AssistantApprovalAction.id.desc(),
+                            has_prior_approval = prior_action is not None
+                            interrupted_step = (
+                                db.query(AssistantRunStep)
+                                .filter(
+                                    AssistantRunStep.run_id == run_id,
+                                    AssistantRunStep.step_key
+                                    == f"assistant.tool.{decision.intent.value}",
+                                    AssistantRunStep.input_fingerprint == tool_fingerprint,
+                                    AssistantRunStep.status.in_(
+                                        ("RUNNING", "UNKNOWN", "COMPLETED")
+                                    ),
+                                )
+                                .first()
                             )
-                            .first()
-                        )
-                        has_prior_approval = prior_action is not None
-                        interrupted_step = (
-                            db.query(AssistantRunStep)
-                            .filter(
-                                AssistantRunStep.run_id == run_id,
-                                AssistantRunStep.step_key
-                                == f"assistant.tool.{decision.intent.value}",
-                                AssistantRunStep.input_fingerprint == tool_fingerprint,
-                                AssistantRunStep.status.in_(("RUNNING", "UNKNOWN", "COMPLETED")),
-                            )
-                            .first()
-                        )
-                        if prior_action is not None and interrupted_step is not None:
-                            recovered_translation = recover_approved_translation(
-                                ToolContext(
+                            if prior_action is not None and interrupted_step is not None:
+                                context = ToolContext(
                                     db=db,
                                     chat_service=self._chat_service,
                                     assistant_run_id=run_id,
                                     approved_action_id=prior_action.id,
                                     worker_id=worker_id,
                                     attempt_count=attempt_count,
-                                ),
-                                tool_input,
-                            )
-                            if recovered_translation is not None:
-                                approved_action = prior_action
+                                )
+                                if decision.intent is AssistantIntent.TRANSLATE:
+                                    recovered_translation = recover_approved_translation(
+                                        context, tool_input
+                                    )
+                                else:
+                                    recovered_graph = recover_approved_graph_index(
+                                        context, tool_input, prior_action
+                                    )
+                                if recovered_translation is not None or recovered_graph is not None:
+                                    approved_action = prior_action
                     if approved_action is None:
                         try:
                             approved_arguments, approval_paper_ids = (
@@ -282,8 +300,10 @@ class AssistantRunProcessor:
                 if not should_execute:
                     if step.status == "COMPLETED" and step.output_payload is not None:
                         tool_result_payload = step.output_payload
-                    elif recovered_translation is not None:
-                        tool_result_payload = recovered_translation.model_dump(mode="json")
+                    elif recovered_translation is not None or recovered_graph is not None:
+                        recovered_result = recovered_translation or recovered_graph
+                        assert recovered_result is not None
+                        tool_result_payload = recovered_result.model_dump(mode="json")
                         save_assistant_step(
                             db,
                             run_id,
@@ -295,11 +315,15 @@ class AssistantRunProcessor:
                             output_payload=tool_result_payload,
                             tool_name=decision.intent.value,
                             external_effect_id=str(
-                                recovered_translation.structured_payload["translation_id"]
+                                recovered_result.structured_payload.get(
+                                    "translation_id",
+                                    recovered_result.structured_payload.get("approval_id"),
+                                )
                             ),
                         )
                     elif decision.intent in {
                         AssistantIntent.QA,
+                        AssistantIntent.GRAPH,
                         AssistantIntent.RESEARCH,
                         AssistantIntent.GAP_ANALYSIS,
                         AssistantIntent.EXPERIMENT_PLAN,
@@ -309,7 +333,7 @@ class AssistantRunProcessor:
                         )
                         recovered_payload = None
                         if completed_message is not None:
-                            if decision.intent is AssistantIntent.QA:
+                            if decision.intent in {AssistantIntent.QA, AssistantIntent.GRAPH}:
                                 recovered_payload = self._tool_result_from_message(
                                     completed_message
                                 )

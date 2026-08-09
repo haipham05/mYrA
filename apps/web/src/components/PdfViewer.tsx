@@ -2,13 +2,22 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import type { Citation, Paper, SourceSelection } from "@/types";
+import type {
+  Citation,
+  Paper,
+  SourceSelection,
+  VisualSelection,
+  VisualSourceReference,
+} from "@/types";
 
 interface PdfViewerProps {
   paper: Paper | null;
   activeCitation: Citation | null;
   apiUrl: string;
   onExplainSelection?: (selection: SourceSelection | null) => void;
+  onVisualSelection?: (selection: VisualSelection | null) => void;
+  focusSource?: VisualSourceReference | null;
+  onClearVisualFocus?: () => void;
 }
 
 export interface HighlightRect {
@@ -16,6 +25,23 @@ export interface HighlightRect {
   top: number;
   width: number;
   height: number;
+}
+
+export function normalizeCropBox(
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+  width: number,
+  height: number,
+) {
+  if (width <= 0 || height <= 0) return null;
+  const left = Math.max(0, Math.min(startX, endX)) / width;
+  const top = Math.max(0, Math.min(startY, endY)) / height;
+  const right = Math.min(width, Math.max(startX, endX)) / width;
+  const bottom = Math.min(height, Math.max(startY, endY)) / height;
+  if (right - left < 0.02 || bottom - top < 0.02) return null;
+  return { left, top, right, bottom };
 }
 
 /**
@@ -134,11 +160,27 @@ export default function PdfViewer({
   activeCitation,
   apiUrl,
   onExplainSelection,
+  onVisualSelection,
+  focusSource,
+  onClearVisualFocus,
 }: PdfViewerProps) {
   const [userPage, setUserPage] = useState<number | null>(null);
   const [scale, setScale] = useState<number>(1.2);
   const [rotation, setRotation] = useState<number>(0);
   const [prevCitation, setPrevCitation] = useState<Citation | null>(null);
+  const [isSelectingCrop, setIsSelectingCrop] = useState(false);
+  const [cropPreview, setCropPreview] = useState<{
+    startX: number;
+    startY: number;
+    endX: number;
+    endY: number;
+  } | null>(null);
+  const [selectedCrop, setSelectedCrop] = useState<{
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  } | null>(null);
 
   const [highlightRects, setHighlightRects] = useState<HighlightRect[]>([]);
   const [isExactMatch, setIsExactMatch] = useState<boolean>(false);
@@ -167,14 +209,22 @@ export default function PdfViewer({
     setUserPage(null);
   }
 
+  const paperId = paper?.id;
+  const paperHash = paper?.document_sha256;
   const citationPage =
     activeCitation && activeCitation.paper_id === paper?.id
       ? activeCitation.page_number
       : 1;
-  const currentPage = userPage ?? citationPage;
-  const paperId = paper?.id;
-  const paperHash = paper?.document_sha256;
+  const focusedSource = focusSource?.paper_id === paperId ? focusSource : null;
+  const currentPage = focusedSource?.page_number ?? userPage ?? citationPage;
   const renderKey = `${paperId ?? "none"}:${currentPage}:${scale}:${rotation}`;
+  const visibleCrop =
+    focusedSource?.crop_box_normalized_top_left ?? selectedCrop;
+  const isCurrentDocumentServed = Boolean(
+    paper &&
+    servedDocument?.paperId === paper.id &&
+    servedDocument.sha256 === paper.document_sha256,
+  );
 
   const captureTextSelection = useCallback(() => {
     const selection = window.getSelection();
@@ -199,6 +249,42 @@ export default function PdfViewer({
         : null,
     );
   }, [currentPage, onExplainSelection, paperHash, paperId]);
+
+  const cropPoint = (event: React.PointerEvent<HTMLDivElement>) => {
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    if (!bounds || bounds.width <= 0 || bounds.height <= 0) return null;
+    return {
+      x: Math.max(0, Math.min(bounds.width, event.clientX - bounds.left)),
+      y: Math.max(0, Math.min(bounds.height, event.clientY - bounds.top)),
+      width: bounds.width,
+      height: bounds.height,
+    };
+  };
+
+  const finishCropSelection = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!cropPreview || !paperId || !paperHash) return;
+    const point = cropPoint(event);
+    if (!point) return;
+    const crop = normalizeCropBox(
+      cropPreview.startX,
+      cropPreview.startY,
+      point.x,
+      point.y,
+      point.width,
+      point.height,
+    );
+    setCropPreview(null);
+    setIsSelectingCrop(false);
+    if (!crop) return;
+    setSelectedCrop(crop);
+    onExplainSelection?.(null);
+    onVisualSelection?.({
+      paper_id: paperId,
+      page_number: currentPage,
+      document_sha256: paperHash,
+      crop,
+    });
+  };
 
   // Handle PDF document rendering with PDF.js
   useEffect(() => {
@@ -519,7 +605,10 @@ export default function PdfViewer({
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() => setUserPage(Math.max(1, currentPage - 1))}
+              onClick={() => {
+                onClearVisualFocus?.();
+                setUserPage(Math.max(1, currentPage - 1));
+              }}
               disabled={currentPage <= 1}
               className="rounded px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40"
             >
@@ -530,13 +619,14 @@ export default function PdfViewer({
             </span>
             <button
               type="button"
-              onClick={() =>
+              onClick={() => {
+                onClearVisualFocus?.();
                 setUserPage(
                   paper.page_count
                     ? Math.min(paper.page_count, currentPage + 1)
                     : currentPage + 1,
-                )
-              }
+                );
+              }}
               disabled={
                 paper.page_count ? currentPage >= paper.page_count : false
               }
@@ -545,8 +635,33 @@ export default function PdfViewer({
               Next
             </button>
           </div>
+          <button
+            type="button"
+            aria-pressed={isSelectingCrop}
+            disabled={paper.status !== "READY" || !isCurrentDocumentServed}
+            onClick={() => {
+              const next = !isSelectingCrop;
+              setIsSelectingCrop(next);
+              if (next) setRotation(0);
+              setCropPreview(null);
+              setSelectedCrop(null);
+              onVisualSelection?.(null);
+              onClearVisualFocus?.();
+            }}
+            className={`rounded border px-2 py-1 text-xs ${isSelectingCrop ? "border-blue-500 bg-blue-50 text-blue-800" : "border-zinc-300 text-zinc-700"}`}
+            title="Select a figure or table region for visual analysis"
+          >
+            {isSelectingCrop ? "Cancel region" : "Select figure region"}
+          </button>
         </div>
       </div>
+
+      {isSelectingCrop && (
+        <p className="border-b border-blue-200 bg-blue-50 px-4 py-2 text-xs text-blue-900">
+          Drag around one figure, table, or plot. Only that crop is sent for
+          visual analysis.
+        </p>
+      )}
 
       {/* Active Citation Callout */}
       {activeCitation && activeCitation.paper_id === paper.id && (
@@ -598,8 +713,74 @@ export default function PdfViewer({
             data-testid="pdf-text-layer"
             onMouseUp={captureTextSelection}
             onKeyUp={captureTextSelection}
-            className="textLayer absolute inset-0 select-text overflow-hidden opacity-0 pointer-events-auto"
+            className={`textLayer absolute inset-0 select-text overflow-hidden opacity-0 ${isSelectingCrop ? "pointer-events-none" : "pointer-events-auto"}`}
           />
+
+          {isSelectingCrop && (
+            <div
+              data-testid="visual-region-selector"
+              className="absolute inset-0 z-30 cursor-crosshair touch-none"
+              onPointerDown={(event) => {
+                const point = cropPoint(event);
+                if (!point) return;
+                event.currentTarget.setPointerCapture(event.pointerId);
+                setCropPreview({
+                  startX: point.x,
+                  startY: point.y,
+                  endX: point.x,
+                  endY: point.y,
+                });
+              }}
+              onPointerMove={(event) => {
+                if (!cropPreview) return;
+                const point = cropPoint(event);
+                if (point)
+                  setCropPreview(
+                    (current) =>
+                      current && { ...current, endX: point.x, endY: point.y },
+                  );
+              }}
+              onPointerUp={finishCropSelection}
+            >
+              {(cropPreview || selectedCrop) && (
+                <div
+                  className="pointer-events-none absolute border-2 border-blue-600 bg-blue-300/20"
+                  style={
+                    cropPreview
+                      ? {
+                          left: Math.min(cropPreview.startX, cropPreview.endX),
+                          top: Math.min(cropPreview.startY, cropPreview.endY),
+                          width: Math.abs(
+                            cropPreview.endX - cropPreview.startX,
+                          ),
+                          height: Math.abs(
+                            cropPreview.endY - cropPreview.startY,
+                          ),
+                        }
+                      : {
+                          left: `${selectedCrop!.left * 100}%`,
+                          top: `${selectedCrop!.top * 100}%`,
+                          width: `${(selectedCrop!.right - selectedCrop!.left) * 100}%`,
+                          height: `${(selectedCrop!.bottom - selectedCrop!.top) * 100}%`,
+                        }
+                  }
+                />
+              )}
+            </div>
+          )}
+
+          {!isSelectingCrop && visibleCrop && (
+            <div
+              aria-label="Selected visual source region"
+              className="pointer-events-none absolute z-25 border-2 border-blue-600 bg-blue-300/20"
+              style={{
+                left: `${visibleCrop.left * 100}%`,
+                top: `${visibleCrop.top * 100}%`,
+                width: `${(visibleCrop.right - visibleCrop.left) * 100}%`,
+                height: `${(visibleCrop.bottom - visibleCrop.top) * 100}%`,
+              }}
+            />
+          )}
 
           {/* Exact Range.getClientRects() highlights for cited page */}
           {isCurrentPageCited &&

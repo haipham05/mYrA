@@ -50,6 +50,7 @@ export default function PaperUploader({
   const [yearFilter, setYearFilter] = useState("");
   const [searching, setSearching] = useState(false);
   const [scopeSaving, setScopeSaving] = useState(false);
+  const [libraryExpanded, setLibraryExpanded] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const refreshPapersRef = useRef(onUploadSuccess);
   const activeJobs = papers.filter(
@@ -101,9 +102,9 @@ export default function PaperUploader({
         year: yearFilter || undefined,
         offset: nextOffset,
       });
-    } catch (error: unknown) {
+    } catch {
       setErrorMessage(
-        error instanceof Error ? error.message : "Could not search papers.",
+        "Could not search papers. Check the connection and try again.",
       );
     } finally {
       setSearching(false);
@@ -115,10 +116,8 @@ export default function PaperUploader({
     setErrorMessage(null);
     try {
       await save();
-    } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "Could not save chat scope.",
-      );
+    } catch {
+      setErrorMessage("Could not save chat scope. Refresh and try again.");
     } finally {
       setScopeSaving(false);
     }
@@ -132,13 +131,12 @@ export default function PaperUploader({
         method: "POST",
       });
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail || "Could not retry ingestion.");
+        throw new Error("retry_failed");
       }
       await onUploadSuccess();
-    } catch (error: unknown) {
+    } catch {
       setErrorMessage(
-        error instanceof Error ? error.message : "Could not retry ingestion.",
+        "Could not restart paper processing. Refresh and try again.",
       );
     } finally {
       setIsRetrying(null);
@@ -167,15 +165,18 @@ export default function PaperUploader({
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Upload failed" }));
-        throw new Error(err.detail || "Upload failed");
+        throw new Error(
+          res.status === 413 ? "file_too_large" : "upload_failed",
+        );
       }
 
       await onUploadSuccess();
     } catch (err: unknown) {
       setIsUploading(false);
       setErrorMessage(
-        err instanceof Error ? err.message : "Failed to upload PDF",
+        err instanceof Error && err.message === "file_too_large"
+          ? "This PDF is too large to upload. Choose a smaller file."
+          : "Could not upload this PDF. Check the file and connection, then try again.",
       );
     } finally {
       if (fileInputRef.current) {
@@ -197,7 +198,16 @@ export default function PaperUploader({
           </p>
         </div>
 
-        <div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            aria-expanded={libraryExpanded}
+            aria-controls="paper-library-content"
+            onClick={() => setLibraryExpanded((expanded) => !expanded)}
+            className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+          >
+            {libraryExpanded ? "Collapse library" : "Expand library"}
+          </button>
           <input
             type="file"
             ref={fileInputRef}
@@ -224,9 +234,6 @@ export default function PaperUploader({
             <span>
               {activeJobs.length} ingestion job
               {activeJobs.length === 1 ? "" : "s"} still processing
-              {activeJobs[0]?.latest_job?.stage
-                ? ` · ${activeJobs[0].latest_job.stage}`
-                : ""}
             </span>
             <span>
               {Math.round((activeJobs[0]?.latest_job?.progress ?? 0) * 100)}%
@@ -248,60 +255,6 @@ export default function PaperUploader({
           {errorMessage}
         </div>
       )}
-
-      <form
-        className="mt-4 grid gap-2 rounded-lg bg-zinc-50 p-3 sm:grid-cols-[minmax(12rem,1fr)_9rem_7rem_auto]"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void runSearch(0);
-        }}
-      >
-        <label className="sr-only" htmlFor="paper-search">
-          Search papers
-        </label>
-        <input
-          id="paper-search"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          maxLength={200}
-          placeholder="Search title, author, or filename"
-          className="min-w-0 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-xs"
-        />
-        <label className="sr-only" htmlFor="paper-status-filter">
-          Filter by status
-        </label>
-        <select
-          id="paper-status-filter"
-          value={statusFilter}
-          onChange={(event) => setStatusFilter(event.target.value)}
-          className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-xs"
-        >
-          <option value="">Any status</option>
-          <option value="READY">Ready</option>
-          <option value="PROCESSING">Processing</option>
-          <option value="FAILED">Failed</option>
-        </select>
-        <label className="sr-only" htmlFor="paper-year-filter">
-          Filter by year
-        </label>
-        <input
-          id="paper-year-filter"
-          type="number"
-          min={1000}
-          max={2100}
-          value={yearFilter}
-          onChange={(event) => setYearFilter(event.target.value)}
-          placeholder="Year"
-          className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-xs"
-        />
-        <button
-          type="submit"
-          disabled={searching}
-          className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium disabled:opacity-50"
-        >
-          {searching ? "Searching…" : "Search"}
-        </button>
-      </form>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
         <label htmlFor="paper-scope" className="font-medium text-zinc-700">
@@ -330,112 +283,175 @@ export default function PaperUploader({
             : `${selectedPaperIds.length} paper${selectedPaperIds.length === 1 ? "" : "s"} selected.`}
         </span>
       </div>
+      <p className="mt-2 text-xs text-zinc-600" aria-live="polite">
+        Current paper:{" "}
+        {selectedPaper?.title || selectedPaper?.filename || "None selected"}
+      </p>
 
-      {/* Papers list */}
-      <div className="mt-3 flex flex-wrap gap-2">
-        {papers.length === 0 ? (
-          <p className="text-xs text-zinc-400 py-2">No papers uploaded yet.</p>
-        ) : (
-          papers.map((paper) => {
-            const isSelected = selectedPaper?.id === paper.id;
-            return (
-              <div
-                key={paper.id}
-                className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 pr-2"
-              >
-                <button
-                  type="button"
-                  onClick={() => onPaperSelect(paper)}
-                  className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
-                    isSelected
-                      ? "bg-zinc-900 text-white"
-                      : "text-zinc-800 hover:bg-zinc-100"
-                  }`}
-                >
-                  <span className="truncate max-w-[240px]">
-                    {paper.title || paper.filename}
-                  </span>
-                  <span
-                    className={`rounded-full px-1.5 py-0.2 text-[10px] ${
-                      paper.status === "READY"
-                        ? isSelected
-                          ? "bg-emerald-800 text-emerald-100"
-                          : "bg-emerald-100 text-emerald-800"
-                        : isSelected
-                          ? "bg-amber-800 text-amber-100"
-                          : "bg-amber-100 text-amber-800"
-                    }`}
+      {libraryExpanded && (
+        <div id="paper-library-content">
+          <form
+            className="mt-4 grid gap-2 rounded-lg bg-zinc-50 p-3 sm:grid-cols-[minmax(12rem,1fr)_9rem_7rem_auto]"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void runSearch(0);
+            }}
+          >
+            <label className="sr-only" htmlFor="paper-search">
+              Search papers
+            </label>
+            <input
+              id="paper-search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              maxLength={200}
+              placeholder="Search title, author, or filename"
+              className="min-w-0 rounded border border-zinc-300 bg-white px-2.5 py-1.5 text-xs"
+            />
+            <label className="sr-only" htmlFor="paper-status-filter">
+              Filter by status
+            </label>
+            <select
+              id="paper-status-filter"
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+              className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-xs"
+            >
+              <option value="">Any status</option>
+              <option value="READY">Ready</option>
+              <option value="PROCESSING">Processing</option>
+              <option value="FAILED">Failed</option>
+            </select>
+            <label className="sr-only" htmlFor="paper-year-filter">
+              Filter by year
+            </label>
+            <input
+              id="paper-year-filter"
+              type="number"
+              min={1000}
+              max={2100}
+              value={yearFilter}
+              onChange={(event) => setYearFilter(event.target.value)}
+              placeholder="Year"
+              className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-xs"
+            />
+            <button
+              type="submit"
+              disabled={searching}
+              className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+            >
+              {searching ? "Searching…" : "Search"}
+            </button>
+          </form>
+          {/* Papers list */}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {papers.length === 0 ? (
+              <p className="text-xs text-zinc-400 py-2">
+                No papers uploaded yet.
+              </p>
+            ) : (
+              papers.map((paper) => {
+                const isSelected = selectedPaper?.id === paper.id;
+                return (
+                  <div
+                    key={paper.id}
+                    className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 pr-2"
                   >
-                    {paper.status}
-                  </span>
-                </button>
-                {paper.latest_job?.status === "FAILED" && (
-                  <div className="max-w-48 px-1 text-[10px] text-rose-700">
-                    {paper.latest_job.is_retryable
-                      ? "Ingestion failed; retry is available."
-                      : "Ingestion failed and cannot be retried."}
-                  </div>
-                )}
-                {paper.latest_job?.status === "FAILED" &&
-                  paper.latest_job.is_retryable && (
                     <button
                       type="button"
-                      className="rounded bg-rose-50 px-2 py-1 text-[10px] font-medium text-rose-800 disabled:opacity-50"
-                      disabled={isRetrying !== null}
-                      onClick={() => void retryJob(paper.latest_job!.id)}
+                      onClick={() => onPaperSelect(paper)}
+                      className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                        isSelected
+                          ? "bg-zinc-900 text-white"
+                          : "text-zinc-800 hover:bg-zinc-100"
+                      }`}
                     >
-                      {isRetrying === paper.latest_job.id
-                        ? "Retrying…"
-                        : "Retry"}
+                      <span className="truncate max-w-[240px]">
+                        {paper.title || paper.filename}
+                      </span>
+                      <span
+                        className={`rounded-full px-1.5 py-0.2 text-[10px] ${
+                          paper.status === "READY"
+                            ? isSelected
+                              ? "bg-emerald-800 text-emerald-100"
+                              : "bg-emerald-100 text-emerald-800"
+                            : isSelected
+                              ? "bg-amber-800 text-amber-100"
+                              : "bg-amber-100 text-amber-800"
+                        }`}
+                      >
+                        {paper.status}
+                      </span>
                     </button>
-                  )}
-                <label className="flex items-center gap-1 text-[10px] text-zinc-500">
-                  <input
-                    type="checkbox"
-                    aria-label={`Include ${paper.title || paper.filename} in chat scope`}
-                    checked={selectedPaperIds.includes(paper.id)}
-                    disabled={paperScope === "project" || scopeSaving}
-                    onChange={(event) =>
-                      void updateScope(() =>
-                        onSelectedPaperIdsChange(
-                          paper.id,
-                          event.target.checked,
-                        ),
-                      )
-                    }
-                  />
-                  Scope
-                </label>
-              </div>
-            );
-          })
-        )}
-      </div>
-      <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
-        <span>
-          {total === 0
-            ? "0 papers"
-            : `Showing ${offset + 1}–${Math.min(offset + papers.length, total)} of ${total}`}
-        </span>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            disabled={offset <= 0 || searching}
-            onClick={() => void runSearch(Math.max(0, offset - 50))}
-            className="rounded border border-zinc-300 px-2 py-1 disabled:opacity-40"
-          >
-            Previous
-          </button>
-          <button
-            type="button"
-            disabled={offset + papers.length >= total || searching}
-            onClick={() => void runSearch(offset + 50)}
-            className="rounded border border-zinc-300 px-2 py-1 disabled:opacity-40"
-          >
-            Next
-          </button>
+                    {paper.latest_job?.status === "FAILED" && (
+                      <div className="max-w-48 px-1 text-[10px] text-rose-700">
+                        {paper.latest_job.is_retryable
+                          ? "Ingestion failed; retry is available."
+                          : "Ingestion failed and cannot be retried."}
+                      </div>
+                    )}
+                    {paper.latest_job?.status === "FAILED" &&
+                      paper.latest_job.is_retryable && (
+                        <button
+                          type="button"
+                          className="rounded bg-rose-50 px-2 py-1 text-[10px] font-medium text-rose-800 disabled:opacity-50"
+                          disabled={isRetrying !== null}
+                          onClick={() => void retryJob(paper.latest_job!.id)}
+                        >
+                          {isRetrying === paper.latest_job.id
+                            ? "Retrying…"
+                            : "Retry"}
+                        </button>
+                      )}
+                    <label className="flex items-center gap-1 text-[10px] text-zinc-500">
+                      <input
+                        type="checkbox"
+                        aria-label={`Include ${paper.title || paper.filename} in chat scope`}
+                        checked={selectedPaperIds.includes(paper.id)}
+                        disabled={paperScope === "project" || scopeSaving}
+                        onChange={(event) =>
+                          void updateScope(() =>
+                            onSelectedPaperIdsChange(
+                              paper.id,
+                              event.target.checked,
+                            ),
+                          )
+                        }
+                      />
+                      Scope
+                    </label>
+                  </div>
+                );
+              })
+            )}
+          </div>
+          <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
+            <span>
+              {total === 0
+                ? "0 papers"
+                : `Showing ${offset + 1}–${Math.min(offset + papers.length, total)} of ${total}`}
+            </span>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                disabled={offset <= 0 || searching}
+                onClick={() => void runSearch(Math.max(0, offset - 50))}
+                className="rounded border border-zinc-300 px-2 py-1 disabled:opacity-40"
+              >
+                Previous
+              </button>
+              <button
+                type="button"
+                disabled={offset + papers.length >= total || searching}
+                onClick={() => void runSearch(offset + 50)}
+                className="rounded border border-zinc-300 px-2 py-1 disabled:opacity-40"
+              >
+                Next
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

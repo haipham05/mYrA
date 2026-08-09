@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.schemas.chat import PaperScope
 from app.schemas.evidence import Citation
 from app.schemas.paper import PaperUploadResponse
+from app.schemas.vision import VisualSelection
 
 
 class AssistantIntent(StrEnum):
@@ -62,6 +63,7 @@ class AssistantRunRequest(BaseModel):
     intent_override: AssistantIntent | None = None
     parent_run_id: UUID | None = None
     source_selection: SourceSelection | None = None
+    visual_selection: VisualSelection | None = None
     idempotency_key: str = Field(min_length=8, max_length=128)
 
     @field_validator("message")
@@ -98,6 +100,12 @@ class AssistantRunRequest(BaseModel):
             or self.selected_paper_ids != [self.source_selection.paper_id]
         ):
             raise ValueError("selected passage requires its single paper as the run scope")
+        if self.visual_selection is not None and (
+            self.scope is not PaperScope.PAPER
+            or self.selected_paper_ids != [self.visual_selection.paper_id]
+            or self.source_selection is not None
+        ):
+            raise ValueError("selected figure requires its single paper as the run scope")
         return self
 
 

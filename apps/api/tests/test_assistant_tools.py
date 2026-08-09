@@ -1,3 +1,4 @@
+import hashlib
 from contextlib import contextmanager
 from uuid import UUID, uuid4
 
@@ -17,6 +18,7 @@ from app.services.assistant_tools import (
     CompareArguments,
     ExperimentPlanArguments,
     GapAnalysisArguments,
+    GraphArguments,
     NotesArguments,
     ToolContext,
     ToolStatus,
@@ -54,6 +56,79 @@ def test_registry_contains_only_fixed_intents_and_typed_callable_contracts() -> 
         registry["run_shell"]  # type: ignore[index]
 
 
+@pytest.mark.anyio
+async def test_graph_tool_forces_scoped_graph_lookup_but_reuses_grounded_qa() -> None:
+    request = _request(scope="project", selected_paper_ids=[])
+    request = request.model_copy(update={"message": "How are method A and method B related?"})
+    decision = RouteDecision(
+        intent=AssistantIntent.GRAPH,
+        standalone_question=request.message,
+        action_summary="Explore graph relationships",
+        arguments={"action": "query", "question": request.message},
+    )
+
+    class FakeChatService:
+        calls = []
+
+        async def answer_question(self, *_args, **kwargs):
+            self.calls.append(kwargs)
+            return type(
+                "Response",
+                (),
+                {
+                    "id": uuid4(),
+                    "content": "The selected graph facts are related. [1]",
+                    "model_name": "test-model",
+                    "citations": [],
+                    "evidence": [],
+                    "provider_usage": None,
+                },
+            )()
+
+    service = FakeChatService()
+    definition = build_tool_registry()[AssistantIntent.GRAPH]
+    tool_input = validate_tool_input(definition, request, decision)
+    assert isinstance(tool_input.arguments, GraphArguments)
+
+    result = await execute_tool(
+        definition,
+        ToolContext(db=None, chat_service=service),  # type: ignore[arg-type]
+        tool_input,
+    )
+
+    assert definition.available
+    assert result.result_type == "answer"
+    assert result.structured_payload["graph_lookup"] == "requested"
+    assert "not proof of corpus-wide absence" in result.structured_payload["graph_coverage"]
+    assert service.calls[0]["graph_lookup"] is True
+    assert service.calls[0]["paper_scope"] == "project"
+
+
+def test_graph_index_tool_requires_persisted_approval_and_explicit_papers() -> None:
+    paper_id = uuid4()
+    request = _request(scope="selection", selected_paper_ids=[paper_id])
+    decision = RouteDecision(
+        intent=AssistantIntent.GRAPH,
+        resolved_paper_ids=[paper_id],
+        action_summary="Index the selected paper into the graph",
+        arguments={"action": "index"},
+    )
+    definition = build_tool_registry()[AssistantIntent.GRAPH]
+    tool_input = validate_tool_input(definition, request, decision)
+
+    assert tool_requires_approval(definition, tool_input)
+
+    empty_request = _request(scope="project", selected_paper_ids=[])
+    with pytest.raises(ValueError, match="one_to_six"):
+        validate_tool_input(
+            definition,
+            empty_request,
+            decision.model_copy(
+                update={"resolved_paper_ids": [], "arguments": {"action": "index"}}
+            ),
+        )
+
+
 def test_tool_validation_rejects_arbitrary_fields_and_checks_paper_cardinality() -> None:
     registry = build_tool_registry()
     request = _request()
@@ -82,6 +157,165 @@ def test_tool_validation_rejects_arbitrary_fields_and_checks_paper_cardinality()
     )
     with pytest.raises(ValueError, match="select more papers"):
         validate_tool_input(registry[AssistantIntent.COMPARE], one_paper, one_paper_decision)
+
+
+@pytest.mark.anyio
+async def test_vision_tool_requires_a_user_selected_region_before_analysis() -> None:
+    paper_id = uuid4()
+    request = AssistantRunRequest(
+        message="Explain the chart trend",
+        conversation_id=uuid4(),
+        project_id=uuid4(),
+        scope="paper",
+        selected_paper_ids=[paper_id],
+        idempotency_key="vision-request-123",
+    )
+    decision = RouteDecision(
+        intent=AssistantIntent.VISION,
+        resolved_paper_ids=[paper_id],
+        action_summary="Analyze the selected chart",
+        arguments={"question": "Explain the chart trend"},
+    )
+    definition = build_tool_registry()[AssistantIntent.VISION]
+
+    result = await execute_tool(
+        definition,
+        ToolContext(db=None, chat_service=object()),  # type: ignore[arg-type]
+        validate_tool_input(definition, request, decision),
+    )
+
+    assert definition.available
+    assert result.status is ToolStatus.NEEDS_INPUT
+    assert result.result_type == "visual_selection_required"
+    assert result.available_actions == ["select_figure_region"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("deny_budget", [False, True])
+async def test_vision_tool_reports_result_without_text_citation(monkeypatch, deny_budget) -> None:
+    from contextlib import contextmanager
+
+    from app.config import Settings
+    from app.schemas.vision import VisualAnalysis, VisualSourceReference
+    from app.services.budget import BudgetDeniedError
+    from app.services.vision import CachedVisionResult
+    from app.services.visual_assets import VisualAsset
+
+    paper_id = uuid4()
+    project_id = uuid4()
+    image_bytes = b"small png crop"
+    source = VisualSourceReference(
+        project_id=project_id,
+        paper_id=paper_id,
+        document_sha256="a" * 64,
+        page_number=2,
+        crop_sha256=hashlib.sha256(image_bytes).hexdigest(),
+        crop_box_normalized_top_left={"left": 0.1, "top": 0.1, "right": 0.8, "bottom": 0.8},
+        text_citation=False,
+    )
+    request = AssistantRunRequest(
+        message="Explain this plot",
+        conversation_id=uuid4(),
+        project_id=project_id,
+        scope="paper",
+        selected_paper_ids=[paper_id],
+        visual_selection={
+            "paper_id": paper_id,
+            "page_number": 2,
+            "document_sha256": "a" * 64,
+            "crop": {"left": 0.1, "top": 0.1, "right": 0.8, "bottom": 0.8},
+        },
+        idempotency_key="vision-request-456",
+    )
+    decision = RouteDecision(
+        intent=AssistantIntent.VISION,
+        resolved_paper_ids=[paper_id],
+        action_summary="Analyze visual source",
+        arguments={"question": "Explain this plot"},
+    )
+
+    class Telemetry:
+        @contextmanager
+        def stage(self, *_args, **_kwargs):
+            yield None
+
+    async def fake_extract_visual_asset(**kwargs):
+        assert kwargs["expected_document_sha256"] == "a" * 64
+        return VisualAsset(
+            png_bytes=image_bytes,
+            source={
+                "project_id": str(project_id),
+                "paper_id": str(paper_id),
+                "filename": "figure.pdf",
+                "document_sha256": "a" * 64,
+                "page_number": 2,
+                "page_width": 600.0,
+                "page_height": 800.0,
+                "crop_box_normalized_top_left": {
+                    "left": 0.1,
+                    "top": 0.1,
+                    "right": 0.8,
+                    "bottom": 0.8,
+                },
+                "crop_sha256": source.crop_sha256,
+                "mime_type": "image/png",
+                "byte_length": len(image_bytes),
+                "pixel_width": 100,
+                "pixel_height": 100,
+                "caption": None,
+                "text_citation": False,
+            },
+        )
+
+    async def fake_analyze_figure_cached(**_kwargs):
+        if deny_budget:
+            raise BudgetDeniedError("request exceeds configured allowance")
+        return CachedVisionResult(
+            analysis=VisualAnalysis(
+                observations=[{"statement": "The plotted curve rises."}],
+                interpretation="The trend is upward.",
+                uncertainty_notes=["The axis units are not legible."],
+            ),
+            source=source,
+            cache_status="miss",
+            generation=GenerationResult(
+                content="{}",
+                requested_model="deepseek-flash",
+                reported_model="deepseek-flash",
+                usage=GenerationUsage(prompt_tokens=20, completion_tokens=10, total_tokens=30),
+            ),
+        )
+
+    monkeypatch.setattr(
+        assistant_tools.Settings, "from_environment", classmethod(lambda _cls: Settings())
+    )
+    monkeypatch.setattr(assistant_tools, "get_telemetry", lambda: Telemetry())
+    monkeypatch.setattr(assistant_tools, "get_storage", lambda _settings: object())
+    monkeypatch.setattr(
+        assistant_tools, "get_cache", lambda _settings: type("Cache", (), {"enabled": False})()
+    )
+    monkeypatch.setattr(assistant_tools, "extract_visual_asset", fake_extract_visual_asset)
+    monkeypatch.setattr(assistant_tools, "analyze_figure_cached", fake_analyze_figure_cached)
+
+    definition = build_tool_registry()[AssistantIntent.VISION]
+    result = await execute_tool(
+        definition,
+        ToolContext(db=object(), chat_service=object()),  # type: ignore[arg-type]
+        validate_tool_input(definition, request, decision),
+    )
+
+    if deny_budget:
+        assert result.status is ToolStatus.UNAVAILABLE
+        assert result.result_type == "visual_analysis_unavailable"
+        assert result.warnings == ["BUDGET_DENIED"]
+    else:
+        assert result.status is ToolStatus.SUCCEEDED
+        assert result.result_type == "visual_analysis"
+        assert result.usage == {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+        assert result.structured_payload["visual_source"]["text_citation"] is False
+        assert result.structured_payload["analysis"]["uncertainty_notes"] == [
+            "The axis units are not legible."
+        ]
 
 
 @pytest.mark.parametrize(
@@ -1350,7 +1584,7 @@ def test_source_selection_requires_exact_single_paper_scope() -> None:
 
 
 @pytest.mark.anyio
-async def test_unimplemented_feature_returns_explicit_unavailable_result() -> None:
+async def test_vision_feature_requests_explicit_region_selection() -> None:
     registry = build_tool_registry()
     request = _request(scope="paper", selected_paper_ids=[uuid4()])
     decision = RouteDecision(
@@ -1365,5 +1599,5 @@ async def test_unimplemented_feature_returns_explicit_unavailable_result() -> No
         validate_tool_input(definition, request, decision),
     )
 
-    assert result.status is ToolStatus.UNAVAILABLE
-    assert "not connected" in result.display_text
+    assert result.status is ToolStatus.NEEDS_INPUT
+    assert result.result_type == "visual_selection_required"

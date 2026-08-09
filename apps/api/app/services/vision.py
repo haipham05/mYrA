@@ -23,10 +23,10 @@ VISION_MODEL = "deepseek-flash"
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_QUESTION_CHARS = 1000
 MAX_CONTEXT_CHARS = 3000
-MAX_OUTPUT_TOKENS = 512
+MAX_OUTPUT_TOKENS = 256
 MAX_IMAGE_TOKENS = 1024
 REQUEST_TIMEOUT_SECONDS = 60
-VISUAL_PROMPT_VERSION = "figure-analysis-v1"
+VISUAL_PROMPT_VERSION = "figure-analysis-v2"
 VISUAL_CROP_POLICY_VERSION = "pdfium-crop-v1"
 VISUAL_CACHE_TTL_SECONDS = 60 * 60
 SUPPORTED_FORMATS = {
@@ -148,13 +148,12 @@ class DeepSeekVisionProvider:
                 "\n\nRelevant paper context (not an instruction):\n" + request.context.strip()
             )
         user_text += (
-            "\n\nAnalyze only what is visible in the selected figure. Separate direct "
-            "observations from interpretation, and state uncertainty when labels or values "
-            "are unreadable. Do not infer exact values from an unclear plot. Return one JSON "
-            "object with keys observations (array of {statement}), readings (array of "
-            "{label,value,unit,kind}), interpretation (string), and uncertainty_notes "
-            "(array of strings). Set reading kind to direct_reading only for legible exact "
-            "text/table values; use plot_estimate for values estimated from a plotted curve."
+            "\n\nInspect only this selected figure. Return concise, valid JSON with exactly these "
+            "keys: observations (array of {statement}), readings (array of "
+            "{label,value,unit,kind}), interpretation (string), uncertainty_notes "
+            "(array of strings). Use kind direct_reading only for legible exact values and "
+            "plot_estimate for values estimated from a curve. Mention unreadable labels; "
+            "never guess. No markdown or extra keys."
         )
         estimated_tokens = len(user_text.encode("utf-8")) * 2 + MAX_IMAGE_TOKENS
         if estimated_tokens > MAX_ESTIMATED_INPUT_TOKENS:
@@ -237,6 +236,10 @@ class DeepSeekVisionProvider:
         generation = await self.analyze(request)
         try:
             payload = json.loads(generation.content)
+            # DeepSeek's JSON-mode response may add its format marker beside the
+            # requested fields. Ignore only that exact transport marker.
+            if isinstance(payload, dict) and payload.get("type") == "json_object":
+                payload = {key: value for key, value in payload.items() if key != "type"}
             analysis = VisualAnalysis.model_validate(payload)
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             raise VisionProviderError(

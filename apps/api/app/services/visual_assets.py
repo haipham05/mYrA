@@ -187,6 +187,7 @@ async def extract_visual_asset(
     page_number: int,
     crop: NormalizedCropBox,
     caption_element_id: UUID | None = None,
+    expected_document_sha256: str | None = None,
 ) -> VisualAsset:
     """Render a bounded crop after verifying its project, READY paper, and source hash.
 
@@ -214,6 +215,11 @@ async def extract_visual_asset(
         raise VisualAssetError(
             "SOURCE_HASH_MISSING", "The paper has no valid source hash."
         ) from err
+    if (
+        expected_document_sha256 is not None
+        and paper.document_sha256.casefold() != expected_document_sha256.casefold()
+    ):
+        raise VisualAssetError("SOURCE_CHANGED", "The selected paper version has changed.")
     if paper.page_count is not None and page_number > paper.page_count:
         raise VisualAssetError("PAGE_OUT_OF_RANGE", "The selected page is outside the paper.")
 

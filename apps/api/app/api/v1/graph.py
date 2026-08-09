@@ -504,23 +504,18 @@ def trigger_graph_index(
     project_id: UUID,
     req: GraphIndexRequest,
     db: Session = Depends(get_db),
-    repo: Neo4jRepository | None = Depends(get_graph_repo),
 ) -> GraphIndexResponse:
-    """Enqueue existing READY papers for GraphRAG extraction."""
+    """Preview eligible papers; mutation is only available through persisted approval."""
     _get_project_or_404(db, project_id)
 
-    settings = Settings.from_environment()
     if not req.dry_run:
-        if not settings.graphrag_enabled:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Graph indexing is disabled by configuration.",
-            )
-        if repo is None or not _check_repo_available(repo):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Graph indexing is unavailable because Neo4j is not connected.",
-            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Graph indexing writes persistent graph data and must be requested and approved "
+                "through the assistant. This endpoint supports dry-run previews only."
+            ),
+        )
 
     result = enqueue_existing_papers_for_graph(
         db=db,

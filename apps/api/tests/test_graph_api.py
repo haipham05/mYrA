@@ -583,12 +583,11 @@ def test_relationships_between_endpoints(
 # ============================================================================
 
 
-def test_index_endpoint_dry_run_and_enqueue(
+def test_index_endpoint_previews_but_requires_persisted_assistant_approval(
     client: TestClient,
     db_session: Session,
-    monkeypatch,
 ) -> None:
-    """Test 7: Index endpoint defaults to dry_run=True; enqueues papers upon explicit opt-in."""
+    """The legacy graph route previews targets but cannot bypass assistant approval."""
     # 1. Default request body: dry_run=True
     resp_dry = client.post(f"/api/v1/projects/{PROJECT_A_ID}/graph/index", json={})
     assert resp_dry.status_code == 200
@@ -605,44 +604,23 @@ def test_index_endpoint_dry_run_and_enqueue(
     )
     assert initial_events_count == 0
 
-    # 2. Explicit enqueue: dry_run=False
+    # Persistent index writes are available only through an approved assistant action.
     resp_live = client.post(
         f"/api/v1/projects/{PROJECT_A_ID}/graph/index",
         json={"dry_run": False, "limit": 5},
     )
-    assert resp_live.status_code == 503
-    assert "disabled" in resp_live.json()["detail"].lower()
-
-    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
-    resp_live = client.post(
-        f"/api/v1/projects/{PROJECT_A_ID}/graph/index",
-        json={"dry_run": False, "limit": 5},
-    )
-    assert resp_live.status_code == 200
-    live_data = resp_live.json()
-
-    assert live_data["dry_run"] is False
-    assert live_data["enqueued_count"] > 0
-
-    # Verify GraphEvents were committed to database
-    committed_events = (
-        db_session.query(GraphEvent).filter(GraphEvent.project_id == PROJECT_A_ID).all()
-    )
-    assert len(committed_events) == live_data["enqueued_count"]
-    assert all(ev.status == "PENDING" for ev in committed_events)
+    assert resp_live.status_code == 409
+    assert "approved through the assistant" in resp_live.json()["detail"]
+    assert db_session.query(GraphEvent).filter(GraphEvent.project_id == PROJECT_A_ID).count() == 0
 
 
-def test_index_endpoint_rejects_live_enqueue_without_connected_repository(
-    client: TestClient, mock_repo: MagicMock, monkeypatch
-) -> None:
-    monkeypatch.setenv("MYRA_GRAPHRAG_ENABLED", "true")
-    mock_repo.verify_connectivity.return_value = False
+def test_index_endpoint_dry_run_does_not_require_neo4j(client: TestClient) -> None:
     response = client.post(
         f"/api/v1/projects/{PROJECT_A_ID}/graph/index",
-        json={"dry_run": False, "limit": 1},
+        json={"dry_run": True, "limit": 1},
     )
-    assert response.status_code == 503
-    assert "neo4j" in response.json()["detail"].lower()
+    assert response.status_code == 200
+    assert response.json()["dry_run"] is True
 
 
 # ============================================================================

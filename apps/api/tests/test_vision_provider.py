@@ -16,6 +16,8 @@ from app.services.vision import (
     StructuredVisionResult,
     VisionProviderError,
     VisionRequest,
+    VisualSourceReference,
+    _visual_cache_key,
     analyze_figure_cached,
 )
 
@@ -217,7 +219,8 @@ def test_structured_output_keeps_observation_inference_and_uncertainty_separate(
                     {
                         "message": {
                             "content": (
-                                '{"observations":[{"statement":"The blue series rises."}],'
+                                '{"type":"json_object",'
+                                '"observations":[{"statement":"The blue series rises."}],'
                                 '"readings":[{"label":"At x=2","value":"about 4",'
                                 '"unit":null,"kind":"plot_estimate"}],'
                                 '"interpretation":"The series trends upward.",'
@@ -296,6 +299,21 @@ def test_visual_analysis_cache_reuses_only_matching_source_and_question() -> Non
     assert provider.calls == 2
     assert second.source.text_citation is False
     assert all(b"base64" not in str(value).encode() for value in cache._client.values.values())
+
+
+def test_visual_cache_key_changes_when_prompt_version_changes(monkeypatch) -> None:
+    import app.services.vision as vision
+
+    image = _png_bytes()
+    source = VisualSourceReference.from_source_metadata(_source_metadata(image))
+    request = VisionRequest(question="Describe the curve.", image_bytes=image)
+    original = _visual_cache_key(source=source, question=request.question, context=request.context)
+
+    monkeypatch.setattr(vision, "VISUAL_PROMPT_VERSION", "figure-analysis-next")
+
+    changed = _visual_cache_key(source=source, question=request.question, context=request.context)
+
+    assert changed != original
 
 
 def test_visual_cache_refuses_crop_bytes_that_do_not_match_source_identity() -> None:

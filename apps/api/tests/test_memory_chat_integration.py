@@ -194,7 +194,7 @@ async def test_chat_forwards_persisted_paper_scope_to_all_evidence_sources(db: S
 
     assert retriever.retrieve.call_args.kwargs["selected_paper_ids"] == selected_ids
     assert memories.call_args.kwargs["selected_paper_ids"] == selected_ids
-    assert graph.call_args.kwargs["selected_paper_ids"] == selected_ids
+    graph.assert_not_called()
 
 
 @pytest.mark.anyio

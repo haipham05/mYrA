@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import type { ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -12,11 +13,14 @@ import DiscoveryImportControls from "@/components/DiscoveryImportControls";
 import type {
   AssistantApprovalResponse,
   AssistantIntent,
+  AssistantResultType,
   AssistantRunResponse,
   Citation,
   Conversation,
   Message,
   SourceSelection,
+  VisualSelection,
+  VisualSourceReference,
 } from "@/types";
 
 interface ComparisonExcerptView {
@@ -64,8 +68,146 @@ interface DiscoveryCandidateView {
   candidatePayload: Record<string, unknown>;
 }
 
+interface NoteCardView {
+  id?: string;
+  title: string;
+  content: string;
+  type?: string;
+  status?: string;
+  version?: number;
+  sources?: unknown;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function failureMessage(result: Message["assistantResult"]): {
+  heading: string;
+  detail: string;
+} | null {
+  if (!result) return null;
+  const warnings = result.warnings.map((warning) => warning.toUpperCase());
+  const payload = isRecord(result.structured_payload)
+    ? result.structured_payload
+    : {};
+  const errorCode =
+    typeof payload.safe_error === "string"
+      ? payload.safe_error.toUpperCase()
+      : warnings.find((warning) =>
+          [
+            "BUDGET_DENIED",
+            "PROVIDER_UNAVAILABLE",
+            "PROVIDER_RATE_LIMITED",
+            "SOURCE_CHANGED",
+            "APPROVAL_SOURCE_CHANGED",
+            "APPROVAL_NO_LONGER_VALID",
+          ].includes(warning),
+        );
+
+  if (errorCode === "BUDGET_DENIED") {
+    return {
+      heading: "Spending limit reached",
+      detail:
+        "This step stopped before its paid model call. Reduce the request scope or check your remaining allowance before retrying.",
+    };
+  }
+  if (
+    errorCode === "PROVIDER_UNAVAILABLE" ||
+    errorCode === "PROVIDER_RATE_LIMITED"
+  ) {
+    return {
+      heading: "Research model unavailable",
+      detail:
+        "The model service could not complete this request. No answer was produced; you can try again later.",
+    };
+  }
+  if (
+    errorCode === "APPROVAL_SOURCE_CHANGED" ||
+    errorCode === "APPROVAL_NO_LONGER_VALID" ||
+    result.result_type === "approval_invalidated" ||
+    result.result_type === "graph_index_approval_invalid"
+  ) {
+    return {
+      heading: "The source changed",
+      detail:
+        "The saved approval no longer matches the current paper or request. Review the current source and submit the action again.",
+    };
+  }
+  if (
+    errorCode === "SOURCE_CHANGED" ||
+    result.result_type === "source_selection_unavailable"
+  ) {
+    return {
+      heading: "Selected passage unavailable",
+      detail:
+        "The selected source no longer matches the current paper. Review the latest paper, then select the passage again or ask a new question.",
+    };
+  }
+  if (result.result_type === "routing_unavailable") {
+    return {
+      heading: "Could not route this request",
+      detail:
+        "The research model could not choose an action. No research action was started; try again later or choose a more specific request.",
+    };
+  }
+  if (result.result_type === "action_outcome_unknown") {
+    return {
+      heading: "The result could not be confirmed",
+      detail:
+        "mYrA did not repeat the action automatically. Check the relevant paper or saved output before trying again.",
+    };
+  }
+  if (result.result_type === "clarification") {
+    const missing = isRecord(result.structured_payload)
+      ? result.structured_payload.missing_information
+      : null;
+    if (Array.isArray(missing) && missing.includes("ready_paper")) {
+      return {
+        heading: "Choose a ready paper",
+        detail:
+          "Select one paper that has finished processing, then submit the request again.",
+      };
+    }
+    if (
+      Array.isArray(missing) &&
+      missing.includes("select_or_identify_paper")
+    ) {
+      return {
+        heading: "Choose which paper to use",
+        detail:
+          "Select a paper from this project or clarify its title before continuing.",
+      };
+    }
+    if (
+      Array.isArray(missing) &&
+      missing.some((item) =>
+        ["paper", "paper_scope", "selected_paper_ids", "scope"].includes(
+          String(item),
+        ),
+      )
+    ) {
+      return {
+        heading: "Choose the research scope",
+        detail:
+          "Choose the current paper, selected papers, or the whole project before continuing.",
+      };
+    }
+  }
+  return null;
+}
+
+function runStatusLabel(status: AssistantRunResponse["status"]): string {
+  const labels: Record<AssistantRunResponse["status"], string> = {
+    QUEUED: "Waiting for a worker",
+    RUNNING: "Research in progress",
+    NEEDS_INPUT: "More information needed",
+    AWAITING_APPROVAL: "Waiting for your approval",
+    SUCCEEDED: "Completed",
+    FAILED: "Not completed",
+    CANCELLED: "Cancelled",
+  };
+  return labels[status];
 }
 
 function isCitation(value: unknown): value is Citation {
@@ -276,6 +418,9 @@ interface ChatPanelProps {
   ) => Promise<AssistantApprovalResponse>;
   sourceSelection?: SourceSelection | null;
   onClearSourceSelection?: () => void;
+  visualSelection?: VisualSelection | null;
+  onClearVisualSelection?: () => void;
+  onVisualSourceClick?: (source: VisualSourceReference) => void;
 }
 
 export default function ChatPanel({
@@ -304,6 +449,9 @@ export default function ChatPanel({
   onDecideDiscoveryImport,
   sourceSelection,
   onClearSourceSelection,
+  visualSelection,
+  onClearVisualSelection,
+  onVisualSourceClick,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [resumeInput, setResumeInput] = useState("");
@@ -573,6 +721,110 @@ export default function ChatPanel({
     );
   };
 
+  const renderVisualAnalysis = (message: Message) => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "visual_analysis") return null;
+    const payload = result.structured_payload;
+    if (!isRecord(payload) || !isRecord(payload.analysis)) return null;
+    const analysis = payload.analysis;
+    const source = payload.visual_source;
+    if (
+      !isRecord(source) ||
+      source.source_kind !== "visual" ||
+      source.text_citation !== false ||
+      typeof source.paper_id !== "string" ||
+      typeof source.page_number !== "number" ||
+      typeof source.document_sha256 !== "string" ||
+      !isRecord(source.crop_box_normalized_top_left)
+    ) {
+      return null;
+    }
+    const observations = Array.isArray(analysis.observations)
+      ? analysis.observations.flatMap((item) =>
+          isRecord(item) && typeof item.statement === "string"
+            ? [item.statement]
+            : [],
+        )
+      : [];
+    const readings = Array.isArray(analysis.readings)
+      ? analysis.readings.flatMap((item) =>
+          isRecord(item) &&
+          typeof item.label === "string" &&
+          typeof item.value === "string" &&
+          (item.kind === "direct_reading" || item.kind === "plot_estimate")
+            ? [
+                {
+                  label: item.label,
+                  value: item.value,
+                  kind: item.kind,
+                  unit: typeof item.unit === "string" ? item.unit : null,
+                },
+              ]
+            : [],
+        )
+      : [];
+    const uncertainties = Array.isArray(analysis.uncertainty_notes)
+      ? analysis.uncertainty_notes.filter(
+          (item): item is string => typeof item === "string",
+        )
+      : [];
+
+    return (
+      <section className="space-y-2" aria-label="Visual analysis">
+        <p className="text-xs font-medium text-blue-900">
+          Figure analysis — visual interpretation, not a text quotation.
+        </p>
+        {observations.length > 0 && (
+          <ul className="list-disc space-y-1 pl-5">
+            {observations.map((item, index) => (
+              <li key={`visual-observation-${index}`}>{item}</li>
+            ))}
+          </ul>
+        )}
+        {readings.length > 0 && (
+          <ul className="space-y-1">
+            {readings.map((item, index) => (
+              <li key={`visual-reading-${index}`}>
+                <span className="font-medium">{item.label}:</span> {item.value}
+                {item.unit ? ` ${item.unit}` : ""}
+                <span className="ml-1 text-xs text-zinc-600">
+                  (
+                  {item.kind === "plot_estimate"
+                    ? "estimated from plot"
+                    : "read directly"}
+                  )
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+        {typeof analysis.interpretation === "string" &&
+          analysis.interpretation && <p>{analysis.interpretation}</p>}
+        {uncertainties.length > 0 && (
+          <div className="rounded bg-amber-50 p-2 text-xs text-amber-900">
+            <p className="font-medium">Uncertainty</p>
+            <ul className="list-disc pl-5">
+              {uncertainties.map((item, index) => (
+                <li key={`visual-uncertainty-${index}`}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {onVisualSourceClick && (
+          <button
+            type="button"
+            className="text-xs font-medium text-blue-800 underline"
+            onClick={() =>
+              onVisualSourceClick(source as unknown as VisualSourceReference)
+            }
+          >
+            Open original page {source.page_number}
+          </button>
+        )}
+      </section>
+    );
+  };
+
   const renderDiscovery = (message: Message) => {
     const result = message.assistantResult;
     if (result?.result_type !== "discovery_results") return null;
@@ -700,6 +952,401 @@ export default function ChatPanel({
     );
   };
 
+  const renderReadingBrief = (message: Message): ReactNode | null => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "reading_brief") return null;
+    const payload = result.structured_payload;
+    if (!isRecord(payload) || !Array.isArray(payload.sections)) return null;
+    const sections = payload.sections.flatMap((value) =>
+      isRecord(value) &&
+      typeof value.title === "string" &&
+      typeof value.content === "string"
+        ? [
+            {
+              title: value.title,
+              content: value.content,
+              citationIndexes: Array.isArray(value.citation_indexes)
+                ? value.citation_indexes.filter(
+                    (index): index is number => typeof index === "number",
+                  )
+                : [],
+            },
+          ]
+        : [],
+    );
+    if (sections.length === 0) return null;
+    return (
+      <section className="space-y-3" aria-label="Paper reading brief">
+        {sections.map((section) => (
+          <div key={section.title}>
+            <h3 className="font-semibold">{section.title}</h3>
+            <div>{renderContent(section.content, message.citations)}</div>
+            <div className="mt-1 flex flex-wrap gap-1">
+              {section.citationIndexes.map((index) => {
+                const citation = message.citations.find(
+                  (item) => item.citation_index === index,
+                );
+                return citation ? (
+                  <button
+                    key={`${section.title}:${index}`}
+                    type="button"
+                    onClick={() => onCitationClick(citation)}
+                    className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-semibold text-blue-800 hover:bg-blue-200"
+                  >
+                    Source [{index}] · page {citation.page_number}
+                  </button>
+                ) : null;
+              })}
+            </div>
+          </div>
+        ))}
+      </section>
+    );
+  };
+
+  const renderClaimVerification = (message: Message): ReactNode | null => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "claim_verification") return null;
+    const payload = result.structured_payload;
+    if (
+      !isRecord(payload) ||
+      typeof payload.verdict !== "string" ||
+      typeof payload.explanation !== "string"
+    ) {
+      return null;
+    }
+    return (
+      <section className="space-y-2" aria-label="Claim verification">
+        <p className="font-semibold capitalize">
+          Claim assessment: {payload.verdict.replaceAll("_", " ")}
+        </p>
+        {typeof payload.claim === "string" && (
+          <blockquote className="border-l-2 border-zinc-300 pl-3 text-zinc-700">
+            {payload.claim}
+          </blockquote>
+        )}
+        <p>{payload.explanation}</p>
+        {typeof payload.scope_note === "string" && (
+          <p className="text-xs text-amber-800">{payload.scope_note}</p>
+        )}
+        <div className="flex flex-wrap gap-1">
+          {message.citations.map((citation) => (
+            <button
+              key={citation.evidence_id}
+              type="button"
+              onClick={() => onCitationClick(citation)}
+              className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-semibold text-blue-800 hover:bg-blue-200"
+            >
+              Source [{citation.citation_index}] · page {citation.page_number}
+            </button>
+          ))}
+        </div>
+      </section>
+    );
+  };
+
+  const renderNotes = (message: Message): ReactNode | null => {
+    const result = message.assistantResult;
+    if (
+      !result ||
+      (result.result_type !== "notes_list" && result.result_type !== "note")
+    ) {
+      return null;
+    }
+    const payload = result.structured_payload;
+    if (!isRecord(payload)) return null;
+    const items =
+      result.result_type === "notes_list"
+        ? Array.isArray(payload.items)
+          ? payload.items
+          : []
+        : payload.item
+          ? [payload.item]
+          : [];
+    const notes = items.flatMap((value): NoteCardView[] =>
+      isRecord(value) &&
+      typeof value.title === "string" &&
+      typeof value.content === "string"
+        ? [
+            {
+              id: typeof value.id === "string" ? value.id : undefined,
+              title: value.title,
+              content: value.content,
+              type: typeof value.type === "string" ? value.type : undefined,
+              status:
+                typeof value.status === "string" ? value.status : undefined,
+              version:
+                typeof value.version === "number" ? value.version : undefined,
+              sources: value.sources,
+            },
+          ]
+        : [],
+    );
+    if (items.length > 0 && notes.length === 0) return null;
+    return (
+      <section className="space-y-2" aria-label="Research notes">
+        {result.result_type === "notes_list" && (
+          <p className="text-xs text-zinc-600">
+            {typeof payload.total === "number" ? payload.total : notes.length}{" "}
+            active note(s)
+          </p>
+        )}
+        {notes.map((note, index) => (
+          <article
+            key={
+              typeof note.id === "string" ? note.id : `${note.title}-${index}`
+            }
+            className="rounded border border-zinc-200 bg-white p-3"
+          >
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h3 className="font-semibold">{note.title}</h3>
+              <span className="text-xs text-zinc-500">
+                {[
+                  note.type,
+                  note.status,
+                  typeof note.version === "number" ? `v${note.version}` : null,
+                ]
+                  .filter((part): part is string => typeof part === "string")
+                  .join(" · ")}
+              </span>
+            </div>
+            <p className="mt-1 whitespace-pre-wrap">{note.content}</p>
+            {Array.isArray(note.sources) && note.sources.length > 0 && (
+              <p className="mt-2 text-xs text-zinc-600">
+                Source context:{" "}
+                {note.sources
+                  .flatMap((source) =>
+                    isRecord(source) && typeof source.page_number === "number"
+                      ? [`page ${source.page_number}`]
+                      : [],
+                  )
+                  .join(", ") || `${note.sources.length} reference(s)`}
+              </p>
+            )}
+          </article>
+        ))}
+        {notes.length === 0 && <p>No active research notes.</p>}
+      </section>
+    );
+  };
+
+  const renderReport = (message: Message): ReactNode | null => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "research_report") return null;
+    const payload = result.structured_payload;
+    if (!isRecord(payload) || typeof payload.report_markdown !== "string") {
+      return null;
+    }
+    const sources = Array.isArray(payload.source_manifest)
+      ? payload.source_manifest.flatMap((source) =>
+          isRecord(source) &&
+          typeof source.citation_index === "number" &&
+          typeof source.page_number === "number"
+            ? [source]
+            : [],
+        )
+      : [];
+    return (
+      <section className="space-y-3" aria-label="Research report">
+        <div className="rounded border border-zinc-200 bg-white p-3">
+          {renderContent(payload.report_markdown, message.citations)}
+        </div>
+        {sources.length > 0 && (
+          <div className="flex flex-wrap gap-1" aria-label="Report sources">
+            {sources.map((source, index) => {
+              const citation = message.citations.find(
+                (item) => item.citation_index === source.citation_index,
+              );
+              return citation ? (
+                <button
+                  key={`${source.citation_index}-${index}`}
+                  type="button"
+                  onClick={() => onCitationClick(citation)}
+                  className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-semibold text-blue-800 hover:bg-blue-200"
+                >
+                  {typeof source.paper_title === "string"
+                    ? source.paper_title
+                    : "Source"}{" "}
+                  · page {citation.page_number}
+                </button>
+              ) : null;
+            })}
+          </div>
+        )}
+        <p className="text-xs text-zinc-500">
+          {payload.saved === true ? "Saved report" : "Draft report — not saved"}
+          {typeof payload.scope === "string" ? ` · ${payload.scope} scope` : ""}
+        </p>
+        {result.artifact_ids.length > 0 && (
+          <p className="text-xs text-zinc-600" aria-label="Report artifacts">
+            Saved artifact reference(s): {result.artifact_ids.join(", ")}
+          </p>
+        )}
+      </section>
+    );
+  };
+
+  const renderGraphIndex = (message: Message): ReactNode | null => {
+    const result = message.assistantResult;
+    if (result?.result_type !== "graph_index_jobs") return null;
+    const payload = result.structured_payload;
+    if (!isRecord(payload)) return null;
+    const counts = [
+      ["Queued", payload.queued_count],
+      ["Already queued or skipped", payload.skipped_count],
+      ["Completed", payload.completed_count],
+      ["Failed", payload.failed_count],
+    ].filter(
+      (entry): entry is [string, number] => typeof entry[1] === "number",
+    );
+    if (counts.length === 0) return null;
+    return (
+      <section className="space-y-2" aria-label="Graph indexing jobs">
+        <p className="font-medium">Optional graph indexing</p>
+        <dl className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+          {counts.map(([label, count]) => (
+            <div key={label} className="flex gap-1">
+              <dt className="text-zinc-600">{label}:</dt>
+              <dd className="font-medium">{count}</dd>
+            </div>
+          ))}
+        </dl>
+        <p className="text-xs text-zinc-600">
+          Graph coverage is limited to indexed, source-verified facts; missing
+          links do not establish that a relationship is absent.
+        </p>
+      </section>
+    );
+  };
+
+  const renderStatusResult = (message: Message): ReactNode | null => {
+    const result = message.assistantResult;
+    if (!result) return null;
+    const failure = failureMessage(result);
+    const statusLabels: Partial<Record<AssistantResultType, string>> = {
+      clarification: "More information needed",
+      approval_required: "Approval required",
+      approval_invalidated: "Approval needs review",
+      routing_unavailable: "Request could not be routed",
+      tool_error: "Research step failed",
+      action_outcome_unknown: "Action status needs checking",
+      unavailable: "Feature unavailable",
+      discovery_unavailable: "Paper discovery unavailable",
+      graph_index_approval_required: "Graph indexing needs approval",
+      graph_index_approval_invalid:
+        "Graph indexing approval expired or changed",
+      graph_indexing_unavailable: "Graph indexing unavailable",
+      note_not_found: "Note unavailable",
+      note_source_unavailable: "Note source could not be verified",
+      note_version_conflict: "Note changed",
+      note_update_rejected: "Note update not applied",
+      report_evidence_unavailable: "Report needs more evidence",
+      research_evidence_unavailable: "Research evidence unavailable",
+      gap_analysis_evidence_unavailable: "Gap-analysis evidence unavailable",
+      experiment_evidence_unavailable: "Experiment evidence unavailable",
+      comparison_scope_unavailable: "Comparison needs a valid paper selection",
+      claim_scope_unavailable:
+        "Claim verification needs a valid paper selection",
+      source_selection_unavailable: "Selected passage is no longer available",
+      visual_selection_required: "Select a figure or crop first",
+      visual_analysis_unavailable: "Figure analysis unavailable",
+    };
+    const label = statusLabels[result.result_type as AssistantResultType];
+    if (!label) return null;
+    const missing =
+      result.result_type === "clarification" &&
+      isRecord(result.structured_payload) &&
+      Array.isArray(result.structured_payload.missing_information)
+        ? result.structured_payload.missing_information.flatMap(
+            (item): string[] => {
+              if (item === "ready_paper") return ["Select a ready paper."];
+              if (item === "select_or_identify_paper") {
+                return ["Select a paper or clarify its title."];
+              }
+              if (
+                [
+                  "paper",
+                  "paper_scope",
+                  "selected_paper_ids",
+                  "scope",
+                ].includes(String(item))
+              ) {
+                return ["Choose the paper or project scope."];
+              }
+              return [];
+            },
+          )
+        : [];
+    return (
+      <section
+        className="rounded border border-amber-200 bg-amber-50 p-3 text-amber-950"
+        aria-label={label}
+      >
+        <p className="font-semibold">{failure?.heading ?? label}</p>
+        {failure && <p className="mt-1 text-xs">{failure.detail}</p>}
+        {missing.length > 0 && (
+          <ul className="mt-1 list-disc pl-5 text-xs">
+            {missing.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        )}
+        {!failure && (
+          <div className="mt-1">
+            {renderContent(message.content, message.citations)}
+          </div>
+        )}
+      </section>
+    );
+  };
+
+  const resultCardRenderers: Partial<
+    Record<AssistantResultType, (message: Message) => ReactNode | null>
+  > = {
+    comparison: renderComparison,
+    discovery_results: renderDiscovery,
+    discovery_unavailable: renderStatusResult,
+    visual_analysis: renderVisualAnalysis,
+    reading_brief: renderReadingBrief,
+    claim_verification: renderClaimVerification,
+    notes_list: renderNotes,
+    note: renderNotes,
+    research_report: renderReport,
+    graph_index_jobs: renderGraphIndex,
+    research_draft: (message) =>
+      renderResearchDiscovery(message) ??
+      renderContent(message.content, message.citations),
+    unavailable: renderStatusResult,
+    clarification: renderStatusResult,
+    approval_required: renderStatusResult,
+    approval_invalidated: renderStatusResult,
+    routing_unavailable: renderStatusResult,
+    tool_error: renderStatusResult,
+    action_outcome_unknown: renderStatusResult,
+    graph_index_approval_required: renderStatusResult,
+    graph_index_approval_invalid: renderStatusResult,
+    graph_indexing_unavailable: renderStatusResult,
+    note_not_found: renderStatusResult,
+    note_source_unavailable: renderStatusResult,
+    note_version_conflict: renderStatusResult,
+    note_update_rejected: renderStatusResult,
+    report_evidence_unavailable: renderStatusResult,
+    research_evidence_unavailable: renderStatusResult,
+    gap_analysis_evidence_unavailable: renderStatusResult,
+    experiment_evidence_unavailable: renderStatusResult,
+    comparison_scope_unavailable: renderStatusResult,
+    claim_scope_unavailable: renderStatusResult,
+    source_selection_unavailable: renderStatusResult,
+    visual_selection_required: renderStatusResult,
+    visual_analysis_unavailable: renderStatusResult,
+  };
+
+  const renderResultCard = (message: Message): ReactNode | null => {
+    const type = message.assistantResult?.result_type;
+    if (!type || !Object.hasOwn(resultCardRenderers, type)) return null;
+    return resultCardRenderers[type as AssistantResultType]?.(message) ?? null;
+  };
+
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-xs">
       <div className="border-b border-zinc-200 px-4 py-3">
@@ -764,10 +1411,29 @@ export default function ChatPanel({
                   activeRun.intent ||
                   "Research request"}
               </p>
-              <p role="status">
-                {activeRun.status.replaceAll("_", " ")}
-                {activeRun.stage ? ` · ${activeRun.stage}` : ""}
-              </p>
+              <p role="status">{runStatusLabel(activeRun.status)}</p>
+              {(activeRun.status === "QUEUED" ||
+                activeRun.status === "RUNNING") && (
+                <p className="mt-1 text-zinc-500">
+                  This request is saved. You can leave and return to check its
+                  status.
+                </p>
+              )}
+              {activeRun.status === "CANCELLED" && (
+                <p className="mt-1 text-zinc-500">
+                  No result was marked complete.
+                </p>
+              )}
+              {activeRun.status === "NEEDS_INPUT" && (
+                <p className="mt-1 text-zinc-500">
+                  Answer the question below so mYrA can continue.
+                </p>
+              )}
+              {activeRun.status === "AWAITING_APPROVAL" && (
+                <p className="mt-1 text-zinc-500">
+                  Nothing will change until you approve the proposed action.
+                </p>
+              )}
             </div>
             {(activeRun.status === "QUEUED" ||
               activeRun.status === "RUNNING") &&
@@ -816,6 +1482,10 @@ export default function ChatPanel({
                   Review proposed action:{" "}
                   {pendingAction.action_type.replaceAll("_", " ")}
                 </p>
+                <p className="mt-1 text-xs">
+                  Check the exact proposal below. The action will not run unless
+                  you approve it.
+                </p>
                 <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[11px]">
                   {JSON.stringify(pendingAction.arguments, null, 2)}
                 </pre>
@@ -862,9 +1532,7 @@ export default function ChatPanel({
                 }`}
               >
                 {msg.role === "ASSISTANT"
-                  ? (renderResearchDiscovery(msg) ??
-                    renderDiscovery(msg) ??
-                    renderComparison(msg) ??
+                  ? (renderResultCard(msg) ??
                     renderContent(msg.content, msg.citations))
                   : msg.content}
               </div>
@@ -898,6 +1566,24 @@ export default function ChatPanel({
               <button
                 type="button"
                 onClick={onClearSourceSelection}
+                className="shrink-0 underline"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+        {visualSelection && (
+          <div className="mb-2 flex items-start justify-between gap-2 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+            <span>
+              Selected visual crop from page {visualSelection.page_number}. It
+              will be sent to DeepSeek for figure analysis, not treated as a
+              text citation.
+            </span>
+            {onClearVisualSelection && (
+              <button
+                type="button"
+                onClick={onClearVisualSelection}
                 className="shrink-0 underline"
               >
                 Clear

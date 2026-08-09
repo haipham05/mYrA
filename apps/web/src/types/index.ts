@@ -102,6 +102,35 @@ export interface SourceSelection {
   document_sha256: string;
 }
 
+export interface VisualSelection {
+  paper_id: string;
+  page_number: number;
+  document_sha256: string;
+  crop: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+}
+
+export interface VisualSourceReference {
+  source_kind: "visual";
+  project_id: string;
+  paper_id: string;
+  document_sha256: string;
+  page_number: number;
+  crop_sha256: string;
+  crop_box_normalized_top_left: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+  caption?: string | null;
+  text_citation: false;
+}
+
 export interface EvidenceItem {
   id: string;
   paper_id: string;
@@ -143,16 +172,135 @@ export type AssistantIntent =
   | "graph"
   | "clarify";
 
-export interface AssistantRunResult {
-  result_type: string;
+export type AssistantResultType =
+  | "answer"
+  | "reading_brief"
+  | "comparison"
+  | "claim_verification"
+  | "discovery_results"
+  | "discovery_unavailable"
+  | "research_draft"
+  | "research_report"
+  | "report_evidence_unavailable"
+  | "gap_analysis"
+  | "experiment_proposal"
+  | "visual_analysis"
+  | "visual_analysis_unavailable"
+  | "translation_job"
+  | "graph_index_jobs"
+  | "graph_index_approval_required"
+  | "graph_index_approval_invalid"
+  | "graph_indexing_unavailable"
+  | "notes_list"
+  | "note"
+  | "note_not_found"
+  | "note_source_unavailable"
+  | "note_version_conflict"
+  | "note_update_rejected"
+  | "clarification"
+  | "approval_required"
+  | "approval_invalidated"
+  | "routing_unavailable"
+  | "tool_error"
+  | "action_outcome_unknown"
+  | "source_selection_unavailable"
+  | "visual_selection_required"
+  | "unavailable"
+  | "help"
+  | "comparison_scope_unavailable"
+  | "claim_scope_unavailable"
+  | "research_evidence_unavailable"
+  | "gap_analysis_evidence_unavailable"
+  | "experiment_evidence_unavailable";
+
+export interface AssistantResultPayloadMap {
+  answer: {
+    [key: string]: unknown;
+    message_id?: unknown;
+    model_name?: unknown;
+  };
+  reading_brief: {
+    [key: string]: unknown;
+    message_id?: unknown;
+    model_name?: unknown;
+    sections?: unknown;
+  };
+  comparison: Record<string, unknown>;
+  claim_verification: {
+    [key: string]: unknown;
+    claim?: unknown;
+    verdict?: unknown;
+    explanation?: unknown;
+    scope_note?: unknown;
+  };
+  discovery_results: Record<string, unknown>;
+  discovery_unavailable: Record<string, unknown>;
+  research_draft: Record<string, unknown>;
+  research_report: {
+    [key: string]: unknown;
+    report_markdown?: unknown;
+    scope?: unknown;
+    source_manifest?: unknown;
+    saved?: unknown;
+  };
+  report_evidence_unavailable: Record<string, unknown>;
+  gap_analysis: Record<string, unknown>;
+  experiment_proposal: Record<string, unknown>;
+  visual_analysis: Record<string, unknown>;
+  visual_analysis_unavailable: Record<string, unknown>;
+  translation_job: Record<string, unknown>;
+  graph_index_jobs: {
+    [key: string]: unknown;
+    project_id?: unknown;
+    paper_ids?: unknown;
+    queued_count?: unknown;
+    skipped_count?: unknown;
+    completed_count?: unknown;
+    failed_count?: unknown;
+    approval_id?: unknown;
+  };
+  graph_index_approval_required: Record<string, unknown>;
+  graph_index_approval_invalid: Record<string, unknown>;
+  graph_indexing_unavailable: Record<string, unknown>;
+  notes_list: { [key: string]: unknown; items?: unknown; total?: unknown };
+  note: { [key: string]: unknown; item?: unknown };
+  note_not_found: Record<string, unknown>;
+  note_source_unavailable: Record<string, unknown>;
+  note_version_conflict: Record<string, unknown>;
+  note_update_rejected: Record<string, unknown>;
+  clarification: { [key: string]: unknown; missing_information?: unknown };
+  approval_required: Record<string, unknown>;
+  approval_invalidated: Record<string, unknown>;
+  routing_unavailable: Record<string, unknown>;
+  tool_error: Record<string, unknown>;
+  action_outcome_unknown: Record<string, unknown>;
+  source_selection_unavailable: Record<string, unknown>;
+  visual_selection_required: Record<string, unknown>;
+  unavailable: Record<string, unknown>;
+  help: Record<string, unknown>;
+  comparison_scope_unavailable: Record<string, unknown>;
+  claim_scope_unavailable: Record<string, unknown>;
+  research_evidence_unavailable: Record<string, unknown>;
+  gap_analysis_evidence_unavailable: Record<string, unknown>;
+  experiment_evidence_unavailable: Record<string, unknown>;
+}
+
+interface AssistantRunResultBase {
   display_text: string;
-  structured_payload: Record<string, unknown>;
   citations: Citation[];
   warnings: string[];
   usage: Record<string, number | string | null>;
   available_actions: string[];
   artifact_ids: string[];
 }
+
+/** Known result tags carry a typed payload; unknown server tags are handled at runtime as text. */
+export type AssistantRunResult = {
+  [K in AssistantResultType]: AssistantRunResultBase & {
+    result_type: K;
+    structured_payload: AssistantResultPayloadMap[K];
+  };
+}[AssistantResultType];
 
 export interface AssistantRunResponse {
   id: string;

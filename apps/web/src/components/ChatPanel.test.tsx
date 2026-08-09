@@ -110,6 +110,84 @@ describe("ChatPanel", () => {
     expect(screen.getByRole("button", { name: "[1]" })).toBeInTheDocument();
   });
 
+  it("renders visual readings as interpretation, separate from text citations", () => {
+    const onVisualSourceClick = vi.fn();
+    const visualMessage: Message = {
+      id: "visual-result",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "The series rises.",
+      citations: [],
+      evidence: [],
+      assistantResult: {
+        result_type: "visual_analysis",
+        display_text: "The series rises.",
+        structured_payload: {
+          analysis: {
+            observations: [{ statement: "The blue line rises." }],
+            readings: [
+              {
+                label: "At x=2",
+                value: "about 4",
+                unit: null,
+                kind: "plot_estimate",
+              },
+            ],
+            interpretation: "The trend is upward.",
+            uncertainty_notes: ["The y-axis labels are blurred."],
+          },
+          visual_source: {
+            source_kind: "visual",
+            project_id: "project-1",
+            paper_id: "paper-123",
+            document_sha256: "a".repeat(64),
+            page_number: 4,
+            crop_sha256: "b".repeat(64),
+            crop_box_normalized_top_left: {
+              left: 0.1,
+              top: 0.2,
+              right: 0.8,
+              bottom: 0.9,
+            },
+            text_citation: false,
+          },
+          cache_status: "miss",
+          requested_model: "deepseek-flash",
+        },
+        citations: [],
+        warnings: [],
+        usage: {},
+        available_actions: [],
+        artifact_ids: [],
+      },
+      created_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[visualMessage]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        onVisualSourceClick={onVisualSourceClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText(/not a text quotation/)).toBeInTheDocument();
+    expect(screen.getByText(/estimated from plot/)).toBeInTheDocument();
+    expect(
+      screen.getByText("The y-axis labels are blurred."),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open original page 4" }),
+    );
+    expect(onVisualSourceClick).toHaveBeenCalledWith(
+      expect.objectContaining({ source_kind: "visual", paper_id: "paper-123" }),
+    );
+  });
+
   it("offers bounded discovery from a research evidence gap", async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     const message: Message = {
@@ -706,5 +784,419 @@ describe("ChatPanel", () => {
     expect(onDecideAction).toHaveBeenCalledWith("action-9", true);
     fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     expect(onDecideAction).toHaveBeenCalledWith("action-9", false);
+  });
+
+  it("renders a typed reading brief and keeps section citations interactive", () => {
+    const onCitationClick = vi.fn();
+    const message: Message = {
+      id: "reading-brief",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "Brief [1].",
+      citations: [mockCitation],
+      evidence: [],
+      assistantResult: {
+        result_type: "reading_brief",
+        display_text: "Brief [1].",
+        structured_payload: {
+          sections: [
+            {
+              title: "Method",
+              content: "The paper uses attention [1].",
+              citation_indexes: [1],
+            },
+          ],
+        },
+        citations: [mockCitation],
+        warnings: [],
+        usage: {},
+        available_actions: [],
+        artifact_ids: [],
+      },
+      created_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByRole("region", { name: "Paper reading brief" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Method")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Source [1] · page 1" }),
+    );
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
+  it("renders claim verification as a scoped verdict with source navigation", () => {
+    const onCitationClick = vi.fn();
+    const message: Message = {
+      id: "claim-verification",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "Verdict: supported [1].",
+      citations: [mockCitation],
+      evidence: [],
+      assistantResult: {
+        result_type: "claim_verification",
+        display_text: "Verdict: supported [1].",
+        structured_payload: {
+          claim: "Attention helps model dependencies.",
+          verdict: "supported",
+          explanation: "A current passage supports it.",
+          scope_note: "Limited to selected papers.",
+        },
+        citations: [mockCitation],
+        warnings: [],
+        usage: {},
+        available_actions: [],
+        artifact_ids: [],
+      },
+      created_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByRole("region", { name: "Claim verification" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Limited to selected papers/)).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Source [1] · page 1" }),
+    );
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
+  it("renders notes, reports, and graph indexing outcomes with typed cards", () => {
+    const baseMessage: Omit<Message, "assistantResult" | "id"> = {
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "Result text.",
+      citations: [],
+      evidence: [],
+      created_at: new Date().toISOString(),
+    };
+    const messages: Message[] = [
+      {
+        ...baseMessage,
+        id: "notes-list",
+        assistantResult: {
+          result_type: "notes_list",
+          display_text: "One active note.",
+          structured_payload: {
+            total: 1,
+            items: [
+              {
+                id: "note-1",
+                title: "Dataset decision",
+                content: "Use the small-data split.",
+                type: "DECISION",
+                status: "ACTIVE",
+                version: 2,
+                sources: [{ page_number: 2 }],
+              },
+            ],
+          },
+          citations: [],
+          warnings: [],
+          usage: {},
+          available_actions: [],
+          artifact_ids: [],
+        },
+      },
+      {
+        ...baseMessage,
+        id: "report",
+        citations: [mockCitation],
+        assistantResult: {
+          result_type: "research_report",
+          display_text: "Report draft.",
+          structured_payload: {
+            report_markdown: "## Findings\n\nA reported result [1].",
+            scope: "selection",
+            saved: false,
+            source_manifest: [
+              { citation_index: 1, page_number: 1, paper_title: "Paper" },
+            ],
+          },
+          citations: [mockCitation],
+          warnings: [],
+          usage: {},
+          available_actions: [],
+          artifact_ids: [],
+        },
+      },
+      {
+        ...baseMessage,
+        id: "graph-index",
+        assistantResult: {
+          result_type: "graph_index_jobs",
+          display_text: "Queued graph indexing for 1 paper.",
+          structured_payload: { queued_count: 1, skipped_count: 0 },
+          citations: [],
+          warnings: [],
+          usage: {},
+          available_actions: [],
+          artifact_ids: [],
+        },
+      },
+    ];
+    const onCitationClick = vi.fn();
+
+    render(
+      <ChatPanel
+        messages={messages}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText("Dataset decision")).toBeInTheDocument();
+    expect(screen.getByText("Use the small-data split.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Research report" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Draft report — not saved/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Paper · page 1" }));
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+    expect(
+      screen.getByRole("region", { name: "Graph indexing jobs" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Graph coverage is limited to indexed/),
+    ).toBeInTheDocument();
+  });
+
+  it("uses a safe text fallback for malformed known and unknown result types", () => {
+    const unknownResult = {
+      result_type: "future_card_type",
+      display_text: "Future result.",
+      structured_payload: { arbitrary: true },
+      citations: [mockCitation],
+      warnings: [],
+      usage: {},
+      available_actions: [],
+      artifact_ids: [],
+    } as unknown as AssistantRunResult;
+    const messages: Message[] = [
+      {
+        id: "malformed-brief",
+        conversation_id: "conv-1",
+        role: "ASSISTANT",
+        content: "Malformed card falls back [1].",
+        citations: [mockCitation],
+        evidence: [],
+        assistantResult: {
+          ...unknownResult,
+          result_type: "reading_brief",
+          structured_payload: { sections: "not-an-array" },
+        } as unknown as AssistantRunResult,
+        created_at: new Date().toISOString(),
+      },
+      {
+        id: "unknown-result",
+        conversation_id: "conv-1",
+        role: "ASSISTANT",
+        content: "Unknown card falls back [1].",
+        citations: [mockCitation],
+        evidence: [],
+        assistantResult: unknownResult,
+        created_at: new Date().toISOString(),
+      },
+    ];
+    const onCitationClick = vi.fn();
+
+    render(
+      <ChatPanel
+        messages={messages}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText(/Malformed card falls back/)).toBeInTheDocument();
+    expect(screen.getByText(/Unknown card falls back/)).toBeInTheDocument();
+    const citationButtons = screen.getAllByRole("button", { name: "[1]" });
+    fireEvent.click(citationButtons[1]);
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
+  it("labels clarification and unavailable outcomes instead of implying success", () => {
+    const message = (
+      id: string,
+      resultType: "clarification" | "graph_indexing_unavailable",
+      payload: Record<string, unknown>,
+      content: string,
+    ): Message => ({
+      id,
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content,
+      citations: [],
+      evidence: [],
+      assistantResult: {
+        result_type: resultType,
+        display_text: content,
+        structured_payload: payload,
+        citations: [],
+        warnings: [],
+        usage: {},
+        available_actions: [],
+        artifact_ids: [],
+      },
+      created_at: new Date().toISOString(),
+    });
+
+    render(
+      <ChatPanel
+        messages={[
+          message(
+            "clarify",
+            "clarification",
+            { missing_information: ["paper_scope"] },
+            "Choose a paper.",
+          ),
+          message(
+            "graph-offline",
+            "graph_indexing_unavailable",
+            {},
+            "Graph indexing is offline; ordinary research still works.",
+          ),
+        ]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByRole("region", { name: "More information needed" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Choose the paper or project scope."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Graph indexing unavailable" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/ordinary research still works/),
+    ).toBeInTheDocument();
+  });
+
+  it("explains known provider, budget, and changed-source failures without exposing payload details", () => {
+    const makeFailure = (
+      id: string,
+      resultType: AssistantRunResult["result_type"],
+      warning: string,
+    ): Message => ({
+      id,
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: "Internal detail: /srv/private/config.toml",
+      citations: [],
+      evidence: [],
+      assistantResult: {
+        result_type: resultType,
+        display_text: "Internal detail: /srv/private/config.toml",
+        structured_payload: {},
+        citations: [],
+        warnings: [warning],
+        usage: {},
+        available_actions: [],
+        artifact_ids: [],
+      } as AssistantRunResult,
+      created_at: new Date().toISOString(),
+    });
+
+    render(
+      <ChatPanel
+        messages={[
+          makeFailure(
+            "provider",
+            "visual_analysis_unavailable",
+            "PROVIDER_UNAVAILABLE",
+          ),
+          makeFailure("budget", "visual_analysis_unavailable", "BUDGET_DENIED"),
+          makeFailure(
+            "source",
+            "approval_invalidated",
+            "APPROVAL_SOURCE_CHANGED",
+          ),
+        ]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByText("Research model unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Spending limit reached")).toBeInTheDocument();
+    expect(screen.getByText("The source changed")).toBeInTheDocument();
+    expect(screen.queryByText(/private\/config\.toml/)).not.toBeInTheDocument();
+  });
+
+  it("uses plain language for saved pending runs and does not show raw stages", () => {
+    const activeRun: AssistantRunResponse = {
+      id: "run-1",
+      project_id: "project-1",
+      conversation_id: "conv-1",
+      status: "RUNNING",
+      intent: "qa",
+      action_summary: "Answer a paper question",
+      stage: "assistant.tool.qa.internal",
+      result: null,
+      safe_error: null,
+      usage: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[]}
+        isLoading={false}
+        activeRun={activeRun}
+        onSendMessage={vi.fn()}
+        onCitationClick={vi.fn()}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Research in progress",
+    );
+    expect(screen.getByText(/request is saved/i)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/assistant\.tool\.qa\.internal/),
+    ).not.toBeInTheDocument();
   });
 });

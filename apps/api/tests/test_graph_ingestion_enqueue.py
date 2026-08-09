@@ -147,11 +147,8 @@ def env(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_successful_ingestion_graphrag_enabled_enqueues_event(env):
-    """Test 1: Successful paper ingestion with graphrag_enabled=True atomically marks paper
-    READY and enqueues exactly one PENDING GraphEvent with action='UPSERT' and a non-empty
-    generation_id.
-    """
+async def test_successful_ingestion_does_not_implicitly_enqueue_graph_even_when_enabled(env):
+    """Graph availability does not opt ordinary paper ingestion into paid extraction."""
     db, storage, _ = env
     proj = create_project(db, ProjectCreate(name="Graph Enqueue Proj 1"))
     pdf_sha = hashlib.sha256(TINY_PDF_BYTES).hexdigest()
@@ -171,21 +168,8 @@ async def test_successful_ingestion_graphrag_enabled_enqueues_event(env):
     assert paper.status == PaperStatus.READY
     assert job.status == JobStatus.COMPLETED
 
-    events = get_active_graph_events_for_paper(db, paper.id)
-    assert len(events) == 1
-    event = events[0]
-
-    assert event.status == "PENDING"
-    assert event.action == "UPSERT"
-    assert event.project_id == proj.id
-    assert event.paper_id == paper.id
-    assert event.generation_id is not None
-    assert len(event.generation_id) > 0
-    assert event.generation_id.startswith(f"gen_{paper.id.hex[:8]}_")
-    assert event.attempts == 0
-    assert event.max_attempts == 3
-    assert event.ontology_version == "1.0.0"
-    assert event.extractor_version == "1.0.0"
+    assert get_active_graph_events_for_paper(db, paper.id) == []
+    assert db.query(GraphEvent).filter(GraphEvent.paper_id == paper.id).count() == 0
 
 
 @pytest.mark.anyio
@@ -222,10 +206,8 @@ async def test_ingestion_telemetry_records_stage_counts_without_document_text(en
 
 
 @pytest.mark.anyio
-async def test_successful_ingestion_graphrag_disabled_enqueues_zero_events(env):
-    """Test 2: Successful paper ingestion with graphrag_enabled=False marks paper
-    READY and enqueues zero GraphEvents.
-    """
+async def test_successful_ingestion_without_graph_configuration_enqueues_zero_events(env):
+    """The default graph-disabled path also completes normal ingestion unchanged."""
     db, storage, _ = env
     proj = create_project(db, ProjectCreate(name="Graph Disabled Proj"))
     pdf_sha = hashlib.sha256(TINY_PDF_BYTES).hexdigest()
@@ -299,10 +281,8 @@ async def test_ingestion_failure_rollback_leaves_no_graph_event(env):
 
 
 @pytest.mark.anyio
-async def test_reindexing_paper_yields_new_unique_generation_id(env):
-    """Test 4: Reindexing a paper (second ingestion run) yields a new unique generation_id
-    for the paper.
-    """
+async def test_reindexing_paper_does_not_schedule_graph_extraction(env):
+    """Reindexing updates the corpus without implicitly scheduling graph extraction."""
     db, storage, _ = env
     proj = create_project(db, ProjectCreate(name="Reindex Proj"))
     pdf_sha = hashlib.sha256(TINY_PDF_BYTES).hexdigest()
@@ -321,10 +301,7 @@ async def test_reindexing_paper_yields_new_unique_generation_id(env):
     assert paper.status == PaperStatus.READY
     assert read_corpus_revision(db, proj.id) == 1
 
-    events_1 = db.query(GraphEvent).filter(GraphEvent.paper_id == paper.id).all()
-    assert len(events_1) == 1
-    gen_id_1 = events_1[0].generation_id
-    assert gen_id_1.startswith(f"gen_{paper.id.hex[:8]}_")
+    assert db.query(GraphEvent).filter(GraphEvent.paper_id == paper.id).count() == 0
 
     # 2. Second ingestion run (reindex)
     job2 = create_job(db, paper.id)
@@ -333,18 +310,7 @@ async def test_reindexing_paper_yields_new_unique_generation_id(env):
     assert paper.status == PaperStatus.READY
     assert read_corpus_revision(db, proj.id) == 2
 
-    events_2 = (
-        db.query(GraphEvent)
-        .filter(GraphEvent.paper_id == paper.id)
-        .order_by(GraphEvent.created_at.asc())
-        .all()
-    )
-    assert len(events_2) == 2
-    gen_id_2 = events_2[1].generation_id
-    assert gen_id_2.startswith(f"gen_{paper.id.hex[:8]}_")
-
-    # The second ingestion run MUST yield a distinct generation_id
-    assert gen_id_1 != gen_id_2
+    assert db.query(GraphEvent).filter(GraphEvent.paper_id == paper.id).count() == 0
 
 
 @pytest.mark.anyio
@@ -385,7 +351,7 @@ async def test_upload_and_ingestion_with_neo4j_offline_or_unconfigured(env):
         mock_driver.assert_not_called()
         mock_repo.assert_not_called()
 
-        # 4. Verify paper is READY and GraphEvent is enqueued in PostgreSQL
+        # 4. Verify paper is READY and graph extraction was not implicitly enqueued
         paper = db.get(Paper, paper_id)
         assert paper is not None
         assert paper.status == PaperStatus.READY
@@ -395,9 +361,8 @@ async def test_upload_and_ingestion_with_neo4j_offline_or_unconfigured(env):
         assert job.status == JobStatus.COMPLETED
 
         events = get_active_graph_events_for_paper(db, paper.id)
-        assert len(events) == 1
-        assert events[0].status == "PENDING"
-        assert events[0].action == "UPSERT"
+        assert events == []
+        assert db.query(GraphEvent).filter(GraphEvent.paper_id == paper.id).count() == 0
 
 
 def test_crud_graph_event_operations(env):

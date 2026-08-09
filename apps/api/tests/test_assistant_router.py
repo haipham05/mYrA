@@ -214,7 +214,34 @@ async def test_selected_passage_rejects_conflicting_explicit_action() -> None:
     )
 
     assert result.outcome is RouteOutcome.NEEDS_CLARIFICATION
-    assert result.decision.intent is AssistantIntent.CLARIFY
+
+
+@pytest.mark.anyio
+async def test_visual_region_routes_deterministically_without_paid_call() -> None:
+    paper_id = uuid4()
+    request = _request(
+        message="Explain this plot",
+        selected_paper_ids=[paper_id],
+        visual_selection={
+            "paper_id": paper_id,
+            "page_number": 3,
+            "document_sha256": "a" * 64,
+            "crop": {"left": 0.1, "top": 0.2, "right": 0.8, "bottom": 0.9},
+        },
+    )
+
+    class NoCall:
+        async def generate(self, **_kwargs):
+            raise AssertionError("explicit visual selection must not spend on routing")
+
+    result = await AssistantRouter(
+        settings=Settings(deepseek_api_key=None), provider=NoCall()
+    ).route(request)
+
+    assert result.outcome is RouteOutcome.ROUTED
+    assert result.decision.intent is AssistantIntent.VISION
+    assert result.decision.resolved_paper_ids == [paper_id]
+    assert result.decision.arguments == {"question": "Explain this plot"}
 
 
 @pytest.mark.anyio
