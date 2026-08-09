@@ -1,5 +1,5 @@
-# Opt-in, independent PDF translation worker. It reuses the current API image
-# and mounted application code, but installs translation libraries in a
+# Opt-in, independent local PDF translation worker. It reuses the current API
+# image and mounted application code, but installs translation libraries in a
 # separate virtual environment in the translation-worker image.
 services:
   translation-worker:
@@ -11,17 +11,19 @@ services:
         BASE_API_IMAGE: myra-api:latest
     restart: unless-stopped
     env_file:
+      - path: .local/runtime/local-app.env
+        required: true
       - path: .local/observability/app.env
         required: true
     environment:
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be configured in the existing environment}
-      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
-      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-}
-      GOOGLE_APPLICATION_CREDENTIALS: /root/.config/gcloud/application_default_credentials.json
+      MYRA_RUNTIME_PROFILE: local
       MYRA_OBSERVABILITY_ENABLED: "true"
       MYRA_TRANSLATION_TEST_RUN: ${MYRA_TRANSLATION_TEST_RUN:-false}
       LANGFUSE_BASE_URL: http://langfuse-web:3000
       MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
+    depends_on:
+      myra-local-postgres:
+        condition: service_healthy
     volumes:
       - type: bind
         source: ./apps/api/app
@@ -42,8 +44,7 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: ${HOME}/.config/gcloud
-        target: /root/.config/gcloud
-        read_only: true
+        source: ./.local/runtime/files
+        target: /app/data
         bind:
           create_host_path: false

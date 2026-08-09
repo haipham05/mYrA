@@ -142,6 +142,35 @@ def test_protocol_rejects_completion_with_untranslated_segments() -> None:
         _safe_event(event)
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "PROVIDER_REJECTED",
+        "PROVIDER_INVALID_RESPONSE",
+        "PROVIDER_INVALID_SCHEMA",
+        "PROVIDER_INVALID_JSON",
+        "PROVIDER_INVALID_OUTPUT",
+        "PROVIDER_MISSING_ITEM",
+        "PROVIDER_MARKER_MISMATCH",
+        "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_UNAVAILABLE",
+    ],
+)
+def test_protocol_preserves_safe_provider_error_classification(code: str) -> None:
+    with pytest.raises(TranslationEngineError, match=code) as exc_info:
+        _safe_event({"type": "error", "code": code})
+
+    assert exc_info.value.code == code
+
+
+def test_protocol_sanitizes_unknown_provider_error_classification() -> None:
+    with pytest.raises(TranslationEngineError, match="ENGINE_FAILURE") as exc_info:
+        _safe_event({"type": "error", "code": "private text from a provider response"})
+
+    assert exc_info.value.code == "ENGINE_FAILURE"
+
+
 def test_protocol_keeps_failure_causes_bounded_and_sanitized() -> None:
     event = {
         "type": "segment_summary",
@@ -173,6 +202,112 @@ def test_protocol_keeps_failure_causes_bounded_and_sanitized() -> None:
     event["failure_units"][0]["failure_reason"] = "raw quote must not cross the protocol"
     with pytest.raises(TranslationEngineError, match="ENGINE_PROTOCOL_ERROR"):
         _safe_event(event)
+
+
+def test_protocol_accepts_split_footnote_preservation_reason() -> None:
+    event = {
+        "type": "segment_summary",
+        "total": 3,
+        "completed": 0,
+        "skipped": 3,
+        "failed": 0,
+        "skip_reasons": {"preserved_split_footnote_layout_content": 3},
+    }
+
+    assert _safe_event(event)["skip_reasons"] == {"preserved_split_footnote_layout_content": 3}
+
+
+def test_checkpoint_recorder_preserves_only_contiguous_split_footnotes() -> None:
+    fragments = [
+        _paragraph("5We used values of 2.8, 3.", "footnote-1"),
+        _paragraph("7, 6.0 and 9.5 TFLOPS for K80, K40, M40 and P100", "footnote-2"),
+        _paragraph(", respectively.", "footnote-3"),
+    ]
+    fragments[0].layout_label = "text"
+    fragments[1].layout_label = "text"
+    fragments[2].layout_label = "text"
+    next_order = 100
+    for index, paragraph in enumerate(fragments):
+        characters = []
+        for char in paragraph.unicode:
+            if char.isspace():
+                characters.append(SimpleNamespace(render_order=None, char_unicode=char))
+            else:
+                characters.append(SimpleNamespace(render_order=next_order, char_unicode=char))
+                next_order += 1
+        if index == 0:
+            paragraph.pdf_paragraph_composition = [
+                SimpleNamespace(pdf_formula=SimpleNamespace(pdf_character=characters[:1])),
+                SimpleNamespace(
+                    pdf_same_style_characters=SimpleNamespace(pdf_character=characters[1:])
+                ),
+            ]
+        else:
+            paragraph.pdf_paragraph_composition = [
+                SimpleNamespace(pdf_line=SimpleNamespace(pdf_character=characters))
+            ]
+
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(SimpleNamespace(page=[SimpleNamespace(page_number=7, pdf_paragraph=fragments)]))
+
+    for paragraph in fragments:
+        assert recorder.get(paragraph)["preserve_reason"] == (
+            "preserved_split_footnote_layout_content"
+        )
+        recorder.note_preprocessed(paragraph, None)
+
+    assert recorder.finish() == {"total": 3, "completed": 0, "skipped": 3, "failed": 0}
+    assert recorder.skip_reasons() == {"preserved_split_footnote_layout_content": 3}
+
+
+@pytest.mark.parametrize(
+    "break_order",
+    ["gap", "unknown_composition", "different_page", "no_sentence_end"],
+)
+def test_checkpoint_recorder_does_not_group_ambiguous_footnote_fragments(
+    break_order: str,
+) -> None:
+    first = _paragraph("1This is a footnote fragment ending", "footnote-1")
+    second_text = " with more text" if break_order == "no_sentence_end" else " with more text."
+    second = _paragraph(second_text, "footnote-2")
+    first.layout_label = second.layout_label = "text"
+
+    def set_characters(paragraph: SimpleNamespace, start: int) -> None:
+        paragraph.pdf_paragraph_composition = [
+            SimpleNamespace(
+                pdf_line=SimpleNamespace(
+                    pdf_character=[
+                        SimpleNamespace(render_order=order)
+                        for order in range(start, start + len(paragraph.unicode))
+                    ]
+                )
+            )
+        ]
+
+    set_characters(first, 10)
+    second_start = 10 + len(first.unicode) + (1 if break_order == "gap" else 0)
+    set_characters(second, second_start)
+    if break_order == "unknown_composition":
+        second.pdf_paragraph_composition = [SimpleNamespace(unrecognized=True)]
+    pages = [SimpleNamespace(page_number=1, pdf_paragraph=[first, second])]
+    if break_order == "different_page":
+        pages = [
+            SimpleNamespace(page_number=1, pdf_paragraph=[first]),
+            SimpleNamespace(page_number=2, pdf_paragraph=[second]),
+        ]
+
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(SimpleNamespace(page=pages))
+
+    assert all("preserve_reason" not in recorder.get(p) for p in (first, second))
 
 
 def test_protocol_keeps_only_safe_failure_unit_metadata() -> None:
@@ -423,7 +558,25 @@ def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
         "A selected prose unit without a validated result.", "uncheckpointed"
     )
     uncheckpointed.pdf_paragraph_composition = [SimpleNamespace(pdf_line=True)]
-    paragraphs = [prose, equation, numeric, declined, uncheckpointed]
+    split_footnote = [
+        _paragraph("5We used values of 2.8, 3.", "footnote-1"),
+        _paragraph("7, 6.0 and 9.5 TFLOPS for K80, K40, M40 and P100", "footnote-2"),
+        _paragraph(", respectively.", "footnote-3"),
+    ]
+    split_footnote[0].layout_label = "fallback_line"
+    split_footnote[1].layout_label = "abandon"
+    split_footnote[2].layout_label = "fallback_line"
+    next_order = 100
+    for paragraph in split_footnote:
+        characters = [
+            SimpleNamespace(render_order=order)
+            for order in range(next_order, next_order + len(paragraph.unicode))
+        ]
+        paragraph.pdf_paragraph_composition = [
+            SimpleNamespace(pdf_line=SimpleNamespace(pdf_character=characters))
+        ]
+        next_order += len(characters)
+    paragraphs = [prose, equation, numeric, declined, uncheckpointed, *split_footnote]
     docs = SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=paragraphs)])
     translations = {id(prose): "Phương pháp đề xuất giảm chi phí chú ý."}
     events: list[dict] = []
@@ -504,7 +657,7 @@ def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
         counts = recorder.finish()
         recorder.emit_summary()
 
-    assert counts == {"total": 5, "completed": 1, "skipped": 2, "failed": 2}
+    assert counts == {"total": 8, "completed": 1, "skipped": 5, "failed": 2}
     assert counts["total"] == counts["completed"] + counts["skipped"] + counts["failed"]
     assert recorder.get(prose)["status"] == "completed"
     assert recorder.get(equation)["skip_reason"] == "protected_scientific_content"
@@ -512,6 +665,8 @@ def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
     assert recorder.get(declined)["failure_reason"] == "no_composition"
     assert recorder.get(declined)["preprocess_decline_reason"] == "no_composition"
     assert recorder.get(uncheckpointed)["failure_reason"] == "missing_validated_checkpoint"
+    assert all(recorder.get(p)["status"] == "skipped" for p in split_footnote)
+    assert "5We used values of 2.8, 3." in [p.unicode for p in split_footnote]
     assert [event["type"] for event in events] == ["checkpoint", "segment_summary"]
 
     checkpoint, summary = events
@@ -520,6 +675,7 @@ def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
     assert summary["skip_reasons"] == {
         "protected_scientific_content": 1,
         "numeric_or_symbol_only": 1,
+        "preserved_split_footnote_layout_content": 3,
     }
     assert summary["failure_causes"] == {
         "no_composition": 1,
@@ -964,11 +1120,45 @@ def test_llm_adapter_retries_unchanged_prose_once_and_preserves_glossary_placeho
     )
 
     assert len(request_texts) == 2
-    assert "previous output left these prose items in English" in request_texts[1]
+    assert request_texts[1].startswith("instructions\n\n## Here is the input:\n\n")
+    assert "previous output left these prose items in English" not in request_texts[1]
     assert "first_occurrence_glossary_terms" in request_texts[1]
     assert translated == "Mô hình attention (chú ý) {v1} cải thiện kết quả trong thực tiễn."
     assert record["status"] == "completed"
     assert recorder.finish()["completed"] == 1
+
+
+def test_llm_adapter_locks_scientific_identifiers_and_numbers_for_translation() -> None:
+    source = "PosUnk and Deep-Att reached 2.8, 3.1 BLEU on K80."
+    response = (
+        "[[MYRA_KEEP_0]] và [[MYRA_KEEP_1]] đạt [[MYRA_KEEP_2]], "
+        "[[MYRA_KEEP_3]] [[MYRA_KEEP_4]] trên [[MYRA_KEEP_5]]."
+    )
+    translated, request_texts, _, _ = _translate_batch_with_responses(source, [response])
+
+    assert translated == "PosUnk và Deep-Att đạt 2.8, 3.1 BLEU trên K80."
+    assert len(request_texts) == 1
+    for source_token in ("PosUnk", "Deep-Att", "2.8", "3.1", "BLEU", "K80"):
+        assert source_token not in request_texts[0]
+
+
+def test_llm_adapter_rejects_missing_or_reordered_scientific_tokens() -> None:
+    source = "The model scored 2.8 then 3.1 BLEU."
+    response = "Mô hình đạt [[MYRA_KEEP_1]] rồi [[MYRA_KEEP_0]] [[MYRA_KEEP_2]]."
+
+    with pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_SCIENTIFIC_TOKEN_MISMATCH"):
+        _translate_batch_with_responses(source, [response])
+
+
+def test_scientific_token_locking_preserves_repeated_values_and_existing_markers() -> None:
+    source = "Result 2.8, then 2.8 again; cite {v1} and 2.8."
+    protected, replacements = engine_runner._lock_scientific_tokens(source)
+
+    assert tuple(replacements.values()) == ("2.8", "2.8", "2.8")
+    assert "{v1}" in protected
+    assert (
+        engine_runner._restore_scientific_tokens(protected, replacements, source=source) == source
+    )
 
 
 def test_llm_adapter_bounds_unchanged_prose_retry_and_keeps_failure_untranslated() -> None:
@@ -1057,13 +1247,71 @@ def test_llm_single_paragraph_fallback_keeps_provider_prompt_and_classifies_mark
     monkeypatch.setattr(translator, "_request", fake_request)
     with (
         recorder.paragraph_scope(paragraph),
-        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_UNAVAILABLE"),
+        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_MARKER_MISMATCH"),
     ):
         translator.llm_translate(fallback_prompt)
 
     assert requests == [fallback_prompt]
-    assert translator.failure_code == "PROVIDER_UNAVAILABLE"
-    assert record["status"] == "pending"
+    assert translator.failure_code == "PROVIDER_MARKER_MISMATCH"
+    assert record["status"] == "invalid"
+    assert record["failure_reason"] == "protected_placeholder_mismatch"
+
+
+def test_llm_batch_marker_mismatch_identifies_only_the_failed_unit(monkeypatch) -> None:
+    source = "The result contains {v1} and remains protected."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=4, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    item = {"id": 0, "input": source, "layout_label": "text"}
+    monkeypatch.setattr(
+        translator,
+        "_request",
+        lambda _text: json.dumps([{"id": 0, "output": "Kết quả được bảo vệ."}]),
+    )
+
+    with (
+        recorder.batch_scope(),
+        recorder.paragraph_scope(paragraph),
+        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_MARKER_MISMATCH"),
+    ):
+        recorder.note_preprocessed(paragraph, source)
+        translator.llm_translate(prefix + json.dumps([item]))
+
+    assert record["status"] == "invalid"
+    assert record["failure_reason"] == "protected_placeholder_mismatch"
+    assert recorder.failure_units() == [
+        {
+            "page_number": 4,
+            "ordinal": 0,
+            "status": "invalid",
+            "failure_reason": "protected_placeholder_mismatch",
+            "source_chars": len(source),
+            "layout_label": "text",
+        }
+    ]
+    summary = {
+        "type": "segment_summary",
+        **recorder.finish(),
+        "failure_reasons": recorder.failure_reasons(),
+        "failure_causes": recorder.failure_causes(),
+        "skip_reasons": recorder.skip_reasons(),
+        "failure_units": recorder.failure_units(),
+    }
+    parsed_summary = _safe_event(summary)
+    assert parsed_summary["failed"] == 1
+    assert parsed_summary["failure_causes"] == {"protected_placeholder_mismatch": 1}
 
 
 def test_llm_batch_malformed_provider_json_sets_safe_failure_code(monkeypatch) -> None:
@@ -1090,12 +1338,12 @@ def test_llm_batch_malformed_provider_json_sets_safe_failure_code(monkeypatch) -
     with (
         recorder.batch_scope(),
         recorder.paragraph_scope(paragraph),
-        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_UNAVAILABLE"),
+        pytest.raises(engine_runner.SafeEngineError, match="PROVIDER_INVALID_JSON"),
     ):
         recorder.note_preprocessed(paragraph, source)
         translator.llm_translate(prefix + json.dumps([item]))
 
-    assert translator.failure_code == "PROVIDER_UNAVAILABLE"
+    assert translator.failure_code == "PROVIDER_INVALID_JSON"
     assert record["status"] == "pending"
 
 
@@ -1109,6 +1357,153 @@ def test_llm_adapter_keeps_normal_batch_response_on_single_request() -> None:
     assert translated == "该模型在此任务中提高了实际效果。"
     assert record["status"] == "completed"
     assert recorder.finish()["completed"] == 1
+
+
+def test_llm_adapter_retries_only_items_that_lose_protected_markers() -> None:
+    source_with_marker = "The value <b1> matters."
+    source_plain = "The model improves the result."
+    paragraphs = [_paragraph(source_with_marker, "p-1"), _paragraph(source_plain, "p-2")]
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=paragraphs)]))
+    records = [recorder.get(paragraph) for paragraph in paragraphs]
+    assert all(record is not None for record in records)
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, translated_items: list[dict[str, object]]) -> None:
+            self.content = json.dumps(translated_items, ensure_ascii=False)
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"content": self.content}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            self.responses = [
+                FakeResponse(
+                    [
+                        {"id": 0, "output": "Giá trị quan trọng."},
+                        {"id": 1, "output": "Mô hình cải thiện kết quả."},
+                    ]
+                ),
+                FakeResponse([{"id": 0, "output": "Giá trị rất quan trọng."}]),
+                FakeResponse([{"id": 0, "output": "Giá trị <b1> vẫn quan trọng."}]),
+            ]
+
+        def post(self, _url: str, **kwargs) -> FakeResponse:
+            prompt = kwargs["json"]["text"]
+            self.prompts.append(prompt)
+            return self.responses.pop(0)
+
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    items = [
+        {"id": 0, "input": source_with_marker, "layout_label": "text"},
+        {"id": 1, "input": source_plain, "layout_label": "text"},
+    ]
+    client = FakeClient()
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    translator.client.close()
+    translator.client = client
+
+    with recorder.batch_scope():
+        recorder.note_preprocessed(paragraphs[0], source_with_marker)
+        recorder.note_preprocessed(paragraphs[1], source_plain)
+        result = json.loads(translator.llm_translate(prefix + json.dumps(items)))
+
+    assert [item["output"] for item in result] == [
+        "Giá trị <b1> vẫn quan trọng.",
+        "Mô hình cải thiện kết quả.",
+    ]
+    assert len(client.prompts) == 3
+    for retry_prompt in client.prompts[1:]:
+        assert retry_prompt.startswith(prefix)
+        assert '"id": 0' in retry_prompt
+        assert '"id": 1' not in retry_prompt
+
+
+def test_llm_adapter_caps_marker_and_unchanged_retries_at_three_total_requests() -> None:
+    source = "The value <b1> matters."
+    translated, requests, record, _ = _translate_batch_with_responses(
+        source,
+        ["Giá trị quan trọng.", "Giá trị vẫn quan trọng.", source],
+    )
+
+    assert translated == source
+    assert len(requests) == 3
+    assert record["status"] in {"completed", "unchanged_prose"}
+
+
+def test_llm_adapter_splits_malformed_multi_item_response() -> None:
+    paragraphs = [
+        _paragraph("First source sentence.", "p-1"),
+        _paragraph("Second sentence.", "p-2"),
+    ]
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=paragraphs)]))
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"content": self.content}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            self.responses = [
+                FakeResponse("not valid JSON"),
+                FakeResponse(json.dumps([{"id": 0, "output": "Câu thứ nhất."}])),
+                FakeResponse(json.dumps([{"id": 1, "output": "Câu thứ hai."}])),
+            ]
+
+        def post(self, _url: str, **kwargs) -> FakeResponse:
+            self.prompts.append(kwargs["json"]["text"])
+            return self.responses.pop(0)
+
+    items = [
+        {"id": 0, "input": "First source sentence.", "layout_label": "text"},
+        {"id": 1, "input": "Second sentence.", "layout_label": "text"},
+    ]
+    client = FakeClient()
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    translator.client.close()
+    translator.client = client
+
+    with recorder.batch_scope():
+        recorder.note_preprocessed(paragraphs[0], items[0]["input"])
+        recorder.note_preprocessed(paragraphs[1], items[1]["input"])
+        result = json.loads(
+            translator.llm_translate(
+                "instructions\n\n## Here is the input:\n\n" + json.dumps(items)
+            )
+        )
+
+    assert [item["output"] for item in result] == ["Câu thứ nhất.", "Câu thứ hai."]
+    assert len(client.prompts) == 3
+    assert '"id": 0' in client.prompts[1] and '"id": 1' not in client.prompts[1]
+    assert '"id": 1' in client.prompts[2] and '"id": 0' not in client.prompts[2]
 
 
 def test_siliconflow_transport_retries_at_most_three_times(monkeypatch) -> None:
@@ -1181,6 +1576,80 @@ def test_siliconflow_failure_is_classified_after_three_attempts(monkeypatch) -> 
     assert exc_info.value.code == "PROVIDER_RATE_LIMITED"
     assert "private paper text" not in str(exc_info.value)
     assert fake.calls == 3
+
+
+def test_siliconflow_invalid_response_is_distinguished_from_outage(monkeypatch) -> None:
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            raise ValueError("private response body")
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            self.calls = 0
+
+        def post(self, *args, **kwargs) -> FakeResponse:
+            self.calls += 1
+            return FakeResponse()
+
+    fake = FakeClient()
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: fake)
+    monkeypatch.setattr(engine_runner.time, "sleep", lambda delay: None)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+
+    with pytest.raises(engine_runner.SafeEngineError) as exc_info:
+        translator._request("private paper text")
+
+    assert exc_info.value.code == "PROVIDER_INVALID_RESPONSE"
+    assert translator.failure_code == "PROVIDER_INVALID_RESPONSE"
+    assert "private response body" not in str(exc_info.value)
+    assert fake.calls == 3
+
+
+def test_siliconflow_rejected_request_is_not_retried_or_exposed(monkeypatch) -> None:
+    class FakeResponse:
+        status_code = 400
+
+        def raise_for_status(self) -> None:
+            raise AssertionError("permanent client errors are classified before this call")
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            self.calls = 0
+
+        def post(self, *args, **kwargs) -> FakeResponse:
+            self.calls += 1
+            return FakeResponse()
+
+    fake = FakeClient()
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: fake)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+
+    with pytest.raises(engine_runner.SafeEngineError) as exc_info:
+        translator._request("private paper text")
+
+    assert exc_info.value.code == "PROVIDER_REJECTED"
+    assert translator.failure_code == "PROVIDER_REJECTED"
+    assert "private paper text" not in str(exc_info.value)
+    assert fake.calls == 1
 
 
 def test_subprocess_emits_progress_and_checkpoint_without_stderr(tmp_path: Path) -> None:

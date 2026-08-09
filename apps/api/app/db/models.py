@@ -686,7 +686,7 @@ class TranslationDocument(Base):
     engine_version: Mapped[str] = mapped_column(String(50), default="2.9.0", nullable=False)
     babeldoc_version: Mapped[str] = mapped_column(String(50), default="0.6.2", nullable=False)
     provider_policy_version: Mapped[str] = mapped_column(
-        String(50), default="siliconflowfree-v1", nullable=False
+        String(50), default="siliconflowfree-v2", nullable=False
     )
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     attempt_token: Mapped[str | None] = mapped_column(String(64), nullable=True)

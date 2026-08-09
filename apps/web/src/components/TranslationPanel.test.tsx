@@ -127,6 +127,12 @@ describe("TranslationPanel", () => {
           {
             id: "translation-2",
             status: "COMPLETED",
+            completed_units: 2,
+            total_units: 8,
+            skipped_units: 6,
+            warnings: [
+              "6 of 8 detected text sections were preserved or skipped rather than translated. Review the PDF for completeness.",
+            ],
             segments: [
               {
                 ordinal: 0,
@@ -165,6 +171,11 @@ describe("TranslationPanel", () => {
       "href",
       "http://127.0.0.1:8000/api/v1/translations/translation-2/pdf?project_id=project-1",
     );
+    expect(
+      screen.getByText(
+        "6 of 8 detected text sections were preserved or skipped rather than translated. Review the PDF for completeness.",
+      ),
+    ).toBeInTheDocument();
     expect(completedFetch).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole("button", { name: "Preview PDF" }));
     expect(

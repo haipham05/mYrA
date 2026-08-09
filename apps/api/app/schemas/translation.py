@@ -55,6 +55,8 @@ class TranslationResponse(BaseModel):
     source_page_count: int | None
     completed_units: int
     total_units: int | None
+    skipped_units: int = 0
+    warnings: list[str] = Field(default_factory=list)
     output_sha256: str | None
     output_available: bool
     error_code: str | None

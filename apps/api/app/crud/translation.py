@@ -12,6 +12,15 @@ from app.db.models import (
     TranslationSegment,
 )
 
+_RETRYABLE_TRANSLATION_ERROR_CODES = {
+    "ENGINE_DEADLINE_EXCEEDED",
+    "ENGINE_INCOMPLETE",
+    "PROVIDER_MARKER_MISMATCH",
+    "PROVIDER_RATE_LIMITED",
+    "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",
+    "PROVIDER_UNAVAILABLE",
+}
+
 
 class TranslationConflict(ValueError):
     pass
@@ -138,7 +147,10 @@ def cancel_translation(db: Session, translation: TranslationDocument) -> Transla
 
 
 def retry_translation(db: Session, translation: TranslationDocument) -> TranslationDocument:
-    if translation.status != "FAILED" or not translation.is_retryable:
+    retryable = translation.is_retryable or translation.error_code in (
+        _RETRYABLE_TRANSLATION_ERROR_CODES
+    )
+    if translation.status != "FAILED" or not retryable:
         raise TranslationConflict("This translation is not in a retryable failed state")
     paper = db.get(Paper, translation.paper_id)
     if not paper or paper.project_id != translation.project_id:

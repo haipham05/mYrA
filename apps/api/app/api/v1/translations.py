@@ -35,6 +35,17 @@ router = APIRouter(tags=["translations"])
 
 
 def _response(translation, *, include_segments: bool = True) -> TranslationResponse:
+    skipped_units = (
+        max(translation.total_units - translation.completed_units, 0)
+        if translation.status == "COMPLETED" and translation.total_units is not None
+        else 0
+    )
+    warnings = []
+    if skipped_units:
+        warnings.append(
+            f"{skipped_units} of {translation.total_units} detected text sections were "
+            "preserved or skipped rather than translated. Review the PDF for completeness."
+        )
     return TranslationResponse(
         id=translation.id,
         project_id=translation.project_id,
@@ -46,6 +57,8 @@ def _response(translation, *, include_segments: bool = True) -> TranslationRespo
         source_page_count=translation.source_page_count,
         completed_units=translation.completed_units,
         total_units=translation.total_units,
+        skipped_units=skipped_units,
+        warnings=warnings,
         output_sha256=translation.output_sha256,
         output_available=bool(translation.output_storage_path),
         error_code=translation.error_code,
@@ -98,7 +111,7 @@ def submit_translation(
         metadata={
             "test_run": test_run,
             "language_pair": "en-vi",
-            "provider_policy": "siliconflowfree-v1",
+            "provider_policy": "siliconflowfree-v2",
         },
     ) as observation:
         try:

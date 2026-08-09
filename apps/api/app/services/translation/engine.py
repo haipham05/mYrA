@@ -166,6 +166,7 @@ def _safe_event(value: Any) -> dict[str, Any]:
                 "author_contact_metadata",
                 "preserved_fallback_layout_content",
                 "preserved_short_layout_label",
+                "preserved_split_footnote_layout_content",
             }
             and isinstance(count, int)
             and count >= 0
@@ -213,6 +214,14 @@ def _safe_event(value: Any) -> dict[str, Any]:
             "ENGINE_VERSION_MISMATCH",
             "LAYOUT_MODEL_UNAVAILABLE",
             "FONT_ASSETS_UNAVAILABLE",
+            "PROVIDER_REJECTED",
+            "PROVIDER_INVALID_RESPONSE",
+            "PROVIDER_INVALID_SCHEMA",
+            "PROVIDER_INVALID_JSON",
+            "PROVIDER_INVALID_OUTPUT",
+            "PROVIDER_MISSING_ITEM",
+            "PROVIDER_MARKER_MISMATCH",
+            "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",
             "PROVIDER_RATE_LIMITED",
             "PROVIDER_UNAVAILABLE",
             "ENGINE_INCOMPLETE",

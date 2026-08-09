@@ -17,7 +17,11 @@ from app.db.base import Base
 from app.db.models import Paper, Project, TranslationDocument, TranslationSegment
 from app.observability.telemetry import TelemetryAdapter, TelemetryConfig
 from app.services.translation.engine import TranslationEngineError
-from app.services.translation.processor import BabelDocTranslationProcessor
+from app.services.translation.processor import (
+    BabelDocTranslationProcessor,
+    _translation_text_is_present,
+    _translation_tokens,
+)
 from app.storage.local import MemoryStorage
 from app.translation_worker import TranslationJob, TranslationProcessingError
 
@@ -232,7 +236,18 @@ def test_processor_reports_render_duration_only_when_engine_reports_render_progr
     assert all(str(tmp_path) not in str(value) for value in output.values())
 
 
-def test_render_telemetry_failure_does_not_mask_engine_failure(database, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("failure_code", "retryable"),
+    [
+        ("PROVIDER_UNAVAILABLE", True),
+        ("PROVIDER_MARKER_MISMATCH", True),
+        ("PROVIDER_SCIENTIFIC_TOKEN_MISMATCH", True),
+        ("ENGINE_PROTOCOL_ERROR", False),
+    ],
+)
+def test_render_telemetry_failure_does_not_mask_engine_failure(
+    database, tmp_path, monkeypatch, failure_code, retryable
+):
     source = FIXTURE_PDF.read_bytes()
     job = _create_processing_job(database, source)
     storage = MemoryStorage()
@@ -249,7 +264,7 @@ def test_render_telemetry_failure_does_not_mask_engine_failure(database, tmp_pat
         async def run(self, _request, *, on_progress, on_checkpoint):
             del on_checkpoint
             await on_progress({"stage": "rendering"})
-            raise TranslationEngineError("PROVIDER_UNAVAILABLE")
+            raise TranslationEngineError(failure_code)
 
     telemetry = FailingTelemetry()
     monkeypatch.setattr("app.services.translation.processor.get_telemetry", lambda: telemetry)
@@ -263,8 +278,8 @@ def test_render_telemetry_failure_does_not_mask_engine_failure(database, tmp_pat
     with pytest.raises(TranslationProcessingError) as error:
         asyncio.run(processor.process(job, on_progress=lambda *_args, **_kwargs: None))
 
-    assert error.value.code == "PROVIDER_UNAVAILABLE"
-    assert error.value.retryable is True
+    assert error.value.code == failure_code
+    assert error.value.retryable is retryable
 
 
 def test_restarted_processor_loads_only_integrity_checked_checkpoints(database):
@@ -432,6 +447,83 @@ def test_processor_rejects_changed_checkpoint_mislabeled_as_preserved_title(data
                 "layout_label": "title",
             },
         )
+
+
+def test_pdf_validation_matches_translation_after_stripping_layout_markers(database, tmp_path):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    output_text = " ".join((PdfReader(FIXTURE_PDF).pages[0].extract_text() or "").split())
+    visible_text = output_text[:100]
+    translated_text = f"{visible_text[:35]}<b1>{visible_text[35:]}</b1>"
+    translated_hash = hashlib.sha256(translated_text.encode()).hexdigest()
+    with database() as db:
+        db.add(
+            TranslationSegment(
+                translation_id=job.id,
+                engine_checkpoint_key=hashlib.sha256(b"marker-checkpoint").hexdigest(),
+                ordinal=0,
+                source_page_number=1,
+                source_text_hash=hashlib.sha256(b"source sentence").hexdigest(),
+                source_quote="source sentence",
+                translated_text=translated_text,
+                translated_text_hash=translated_hash,
+                status="VALIDATED",
+            )
+        )
+        db.commit()
+    output_pdf = tmp_path / "rendered.pdf"
+    shutil.copyfile(FIXTURE_PDF, output_pdf)
+
+    validated_pdf, source_map = asyncio.run(
+        BabelDocTranslationProcessor(session_factory=database)._validate_pdf(output_pdf, job)
+    )
+
+    assert validated_pdf == source
+    assert source_map[0]["translated_text_hash"] == translated_hash
+
+
+def test_pdf_validation_still_rejects_absent_translation(database, tmp_path):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    translated_text = "A completely unrelated translated paragraph that is not in this PDF."
+    with database() as db:
+        db.add(
+            TranslationSegment(
+                translation_id=job.id,
+                engine_checkpoint_key=hashlib.sha256(b"absent-checkpoint").hexdigest(),
+                ordinal=0,
+                source_page_number=1,
+                source_text_hash=hashlib.sha256(b"source sentence").hexdigest(),
+                source_quote="source sentence",
+                translated_text=translated_text,
+                translated_text_hash=hashlib.sha256(translated_text.encode()).hexdigest(),
+                status="VALIDATED",
+            )
+        )
+        db.commit()
+    output_pdf = tmp_path / "rendered.pdf"
+    shutil.copyfile(FIXTURE_PDF, output_pdf)
+
+    with pytest.raises(TranslationProcessingError, match="OUTPUT_TRANSLATION_NOT_FOUND"):
+        asyncio.run(
+            BabelDocTranslationProcessor(session_factory=database)._validate_pdf(output_pdf, job)
+        )
+
+
+def test_translation_presence_requires_a_bounded_window_on_one_page():
+    expected = "alpha beta gamma delta epsilon zeta"
+    scattered = ["alpha", *(["noise"] * 12), "beta", *(["noise"] * 12), "gamma"]
+    scattered.extend(["delta", *(["noise"] * 12), "epsilon"])
+
+    assert not _translation_text_is_present(expected, [scattered, ["zeta"]])
+    assert _translation_text_is_present(
+        expected,
+        [["alpha", "noise", "beta", "gamma", "delta", "epsilon", "noise", "zeta"]],
+    )
+
+
+def test_translation_tokens_join_words_split_by_layout_markers():
+    assert _translation_tokens("translated<b1>paragraph</b1>") == ["translatedparagraph"]
 
 
 def test_processor_withholds_unchanged_checkpoint_until_document_finishes(database, tmp_path):

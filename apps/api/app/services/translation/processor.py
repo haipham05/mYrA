@@ -32,6 +32,9 @@ from app.translation_worker import (
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LAYOUT_MARKER = re.compile(
+    r"\{v\d+\}|\{[A-Za-z][\w.-]*\}|%[sd]|\[\[.*?\]\]|%%.*?%%|</?style\b[^>]*>|</?b\d+>"
+)
 _ENGINE_PYTHON = "/opt/myra-translation/.venv/bin/python"
 _ENGINE_RUNNER = "/app/app/services/translation/engine_runner.py"
 logger = logging.getLogger("myra.translation.processor")
@@ -62,6 +65,32 @@ def _safe_filename(filename: str) -> str:
 
 def _normalize_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _translation_tokens(value: str) -> list[str]:
+    without_layout_markers = _LAYOUT_MARKER.sub("", value)
+    return re.findall(r"\w+", unicodedata.normalize("NFKC", without_layout_markers).casefold())
+
+
+def _translation_text_is_present(translated_text: str, output_pages: list[list[str]]) -> bool:
+    expected = _translation_tokens(translated_text)
+    if not expected:
+        return False
+    required = (len(expected) * 4 + 4) // 5
+    max_window = max(required + 8, required * 2)
+    for page_tokens in output_pages:
+        for start, token in enumerate(page_tokens):
+            if token != expected[0]:
+                continue
+            matched = 1
+            for candidate in page_tokens[start + 1 : start + max_window]:
+                if candidate == expected[matched]:
+                    matched += 1
+                    if matched >= required:
+                        return True
+                    if matched == len(expected):
+                        return True
+    return False
 
 
 class BabelDocTranslationProcessor:
@@ -204,8 +233,8 @@ class BabelDocTranslationProcessor:
             reader = PdfReader(io.BytesIO(data), strict=True)
             if not reader.pages:
                 raise ValueError("PDF has no pages")
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            if not text.strip():
+            page_tokens = [_translation_tokens(page.extract_text() or "") for page in reader.pages]
+            if not any(page_tokens):
                 raise ValueError("PDF has no selectable text")
         except Exception as exc:
             raise TranslationProcessingError(
@@ -226,14 +255,15 @@ class BabelDocTranslationProcessor:
                 ).all()
             )
         translated_rows = [row for row in rows if row.status == "VALIDATED"]
-        normalized_pdf_text = _normalize_text(text)
         meaningful_rows = [
-            row for row in translated_rows if len(_normalize_text(row.translated_text)) >= 24
+            row
+            for row in translated_rows
+            if len(_normalize_text(_LAYOUT_MARKER.sub("", row.translated_text))) >= 24
         ]
         matched_rows = [
             row
             for row in meaningful_rows
-            if _normalize_text(row.translated_text) in normalized_pdf_text
+            if _translation_text_is_present(row.translated_text, page_tokens)
         ]
         minimum_matches = max(1, (len(meaningful_rows) * 3 + 4) // 5)
         if not meaningful_rows or len(matched_rows) < minimum_matches:
@@ -437,7 +467,7 @@ class BabelDocTranslationProcessor:
                     translation_id=str(job.id),
                     engine_version="2.9.0",
                     babeldoc_version="0.6.2",
-                    provider_policy="siliconflowfree-v1",
+                    provider_policy="siliconflowfree-v2",
                     documented_model="THUDM/GLM-4-9B-0414",
                     provider_reported_model=None,
                     provider_usage=None,
@@ -461,7 +491,9 @@ class BabelDocTranslationProcessor:
                         "Translation provider or engine did not complete this request.",
                         retryable=exc.code
                         in {
+                            "PROVIDER_MARKER_MISMATCH",
                             "PROVIDER_RATE_LIMITED",
+                            "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",
                             "PROVIDER_UNAVAILABLE",
                             "ENGINE_DEADLINE_EXCEEDED",
                             "ENGINE_INCOMPLETE",

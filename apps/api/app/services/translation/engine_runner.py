@@ -23,7 +23,7 @@ PDF2ZH_VERSION = "2.9.0"
 BABELDOC_VERSION = "0.6.2"
 TRANSLATION_LANG_IN = "English"
 TRANSLATION_LANG_OUT = "Vietnamese"
-TRANSLATION_POLICY_VERSION = "siliconflowfree-v1"
+TRANSLATION_POLICY_VERSION = "siliconflowfree-v2"
 _PREPROCESS_DECLINE_CAUSES = frozenset(
     {
         "vertical_paragraph",
@@ -43,11 +43,56 @@ _ACTIVE_RECORDER: TranslationCheckpointRecorder | None = None
 _PROTECTED_TOKEN = re.compile(
     r"\{v\d+\}|\{[A-Za-z][\w.-]*\}|%[sd]|\[\[.*?\]\]|%%.*?%%|</?style\b[^>]*>|</?b\d+>"
 )
+_SCIENTIFIC_TOKEN = re.compile(
+    r"(?<![\w])(?:"
+    r"[A-Z][a-z]+[A-Z][A-Za-z0-9]*|"  # CamelCase model and architecture names
+    r"[A-Z][a-z]+(?:-[A-Z][a-z]+)+|"  # Hyphenated architecture names
+    r"[A-Z]{2,}(?:-[A-Z0-9]+)*|"  # Acronyms and benchmark names
+    r"[A-Za-z][A-Za-z0-9-]*\d+[A-Za-z0-9-]*|"  # Alphanumeric model identifiers
+    r"\d+(?:[.,]\d+)*(?:\s?%|[A-Za-z]{1,5})?"  # Measurements, values, and citations
+    r")(?![\w])"
+)
+_FOOTNOTE_PROSE_START = re.compile(r"^\s*\d{1,2}\s*(?:we|this|it|our|see|note|source)\b", re.I)
 
 
 def _checkpoint_base_key(identity: dict[str, Any]) -> str:
     identity_wire = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(identity_wire.encode()).hexdigest()
+
+
+def _paragraph_render_order_span(paragraph: Any) -> tuple[int, int] | None:
+    """Return a span only when source characters form one exact reading-order run."""
+    characters = []
+    for composition in getattr(paragraph, "pdf_paragraph_composition", None) or []:
+        if line := getattr(composition, "pdf_line", None):
+            characters.extend(getattr(line, "pdf_character", None) or [])
+        elif character := getattr(composition, "pdf_character", None):
+            characters.append(character)
+        elif formula := getattr(composition, "pdf_formula", None):
+            formula_characters = getattr(formula, "pdf_character", None) or []
+            if not formula_characters:
+                return None
+            characters.extend(formula_characters)
+        elif same_style := getattr(composition, "pdf_same_style_characters", None):
+            characters.extend(getattr(same_style, "pdf_character", None) or [])
+        else:
+            return None
+    orders = []
+    for character in characters:
+        order = getattr(character, "render_order", None)
+        if order is None:
+            char_unicode = getattr(character, "char_unicode", None)
+            if isinstance(char_unicode, str) and char_unicode.isspace():
+                continue
+            return None
+        orders.append(order)
+    if (
+        not orders
+        or any(not isinstance(order, int) or isinstance(order, bool) for order in orders)
+        or orders != list(range(orders[0], orders[0] + len(orders)))
+    ):
+        return None
+    return orders[0], orders[-1]
 
 
 class SafeEngineError(Exception):
@@ -124,7 +169,9 @@ class TranslationCheckpointRecorder:
         for page_index, page in enumerate(docs.page, start=1):
             page_number = page.page_number or page_index
             offset = 0
-            for page_ordinal, paragraph in enumerate(page.pdf_paragraph):
+            page_records: list[dict[str, Any]] = []
+            page_paragraphs = list(page.pdf_paragraph)
+            for page_ordinal, paragraph in enumerate(page_paragraphs):
                 quote = paragraph.unicode or ""
                 record = {
                     "page_number": int(page_number),
@@ -160,8 +207,58 @@ class TranslationCheckpointRecorder:
                 }
                 record["base_key"] = _checkpoint_base_key(identity)
                 self.records[id(paragraph)] = record
+                page_records.append(record)
                 offset += len(quote) + 1
                 global_ordinal += 1
+            self._mark_split_footnotes(page_records, page_paragraphs)
+
+    @staticmethod
+    def _mark_split_footnotes(records: list[dict[str, Any]], paragraphs: list[Any]) -> None:
+        spans = [_paragraph_render_order_span(paragraph) for paragraph in paragraphs]
+        for start, record in enumerate(records):
+            first_text = record["source_quote"]
+            if not _FOOTNOTE_PROSE_START.match(first_text) or spans[start] is None:
+                continue
+
+            group = [start]
+            combined = first_text
+            while len(group) < 4:
+                previous_index = group[-1]
+                next_index = previous_index + 1
+                if next_index >= len(records):
+                    break
+                previous = records[previous_index]
+                following = records[next_index]
+                previous_span = spans[previous_index]
+                following_span = spans[next_index]
+                if (
+                    following["page_number"] != record["page_number"]
+                    or following["page_ordinal"] != previous["page_ordinal"] + 1
+                    or previous_span is None
+                    or following_span is None
+                    or following_span[0] != previous_span[1] + 1
+                ):
+                    break
+
+                next_text = following["source_quote"]
+                decimal_continuation = bool(
+                    re.search(r"\d\.$", combined) and re.match(r"^\d", next_text)
+                )
+                if re.search(r"[.!?][\"')\]]*$", combined) and not decimal_continuation:
+                    break
+                group.append(next_index)
+                combined += next_text
+                if len(combined) > 512:
+                    group = []
+                    break
+
+                if re.search(r"[.!?][\"')\]]*$", combined):
+                    if len(group) > 1:
+                        for index in group:
+                            records[index]["preserve_reason"] = (
+                                "preserved_split_footnote_layout_content"
+                            )
+                    break
 
     def get(self, paragraph: Any) -> dict[str, Any] | None:
         return self.records.get(id(paragraph))
@@ -274,6 +371,12 @@ class TranslationCheckpointRecorder:
                 }
             )
 
+    def invalidate(self, record: dict[str, Any], reason: str) -> None:
+        if record["status"] not in {"invalid", "unchanged_prose", "oversized", "untranslated"}:
+            self.failed += 1
+        record["status"] = "invalid"
+        record["failure_reason"] = reason
+
     def finish(self) -> dict[str, Any]:
         for record in self.records.values():
             if record["status"] == "pending":
@@ -305,6 +408,8 @@ class TranslationCheckpointRecorder:
         source = record["source_quote"]
         normalized = source.strip()
         label = str(record.get("layout_label") or "").casefold()
+        if record.get("preserve_reason") == "preserved_split_footnote_layout_content":
+            return record["preserve_reason"]
         if not normalized:
             return "empty"
         if len(normalized) < 5:
@@ -400,6 +505,50 @@ class TranslationCheckpointRecorder:
 
 def _protected_tokens(text: str) -> tuple[str, ...]:
     return tuple(_PROTECTED_TOKEN.findall(text))
+
+
+def _lock_scientific_tokens(text: str) -> tuple[str, dict[str, str]]:
+    """Temporarily protect compact identifiers and numeric values during translation."""
+    existing = [match.span() for match in _PROTECTED_TOKEN.finditer(text)]
+    replacements: dict[str, str] = {}
+    pieces: list[str] = []
+    cursor = 0
+    token_index = 0
+    for match in _SCIENTIFIC_TOKEN.finditer(text):
+        start, end = match.span()
+        if any(
+            start < protected_end and end > protected_start
+            for protected_start, protected_end in existing
+        ):
+            continue
+        placeholder = f"[[MYRA_KEEP_{token_index}]]"
+        while placeholder in text or placeholder in replacements:
+            token_index += 1
+            placeholder = f"[[MYRA_KEEP_{token_index}]]"
+        pieces.extend((text[cursor:start], placeholder))
+        replacements[placeholder] = match.group(0)
+        cursor = end
+        token_index += 1
+    if not replacements:
+        return text, replacements
+    pieces.append(text[cursor:])
+    return "".join(pieces), replacements
+
+
+def _restore_scientific_tokens(text: str, replacements: dict[str, str], *, source: str) -> str:
+    if not replacements:
+        return text
+    if text == source:
+        return text
+    expected = tuple(replacements)
+    found = tuple(_PROTECTED_TOKEN.findall(text))
+    locked = tuple(token for token in found if token in replacements)
+    if locked != expected:
+        raise SafeEngineError("PROVIDER_SCIENTIFIC_TOKEN_MISMATCH")
+    restored = text
+    for placeholder, source_token in replacements.items():
+        restored = restored.replace(placeholder, source_token, 1)
+    return restored
 
 
 def _classify_preprocess_decline(
@@ -589,7 +738,7 @@ def _clean_model_json(value: str) -> list[dict[str, Any]]:
     if isinstance(parsed, dict):
         parsed = [parsed]
     if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
-        raise SafeEngineError("PROVIDER_UNAVAILABLE")
+        raise SafeEngineError("PROVIDER_INVALID_SCHEMA")
     return parsed
 
 
@@ -739,9 +888,14 @@ class SiliconFlowFreeTranslator:
     def __str__(self) -> str:
         return f"{self.name} {self.lang_in} {self.lang_out}"
 
-    def _provider_error(self) -> SafeEngineError:
-        self.failure_code = "PROVIDER_UNAVAILABLE"
+    def _provider_error(self, code: str = "PROVIDER_INVALID_OUTPUT") -> SafeEngineError:
+        self.failure_code = code
         return SafeEngineError(self.failure_code)
+
+    def _marker_error(self, record: dict[str, Any] | None) -> SafeEngineError:
+        if record is not None:
+            self.recorder.invalidate(record, "protected_placeholder_mismatch")
+        return self._provider_error("PROVIDER_MARKER_MISMATCH")
 
     def translate(self, text: str, ignore_cache: bool = False, rate_limit_params=None) -> str:
         del ignore_cache, rate_limit_params
@@ -755,7 +909,7 @@ class SiliconFlowFreeTranslator:
         result = self._request(text)
         if record:
             if _protected_tokens(text) != _protected_tokens(result):
-                raise self._provider_error()
+                raise self._marker_error(record)
             record["context_hash"] = hashlib.sha256(text.encode()).hexdigest()
             result = _apply_first_occurrence_terms(result, record.get("first_occurrence_terms", []))
         return result
@@ -778,11 +932,12 @@ class SiliconFlowFreeTranslator:
                 record["context_hash"] = context_hash
                 result = self._request(text)
                 if source and _protected_tokens(source) != _protected_tokens(result):
-                    raise self._provider_error()
+                    raise self._marker_error(record)
                 return result
             return self._request(text)
 
         prefix, suffix, items = parsed
+        record_by_id = {item.get("id"): records[index] for index, item in enumerate(items)}
         prepared: dict[int, tuple[dict[str, Any], str]] = {}
         misses: list[dict[str, Any]] = []
         for index, item in enumerate(items):
@@ -804,17 +959,31 @@ class SiliconFlowFreeTranslator:
 
         provider_results: dict[Any, str] = {}
         if misses:
+            isolated_ids: set[Any] = set()
+            provider_attempts: dict[Any, int] = {}
 
-            def request_batch(
-                batch: list[dict[str, Any]], *, retry_unchanged: bool = False
-            ) -> dict[Any, str]:
+            def translate_individually(batch: list[dict[str, Any]]) -> dict[Any, str]:
+                recovered: dict[Any, str] = {}
+                for item in batch:
+                    isolated_ids.add(item.get("id"))
+                    recovered.update(request_batch([item]))
+                return recovered
+
+            def request_batch(batch: list[dict[str, Any]]) -> dict[Any, str]:
+                for item in batch:
+                    item_id = item.get("id")
+                    provider_attempts[item_id] = provider_attempts.get(item_id, 0) + 1
+                locked_tokens: dict[Any, dict[str, str]] = {}
+                original_inputs: dict[Any, str] = {}
+                provider_batch: list[dict[str, Any]] = []
+                for item in batch:
+                    provider_item = dict(item)
+                    protected_input, replacements = _lock_scientific_tokens(item["input"])
+                    provider_item["input"] = protected_input
+                    provider_batch.append(provider_item)
+                    locked_tokens[item.get("id")] = replacements
+                    original_inputs[item.get("id")] = item["input"]
                 provider_text = prefix
-                if retry_unchanged:
-                    provider_text += (
-                        "The previous output left these prose items in English. Translate each "
-                        "item into Vietnamese now. Preserve every protected placeholder exactly. "
-                        "Return only the requested JSON items.\n\n"
-                    )
                 if any(item.get("first_occurrence_glossary_terms") for item in batch):
                     provider_text += (
                         "For an item with first_occurrence_glossary_terms, include the "
@@ -822,33 +991,64 @@ class SiliconFlowFreeTranslator:
                         "followed by its preferred Vietnamese form in parentheses at its first "
                         "document occurrence. Use Vietnamese only for later occurrences.\n\n"
                     )
-                provider_text += json.dumps(batch, ensure_ascii=False, indent=2)
+                provider_text += json.dumps(provider_batch, ensure_ascii=False, indent=2)
                 if suffix:
                     provider_text += suffix
                 try:
                     results = _clean_model_json(self._request(provider_text))
                 except SafeEngineError as exc:
+                    if exc.code == "PROVIDER_INVALID_SCHEMA" and len(batch) > 1:
+                        return translate_individually(batch)
                     self.failure_code = exc.code
                     raise
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    raise self._provider_error() from exc
+                    if len(batch) > 1:
+                        return translate_individually(batch)
+                    raise self._provider_error("PROVIDER_INVALID_JSON") from exc
                 parsed_results: dict[Any, str] = {}
                 for result in results:
                     result_id = result.get("id")
                     output = result.get("output")
-                    if not isinstance(output, str):
-                        raise self._provider_error()
-                    parsed_results[result_id] = output
+                    if result_id is None or not isinstance(output, str):
+                        raise self._provider_error("PROVIDER_INVALID_SCHEMA")
+                    try:
+                        parsed_results[result_id] = _restore_scientific_tokens(
+                            output,
+                            locked_tokens.get(result_id, {}),
+                            source=original_inputs.get(result_id, ""),
+                        )
+                    except SafeEngineError as exc:
+                        self.failure_code = exc.code
+                        raise
                 return parsed_results
 
             provider_results = request_batch(misses)
+            invalid_items = []
+            for item in misses:
+                if item.get("id") in isolated_ids:
+                    continue
+                output = provider_results.get(item.get("id"))
+                if output is None or _protected_tokens(item["input"]) != _protected_tokens(output):
+                    invalid_items.append(item)
+            for item in invalid_items:
+                # Batch responses can lose layout placeholders. Retry only that
+                # item, with at most three total attempts including the batch.
+                while provider_attempts.get(item.get("id"), 0) < 3:
+                    isolated_ids.add(item.get("id"))
+                    provider_results.update(request_batch([item]))
+                    translated = provider_results.get(item.get("id"))
+                    if translated and _protected_tokens(item["input"]) == _protected_tokens(
+                        translated
+                    ):
+                        break
+
             unchanged_items: list[dict[str, Any]] = []
             for item in misses:
                 output = provider_results.get(item.get("id"))
                 if output is None:
-                    raise self._provider_error()
+                    raise self._provider_error("PROVIDER_MISSING_ITEM")
                 if _protected_tokens(item["input"]) != _protected_tokens(output):
-                    raise self._provider_error()
+                    raise self._marker_error(record_by_id.get(item.get("id")))
                 layout_label = item.get("layout_label")
                 unchanged = _is_unchanged_english_prose(
                     item["input"], output, layout_label=layout_label
@@ -858,7 +1058,13 @@ class SiliconFlowFreeTranslator:
                     unchanged_items.append(item)
 
             if unchanged_items:
-                provider_results.update(request_batch(unchanged_items, retry_unchanged=True))
+                # Reuse BabelDOC's exact prompt wrapper. The free proxy rejects
+                # additional natural-language instructions as an unsupported prompt.
+                retries_left = [
+                    item for item in unchanged_items if provider_attempts.get(item.get("id"), 0) < 3
+                ]
+                if retries_left:
+                    provider_results.update(request_batch(retries_left))
 
         combined: list[dict[str, Any]] = []
         for index, item in enumerate(items):
@@ -868,9 +1074,9 @@ class SiliconFlowFreeTranslator:
                 result_id = item.get("id")
                 translated = provider_results.get(result_id)
                 if translated is None:
-                    raise SafeEngineError("PROVIDER_UNAVAILABLE")
+                    raise self._provider_error("PROVIDER_MISSING_ITEM")
             if _protected_tokens(item["input"]) != _protected_tokens(translated):
-                raise self._provider_error()
+                raise self._marker_error(records[index])
             translated = _apply_first_occurrence_terms(
                 translated, records[index].get("first_occurrence_terms", [])
             )
@@ -914,15 +1120,23 @@ class SiliconFlowFreeTranslator:
                     )
                     if response.status_code == 429:
                         last_error = SafeEngineError("PROVIDER_RATE_LIMITED")
+                    elif 400 <= response.status_code < 500:
+                        # A rejected request is not made more valid by repeating
+                        # the same paper text. Keep the status category only; the
+                        # response body may echo sensitive document content.
+                        self.failure_code = "PROVIDER_REJECTED"
+                        raise SafeEngineError(self.failure_code)
                     else:
                         response.raise_for_status()
                         data = response.json()
                         content = data.get("content") if isinstance(data, dict) else None
                         if isinstance(content, str) and content:
                             return content
-                        last_error = SafeEngineError("PROVIDER_UNAVAILABLE")
-                except (httpx.HTTPError, ValueError):
+                        last_error = SafeEngineError("PROVIDER_INVALID_RESPONSE")
+                except httpx.HTTPError:
                     last_error = SafeEngineError("PROVIDER_UNAVAILABLE")
+                except ValueError:
+                    last_error = SafeEngineError("PROVIDER_INVALID_RESPONSE")
             if attempt < 2:
                 time.sleep(0.5 * (2**attempt))
         self.failure_code = (last_error or SafeEngineError("PROVIDER_UNAVAILABLE")).code
@@ -1140,9 +1354,12 @@ def _checkpoint_hooks(
         return result
 
     def pre_translate(self, paragraph, tracker, page_font_map=None, xobj_font_map=None):
+        record = recorder.get(paragraph)
+        if record and record.get("preserve_reason"):
+            recorder.note_preprocessed(paragraph, None)
+            return None, None
         result = original_pre(self, paragraph, tracker, page_font_map, xobj_font_map)
         if isinstance(result, tuple) and len(result) == 2:
-            record = recorder.get(paragraph)
             if record and result[0] is None and not record.get("preprocess_decline_reason"):
                 reason = _classify_preprocess_decline(
                     paragraph,
@@ -1163,7 +1380,8 @@ def _checkpoint_hooks(
             )
         source = record.get("preprocessed_input") if record else None
         if source is not None and _protected_tokens(source) != _protected_tokens(translated_text):
-            raise SafeEngineError("PROVIDER_UNAVAILABLE")
+            recorder.invalidate(record, "protected_placeholder_mismatch")
+            raise SafeEngineError("PROVIDER_MARKER_MISMATCH")
         result = original_post(self, paragraph, tracker, translate_input, translated_text)
         if record:
             recorder.complete(record, translated_text)

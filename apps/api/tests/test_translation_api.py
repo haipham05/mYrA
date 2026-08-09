@@ -1,4 +1,7 @@
+import asyncio
+import hashlib
 from contextlib import contextmanager
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +13,8 @@ from app.db.base import Base
 from app.db.models import Paper, PaperPage, Project, TranslationDocument
 from app.db.session import get_db
 from app.main import app
+from app.storage.local import LocalStorage
+from app.translation_worker import TranslationJob, TranslationResult, TranslationWorker
 
 
 @pytest.fixture
@@ -71,7 +76,7 @@ def test_translation_requires_external_disclosure_and_project_ready_paper(transl
 
 
 def test_translation_request_is_idempotent_and_project_scoped(translation_client):
-    client, project_id, paper_id, foreign_project_id, _ = translation_client
+    client, project_id, paper_id, foreign_project_id, session_factory = translation_client
     payload = {
         "project_id": str(project_id),
         "acknowledge_external_processing": True,
@@ -83,6 +88,10 @@ def test_translation_request_is_idempotent_and_project_scoped(translation_client
     assert second.status_code == 200
     assert first.json()["id"] == second.json()["id"]
     assert first.json()["source_sha256"] == "a" * 64
+    with session_factory() as db:
+        saved = db.get(TranslationDocument, UUID(first.json()["id"]))
+        assert saved is not None
+        assert saved.provider_policy_version == "siliconflowfree-v2"
 
     assert (
         client.get(
@@ -95,6 +104,42 @@ def test_translation_request_is_idempotent_and_project_scoped(translation_client
     )
     assert listed.status_code == 200
     assert len(listed.json()["items"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_status"),
+    [
+        ("PROVIDER_MARKER_MISMATCH", 200),
+        ("PROVIDER_SCIENTIFIC_TOKEN_MISMATCH", 200),
+        ("UNRECOGNIZED_FAILURE", 409),
+    ],
+)
+def test_retry_accepts_legacy_transient_marker_failures(
+    translation_client, error_code, expected_status
+):
+    client, project_id, paper_id, _, session_factory = translation_client
+    created = client.post(
+        f"/api/v1/papers/{paper_id}/translations",
+        json={
+            "project_id": str(project_id),
+            "acknowledge_external_processing": True,
+            "idempotency_key": f"retry-{error_code}",
+        },
+    )
+    translation_id = UUID(created.json()["id"])
+    with session_factory() as db:
+        translation = db.get(TranslationDocument, translation_id)
+        translation.status = "FAILED"
+        translation.error_code = error_code
+        translation.is_retryable = False
+        db.commit()
+
+    response = client.post(
+        f"/api/v1/translations/{translation_id}/retry", params={"project_id": project_id}
+    )
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json()["status"] == "PENDING"
 
 
 def test_translation_request_marks_deliberate_live_validation(translation_client, monkeypatch):
@@ -122,11 +167,42 @@ def test_translation_request_marks_deliberate_live_validation(translation_client
     assert response.status_code == 202
     assert observations[0]["name"] == "translation.request"
     assert observations[0]["metadata"]["test_run"] is True
+    assert observations[0]["metadata"]["provider_policy"] == "siliconflowfree-v2"
     assert observations[0]["input"] == {
         "project_id": str(project_id),
         "paper_id": str(paper_id),
     }
     assert observations[0]["update"]["output"]["outcome"] == "created"
+
+
+def test_completed_partial_translation_reports_skipped_sections(translation_client):
+    client, project_id, paper_id, _, session_factory = translation_client
+    created = client.post(
+        f"/api/v1/papers/{paper_id}/translations",
+        json={
+            "project_id": str(project_id),
+            "acknowledge_external_processing": True,
+            "idempotency_key": "partial-completion-warning",
+        },
+    )
+    translation_id = UUID(created.json()["id"])
+    with session_factory() as db:
+        translation = db.get(TranslationDocument, translation_id)
+        translation.status = "COMPLETED"
+        translation.completed_units = 3
+        translation.total_units = 8
+        db.commit()
+
+    response = client.get(
+        f"/api/v1/translations/{translation_id}", params={"project_id": project_id}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["skipped_units"] == 5
+    assert response.json()["warnings"] == [
+        "5 of 8 detected text sections were preserved or skipped rather than translated. "
+        "Review the PDF for completeness."
+    ]
 
 
 def test_translation_checkpoints_are_idempotent_and_attempt_fenced(translation_client):
@@ -263,6 +339,55 @@ def test_translation_pdf_supports_inline_preview_and_project_scope(translation_c
     assert preview.headers["content-disposition"].startswith("inline;")
     assert 'paper".pdf' not in download.headers["content-disposition"]
     assert foreign.status_code == 404
+
+
+def test_local_translation_queue_worker_storage_and_download(
+    translation_client, monkeypatch, tmp_path
+):
+    client, project_id, paper_id, _, session_factory = translation_client
+    submitted = client.post(
+        f"/api/v1/papers/{paper_id}/translations",
+        json={
+            "project_id": str(project_id),
+            "acknowledge_external_processing": True,
+            "idempotency_key": "local-worker-download",
+        },
+    )
+    assert submitted.status_code == 202
+    translation_id = submitted.json()["id"]
+    storage = LocalStorage(str(tmp_path / "storage"))
+    artifact = b"%PDF-1.4\nlocal translated test artifact\n%%EOF\n"
+
+    class LocalArtifactProcessor:
+        async def process(self, job: TranslationJob, *, on_progress) -> TranslationResult:
+            key = f"translations/{job.id}/result.pdf"
+            await storage.put(key, artifact)
+            on_progress("render", completed_units=1, total_units=1)
+            return TranslationResult(
+                output_storage_path=key,
+                output_sha256=hashlib.sha256(artifact).hexdigest(),
+                source_map=[],
+            )
+
+    monkeypatch.setattr("app.api.v1.translations.get_storage", lambda: storage)
+    worker = TranslationWorker(
+        LocalArtifactProcessor(), session_factory=session_factory, worker_id="local-test-worker"
+    )
+    assert asyncio.run(worker.process_one()) is True
+
+    status = client.get(f"/api/v1/translations/{translation_id}", params={"project_id": project_id})
+    assert status.status_code == 200
+    assert status.json()["status"] == "COMPLETED"
+    assert status.json()["output_sha256"] == hashlib.sha256(artifact).hexdigest()
+    downloaded = client.get(
+        f"/api/v1/translations/{translation_id}/pdf", params={"project_id": project_id}
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == artifact
+    with session_factory() as db:
+        paper = db.get(Paper, paper_id)
+        assert paper.status == "READY"
+        assert paper.document_sha256 == "a" * 64
 
 
 def test_migration_adds_translation_tables_and_rolls_forward(tmp_path):
