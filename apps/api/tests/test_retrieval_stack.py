@@ -25,6 +25,7 @@ from app.services.retrieval import (
     BGERerankerProvider,
     HybridRetriever,
     SimpleLexicalReranker,
+    _parent_context_window,
     cosine_similarity,
     get_reranker,
     set_reranker,
@@ -41,6 +42,42 @@ def test_cosine_similarity():
 
     assert cosine_similarity([], [1.0]) == 0.0
     assert cosine_similarity([0.0, 0.0], [0.0, 0.0]) == 0.0
+
+
+def test_parent_context_window_keeps_context_around_verbatim_child():
+    child = "The head outputs are concatenated and projected."
+    parent = f"{'preceding source. ' * 250}{child}{'following source. ' * 250}"
+
+    result = _parent_context_window(parent, child)
+
+    assert len(result) == retrieval_module._PARENT_CONTEXT_WINDOW_CHARS
+    assert child in result
+    assert "preceding source." in result
+    assert "following source." in result
+    assert result != parent[: retrieval_module._PARENT_CONTEXT_WINDOW_CHARS]
+
+
+def test_parent_context_window_preserves_short_matching_parent_and_safe_fallbacks():
+    short_parent = "short source context"
+    long_parent = "prefix " * 500
+    repeated_parent = f"{'prefix ' * 250}same child{'middle ' * 250}same child{'suffix ' * 250}"
+    short_repeated_parent = "same child, then same child"
+
+    assert _parent_context_window(short_parent, "short") == short_parent
+    assert _parent_context_window("short unrelated parent", "missing child") == "missing child"
+    assert _parent_context_window(short_repeated_parent, "same child") == "same child"
+    assert _parent_context_window(long_parent, "missing child") == "missing child"
+    assert _parent_context_window(repeated_parent, "same child") == "same child"
+
+
+def test_parent_context_window_bounds_a_child_larger_than_the_window():
+    child = "exact child text " * 300
+    parent = f"before {child} after"
+
+    result = _parent_context_window(parent, child)
+
+    assert len(result) == retrieval_module._PARENT_CONTEXT_WINDOW_CHARS
+    assert result in parent
 
 
 def test_retrieve_forwards_shared_query_embedding(monkeypatch):
@@ -181,6 +218,7 @@ def test_reranking_cache_uses_model_and_ordered_content_hashes(monkeypatch):
     assert miss_observation.metadata["cache_status"] == "miss"
     assert hit_observation.metadata["cache_status"] == "hit"
     assert reranker.calls == 1
+    assert '"policy":"child-parent-context-v2"' in cache.keys[0]
 
     retrieval_module._rerank_with_cache("private query", list(reversed(docs)), reranker)
     reranker.model_version = "rev-2"
@@ -634,6 +672,19 @@ def test_retriever_project_isolation(monkeypatch):
     db.add(chunk1)
     db.flush()
     db.add(ChunkElement(chunk_id=chunk1.id, element_id=elem1.id, order_index=0))
+    parent1 = PaperChunk(
+        paper_id=paper1.id,
+        chunk_type="parent",
+        chunk_index=0,
+        text=(
+            "Section context about the paper's output operation. "
+            + ("Additional background paragraph. " * 30)
+            + f"{chunk1.text} Nearby explanation."
+        ),
+    )
+    db.add(parent1)
+    db.flush()
+    db.add(ChunkElement(chunk_id=parent1.id, element_id=elem1.id, order_index=0))
 
     # Create paper in Project 2
     paper2 = create_paper(db, project_id=p2.id, filename="p2.pdf", storage_path="p2.pdf")
@@ -718,6 +769,13 @@ def test_retriever_project_isolation(monkeypatch):
     assert reranking["input"]["question"] == "quantum computing"
     assert reranking["output"]["candidates"]
     assert reranking["output"]["candidates"][0]["score"]["metric"] == "reranker_score"
+    ranked_input = next(
+        item for item in reranking["input"]["candidates"] if item["chunk_id"] == str(chunk1.id)
+    )
+    assert ranked_input["parent_context_included"] is True
+    assert "Section context" in ranked_input["parent_context_prefix"]
+    assert ev1[0].quote == chunk1.text
+    assert ev1[0].parent_context.startswith("Section context")
 
     # Query Project 2 for "quantum" -> should find no results or only project 2 items
     ev2 = retriever.retrieve(db, project_id=p2.id, query="quantum computing")

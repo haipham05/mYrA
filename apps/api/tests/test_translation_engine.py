@@ -981,6 +981,44 @@ def test_checkpoint_recorder_skips_short_abandoned_layout_fragment() -> None:
     assert recorder.skip_reasons() == {"below_engine_minimum": 1}
 
 
+def test_checkpoint_recorder_rejects_unchanged_english_sentence_in_translated_prose(
+    monkeypatch,
+) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(engine_runner, "PROTOCOL_STDOUT", output)
+    source = "The proposed method reduces attention cost. Wepresentthese results in Table 3."
+    paragraph = _paragraph(source)
+    paragraph.layout_label = "plain text"
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=9, pdf_paragraph=[paragraph])])
+    )
+
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, paragraph.unicode)
+    recorder.complete(
+        record, "Phương pháp đề xuất giảm chi phí chú ý. Wepresentthese results in Table 3."
+    )
+
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
+    assert record["status"] == "unchanged_prose"
+    assert record["failure_reason"] == "unchanged_prose"
+    assert output.getvalue() == ""
+
+
+def test_unchanged_sentence_guard_does_not_treat_citation_title_as_prose() -> None:
+    source = "We evaluate our model against a baseline. Attention Is All You Need, 2017."
+    translated = "Chúng tôi đánh giá mô hình theo đường cơ sở. Attention Is All You Need, 2017."
+
+    assert not engine_runner._contains_unchanged_english_sentence(source, translated)
+    assert engine_runner._english_function_word_count("Attention") == 0
+
+
 def test_checkpoint_recorder_preserves_babeldoc_intentionally_skipped_units() -> None:
     paragraph = _paragraph("Only an equation")
     paragraph.layout_label = "equation"
@@ -1128,6 +1166,55 @@ def test_llm_adapter_retries_unchanged_prose_once_and_preserves_glossary_placeho
     assert recorder.finish()["completed"] == 1
 
 
+def test_llm_adapter_retries_cached_prose_with_an_unchanged_sentence() -> None:
+    source = "The proposed method reduces attention cost. Wepresentthese results clearly."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=9, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    item = {"id": 0, "input": source, "layout_label": "text"}
+    checkpoint_key = recorder.key_for(record, engine_runner._context_hash(prefix, "", source))
+    recorder.checkpoints[checkpoint_key] = (
+        "Phương pháp đề xuất giảm chi phí chú ý. Wepresentthese results clearly."
+    )
+    requests: list[str] = []
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+
+    def translate(text: str) -> str:
+        requests.append(text)
+        return json.dumps(
+            [
+                {
+                    "id": 0,
+                    "output": "Phương pháp đề xuất giảm chi phí chú ý và trình bày rõ các kết quả.",
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+    translator._request = translate
+    with recorder.batch_scope():
+        recorder.note_preprocessed(paragraph, source)
+        translated = json.loads(translator.llm_translate(prefix + json.dumps([item])))[0]["output"]
+    recorder.complete(record, translated)
+
+    assert len(requests) == 1
+    assert "Wepresentthese" in requests[0]
+    assert translated == "Phương pháp đề xuất giảm chi phí chú ý và trình bày rõ các kết quả."
+    assert record["status"] == "completed"
+    assert recorder.finish()["completed"] == 1
+
+
 def test_llm_adapter_locks_scientific_identifiers_and_numbers_for_translation() -> None:
     source = "PosUnk and Deep-Att reached 2.8, 3.1 BLEU on K80."
     response = (
@@ -1216,6 +1303,78 @@ def test_llm_single_paragraph_fallback_reuses_existing_prompt_checkpoint(monkeyp
         translated = translator.llm_translate(fallback_prompt)
 
     assert translated == translated_checkpoint
+
+
+def test_llm_single_paragraph_fallback_retries_stale_unchanged_sentence_checkpoint(
+    monkeypatch,
+) -> None:
+    source = "The proposed method reduces attention cost. Wepresentthese results clearly."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=9, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    recorder.note_preprocessed(paragraph, source)
+    fallback_prompt = "The pinned single-paragraph provider request"
+    key = recorder.key_for(record, hashlib.sha256(fallback_prompt.encode()).hexdigest())
+    recorder.checkpoints[key] = (
+        "Phương pháp đề xuất giảm chi phí chú ý. Wepresentthese results clearly."
+    )
+    requests: list[str] = []
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+
+    def translate(text: str) -> str:
+        requests.append(text)
+        return "Phương pháp đề xuất giảm chi phí chú ý và trình bày rõ các kết quả."
+
+    monkeypatch.setattr(translator, "_request", translate)
+    with recorder.paragraph_scope(paragraph):
+        translated = translator.llm_translate(fallback_prompt)
+
+    assert requests == [fallback_prompt]
+    assert translated == "Phương pháp đề xuất giảm chi phí chú ý và trình bày rõ các kết quả."
+
+
+def test_direct_translation_retries_stale_unchanged_sentence_checkpoint(monkeypatch) -> None:
+    source = "The proposed method reduces attention cost. Wepresentthese results clearly."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=9, pdf_paragraph=[paragraph])])
+    )
+    record = recorder.get(paragraph)
+    assert record is not None
+    key = recorder.key_for(record, hashlib.sha256(source.encode()).hexdigest())
+    recorder.checkpoints[key] = (
+        "Phương pháp đề xuất giảm chi phí chú ý. Wepresentthese results clearly."
+    )
+    requests: list[str] = []
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+
+    def translate(text: str) -> str:
+        requests.append(text)
+        return "Phương pháp đề xuất giảm chi phí chú ý và trình bày rõ các kết quả."
+
+    monkeypatch.setattr(translator, "_request", translate)
+    with recorder.paragraph_scope(paragraph):
+        translated = translator.translate(source)
+
+    assert requests == [source]
+    assert translated == "Phương pháp đề xuất giảm chi phí chú ý và trình bày rõ các kết quả."
 
 
 def test_llm_single_paragraph_fallback_keeps_provider_prompt_and_classifies_marker_loss(

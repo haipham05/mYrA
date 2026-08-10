@@ -36,6 +36,7 @@ _SAFE_EXTRA_FIELDS = frozenset(
         "response_id",
         "queue_age_seconds",
         "retry_count",
+        "skip_reasons",
         "stage",
         "token_count_estimate",
         "total_units",

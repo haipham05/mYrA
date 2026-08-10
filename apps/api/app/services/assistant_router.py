@@ -32,8 +32,15 @@ _ROUTER_SYSTEM_PROMPT = "\n".join(
         "Resolve paper references only to IDs included in available_papers. If a needed paper "
         'or detail is missing or ambiguous, use intent="clarify", explain briefly, and set '
         "missing_information.",
-        "For a contextual follow-up, provide standalone_question while preserving its meaning. "
-        "Do not answer the research question.",
+        "For QA, reading, or research requests, provide a concise search-ready "
+        "standalone_question that preserves the requested relationship, key entities, scope, "
+        "and constraints; do not merely repeat or lightly rephrase the user message. Resolve "
+        "follow-up references from bounded history first. Add common, clearly equivalent "
+        "technical search terms for key objects and actions (for example, include 'outputs' "
+        "alongside 'results' when asking about model components). These are retrieval terms, "
+        "not answer claims. Do not add speculative facts or assume the answer. Keep the "
+        "original request unchanged in the persisted run; this field is only for retrieval. "
+        "Do not answer the question.",
         "Use resolved_paper_ids for explicit paper references. The server will enforce the "
         "user's selected scope.",
         "Keep arguments small and limited to simple JSON data needed by that intent. "

@@ -240,6 +240,7 @@ def test_processor_reports_render_duration_only_when_engine_reports_render_progr
     ("failure_code", "retryable"),
     [
         ("PROVIDER_UNAVAILABLE", True),
+        ("PROVIDER_INVALID_JSON", True),
         ("PROVIDER_MARKER_MISMATCH", True),
         ("PROVIDER_SCIENTIFIC_TOKEN_MISMATCH", True),
         ("ENGINE_PROTOCOL_ERROR", False),

@@ -7,6 +7,8 @@ def test_general_qa_prompt_is_topic_neutral_and_grounded():
 
     assert "Cite every factual paper claim" in prompt
     assert "evidence is insufficient" in prompt
+    assert "concise exact quotation" in prompt
+    assert "verified quote" in prompt
     assert "Transformer" not in prompt
     assert "BERT" not in prompt
     assert "Always explicitly name the subject" not in prompt

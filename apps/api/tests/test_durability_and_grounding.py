@@ -261,6 +261,101 @@ async def test_chat_grounding_and_unsupported_citation():
     db.close()
 
 
+@pytest.mark.anyio
+async def test_chat_accepts_exact_quote_when_subject_needs_parent_context():
+    create_tables()
+    db = SessionLocal()
+    proj = create_project(db, ProjectCreate(name="Contextual Quote Test"))
+    conv = create_conversation(db, proj.id, title="Contextual Quote Test")
+
+    paper = create_paper(db, proj.id, "attention_excerpt.pdf", "attention_excerpt.pdf")
+    paper.status = PaperStatus.READY
+    paper.document_sha256 = "mock_hash_contextual_quote"
+    quote = "These are concatenated and once again projected, resulting in the final values."
+    parent_text = (
+        "The outputs from parallel attention heads are concatenated and projected again. "
+        + ("Additional description of the attention operation. " * 15)
+        + quote
+    )
+    page = PaperPage(
+        paper_id=paper.id,
+        page_number=1,
+        width=612.0,
+        height=792.0,
+        raw_text=f"The results from the parallel attention heads are returned. {quote}",
+    )
+    db.add(page)
+    db.flush()
+    elem = PaperElement(
+        paper_id=paper.id,
+        page_number=1,
+        element_index=0,
+        element_type="text",
+        text=quote,
+        page_width=612.0,
+        page_height=792.0,
+        parser_version="docling-2.130.0",
+    )
+    db.add(elem)
+    db.flush()
+    chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="child",
+        chunk_index=0,
+        text=quote,
+        token_count=12,
+        embedding=[0.1] * 1024,
+        embedding_vec=[0.1] * 1024,
+    )
+    db.add(chunk)
+    db.flush()
+    db.add(ChunkElement(chunk_id=chunk.id, element_id=elem.id, order_index=0))
+    parent_chunk = PaperChunk(
+        paper_id=paper.id,
+        chunk_type="parent",
+        chunk_index=1,
+        text=parent_text,
+        token_count=80,
+        embedding=[0.1] * 1024,
+        embedding_vec=[0.1] * 1024,
+    )
+    db.add(parent_chunk)
+    db.flush()
+    db.add(ChunkElement(chunk_id=parent_chunk.id, element_id=elem.id, order_index=0))
+    db.commit()
+
+    class CapturingLLMProvider(FakeLLMProvider):
+        user_prompt = ""
+
+        async def generate(self, system_prompt: str, user_prompt: str) -> str:
+            self.user_prompt = user_prompt
+            return f'"{quote}" [E1]'
+
+    fake_llm = CapturingLLMProvider()
+    set_llm_provider(fake_llm)
+    service = ChatService()
+    retrieved = service.retriever.retrieve(
+        db,
+        proj.id,
+        "How are results from parallel attention heads combined?",
+        query_embedding=[0.1] * 1024,
+    )
+    assert retrieved[0].parent_context is not None
+    assert "outputs from parallel attention heads" in retrieved[0].parent_context
+    response = await service.answer_question(
+        db, conv.id, "How are results from parallel attention heads combined?"
+    )
+
+    assert response.evidence[0].chunk_id == retrieved[0].chunk_id
+    assert "outputs from parallel attention heads" in response.evidence[0].parent_context
+    assert "Context:" in fake_llm.user_prompt
+    assert "outputs from parallel attention heads" in fake_llm.user_prompt
+    assert "concatenated and once again projected" in response.content
+    assert len(response.citations) == 1
+    assert response.citations[0].anchor_status == AnchorStatus.VERIFIED
+    db.close()
+
+
 def test_adversarial_claim_grounding_direct():
     """Adversarial validation tests specifically required by Milestone 1 review:
 

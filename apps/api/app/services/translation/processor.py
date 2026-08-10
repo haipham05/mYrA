@@ -491,6 +491,7 @@ class BabelDocTranslationProcessor:
                         "Translation provider or engine did not complete this request.",
                         retryable=exc.code
                         in {
+                            "PROVIDER_INVALID_JSON",
                             "PROVIDER_MARKER_MISMATCH",
                             "PROVIDER_RATE_LIMITED",
                             "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",

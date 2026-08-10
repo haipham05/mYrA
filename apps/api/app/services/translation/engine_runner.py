@@ -640,6 +640,72 @@ _ENGLISH_FUNCTION_WORDS = frozenset(
 )
 _NON_PROSE_LAYOUT_LABELS = frozenset({"code", "equation", "formula", "math"})
 _PROSE_LAYOUT_LABELS = frozenset({"caption", "heading", "text", "title"})
+_ENGLISH_SENTENCE_STARTERS = frozenset(
+    {
+        "a",
+        "an",
+        "although",
+        "because",
+        "for",
+        "he",
+        "however",
+        "if",
+        "in",
+        "it",
+        "our",
+        "she",
+        "the",
+        "their",
+        "these",
+        "they",
+        "this",
+        "those",
+        "we",
+        "when",
+        "while",
+        "you",
+    }
+)
+
+
+def _english_function_word_count(text: str) -> int:
+    words = re.findall(r"[a-z]+", text.casefold())
+    count = sum(word in _ENGLISH_FUNCTION_WORDS for word in words)
+    for word in words:
+        # Layout extraction can join a leading pronoun to the following verb
+        # (for example, "Wepresentthese"). Do not split arbitrary technical
+        # words: doing so can misread "attention" as "a" + "on".
+        if word.startswith(("we", "they", "you", "it", "this", "these")) and any(
+            word.endswith(suffix) and len(word) - len("we") - len(suffix) >= 4
+            for suffix in ("the", "these", "those", "a", "an", "in", "to", "for")
+        ):
+            count += 2
+    return count
+
+
+def _contains_unchanged_english_sentence(source: str, translated: str) -> bool:
+    """Detect a whole source sentence copied unchanged into an otherwise translated unit."""
+
+    def compact(text: str) -> str:
+        return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text).casefold())
+
+    translated_compact = compact(translated)
+    for sentence in re.split(r"(?<=[.!?])\s+", source):
+        sentence_compact = compact(sentence)
+        if len(sentence_compact) < 24 or sentence_compact not in translated_compact:
+            continue
+        first_word = re.match(r"[A-Za-z]+", sentence.strip())
+        if first_word is None:
+            continue
+        first_word = first_word.group().casefold()
+        starts_like_sentence = first_word in _ENGLISH_SENTENCE_STARTERS or first_word.startswith(
+            ("we", "they", "you", "it", "this", "these")
+        )
+        if not starts_like_sentence:
+            continue
+        if _english_function_word_count(sentence) >= 2:
+            return True
+    return False
 
 
 def _is_unchanged_english_prose(
@@ -659,6 +725,10 @@ def _is_unchanged_english_prose(
 
     if len(normalize_exact(source)) >= 24 and normalize_exact(source) == normalize_exact(
         translated
+    ):
+        return True
+    if (layout_label or "").casefold().strip() != "title" and _contains_unchanged_english_sentence(
+        source, translated
     ):
         return True
 
@@ -685,6 +755,14 @@ def _is_unchanged_english_prose(
         re.findall(r"\\(?:frac|sum|int|sqrt|begin)\b", source)
     )
     return math_markers < 2
+
+
+def _checkpoint_is_usable(source: str, translated: str, layout_label: str | None) -> bool:
+    if _protected_tokens(source) != _protected_tokens(translated):
+        return False
+    if str(layout_label or "").casefold().strip() == "title":
+        return True
+    return not _is_unchanged_english_prose(source, translated, layout_label=layout_label)
 
 
 def _apply_first_occurrence_terms(translated_text: str, terms: list[dict[str, str]]) -> str:
@@ -904,7 +982,9 @@ class SiliconFlowFreeTranslator:
         if record:
             key = self.recorder.key_for(record, hashlib.sha256(text.encode()).hexdigest())
             cached = self.recorder.checkpoints.get(key)
-            if cached is not None and _protected_tokens(text) == _protected_tokens(cached):
+            if cached is not None and _checkpoint_is_usable(
+                text, cached, record.get("layout_label")
+            ):
                 return cached
         result = self._request(text)
         if record:
@@ -925,7 +1005,9 @@ class SiliconFlowFreeTranslator:
                 key = self.recorder.key_for(record, context_hash)
                 cached = self.recorder.checkpoints.get(key)
                 source = record.get("preprocessed_input") or ""
-                if cached is not None and _protected_tokens(source) == _protected_tokens(cached):
+                if cached is not None and _checkpoint_is_usable(
+                    source, cached, record.get("layout_label")
+                ):
                     return _apply_first_occurrence_terms(
                         cached, record.get("first_occurrence_terms", [])
                     )
@@ -950,6 +1032,13 @@ class SiliconFlowFreeTranslator:
             context_hash = _context_hash(prefix, suffix, source_input)
             key = self.recorder.key_for(record, context_hash)
             cached = self.recorder.checkpoints.get(key)
+            if isinstance(cached, str) and not _checkpoint_is_usable(
+                source_input, cached, item.get("layout_label")
+            ):
+                # Older, integrity-valid checkpoints may contain a translated
+                # paragraph with an unchanged English sentence. Do not let that
+                # checkpoint suppress the bounded provider retry on resume.
+                cached = None
             if isinstance(cached, str) and _protected_tokens(source_input) == _protected_tokens(
                 cached
             ):

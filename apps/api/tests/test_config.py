@@ -239,6 +239,7 @@ def test_log_formatter_keeps_safe_translation_validation_summary_only() -> None:
     record.skipped_units = 2
     record.failure_count = 0
     record.failure_reasons = {}
+    record.skip_reasons = {"protected_scientific_content": 1, "preserved_short_layout_label": 1}
     record.failure_units = []
     record.translation_id = "translation-test-id"
     record.source_quote = "private research text"
@@ -248,6 +249,10 @@ def test_log_formatter_keeps_safe_translation_validation_summary_only() -> None:
     assert formatted["total_units"] == 31
     assert formatted["completed_units"] == 29
     assert formatted["failure_count"] == 0
+    assert formatted["skip_reasons"] == {
+        "protected_scientific_content": 1,
+        "preserved_short_layout_label": 1,
+    }
     assert "failure_units" in formatted
     assert formatted["translation_id"] == "translation-test-id"
     assert "source_quote" not in formatted

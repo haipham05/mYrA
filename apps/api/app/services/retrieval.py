@@ -10,7 +10,7 @@ from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import bindparam, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.crud.corpus import has_pending_corpus_revision, read_corpus_revision
 from app.db.models import ChunkElement, Paper, PaperChunk, PaperElement, PaperPage
@@ -28,6 +28,65 @@ from app.services.cache import get_cache
 from app.services.embedding import get_embedding_provider
 
 _TRACE_PREFIX_CHARS = 240
+_PARENT_CONTEXT_WINDOW_CHARS = 2_800
+_RERANKER_PARENT_CONTEXT_MIN_CHARS = 600
+_RERANKING_POLICY_REVISION = "child-parent-context-v2"
+
+
+def _parent_context_window(parent_text: str, child_text: str) -> str:
+    """Keep the child's surrounding source context when a parent is long."""
+    limit = _PARENT_CONTEXT_WINDOW_CHARS
+    child_start = parent_text.find(child_text) if child_text else -1
+    if child_start < 0 or parent_text.find(child_text, child_start + 1) >= 0:
+        # Do not guess a location when the child is absent or ambiguous.
+        return child_text[:limit]
+    if len(parent_text) <= limit:
+        return parent_text
+
+    child_length = min(len(child_text), limit)
+    center = child_start + child_length // 2
+    start = max(0, min(center - limit // 2, len(parent_text) - limit))
+    return parent_text[start : start + limit]
+
+
+def _reranker_documents(db: Session, chunks: list[PaperChunk]) -> list[str]:
+    """Use bounded parent context only when a long chunk may hide needed detail."""
+    if not chunks:
+        return []
+
+    child_links = aliased(ChunkElement)
+    parent_links = aliased(ChunkElement)
+    child_chunks = aliased(PaperChunk)
+    parent_chunks = aliased(PaperChunk)
+    rows = (
+        db.query(child_links.chunk_id, parent_chunks.text)
+        .join(child_chunks, child_chunks.id == child_links.chunk_id)
+        .join(parent_links, parent_links.element_id == child_links.element_id)
+        .join(parent_chunks, parent_chunks.id == parent_links.chunk_id)
+        .filter(
+            child_links.chunk_id.in_([chunk.id for chunk in chunks]),
+            parent_chunks.paper_id == child_chunks.paper_id,
+            parent_chunks.chunk_type == "parent",
+        )
+        .order_by(child_links.chunk_id, parent_links.order_index)
+        .all()
+    )
+    parent_text_by_chunk: dict[UUID, str] = {}
+    for chunk_id, parent_text in rows:
+        parent_text_by_chunk.setdefault(chunk_id, parent_text)
+
+    documents: list[str] = []
+    for chunk in chunks:
+        parent_text = parent_text_by_chunk.get(chunk.id)
+        if not parent_text or len(parent_text) <= _RERANKER_PARENT_CONTEXT_MIN_CHARS:
+            documents.append(chunk.text)
+            continue
+        context = _parent_context_window(parent_text, chunk.text)
+        if context == chunk.text:
+            documents.append(chunk.text)
+            continue
+        documents.append(f"{chunk.text}\n\nNearby source context:\n{context}")
+    return documents
 
 
 class _RetrievalObservation:
@@ -151,7 +210,7 @@ def _rerank_with_cache(
             "documents": content_hashes,
             "model": reranker.model_name,
             "revision": getattr(reranker, "model_version", "unversioned"),
-            "policy": "top-evidence-v1",
+            "policy": _RERANKING_POLICY_REVISION,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1058,14 +1117,14 @@ class HybridRetriever:
         # Rerank candidates for the production strategy.
         if top_chunks is None:
             reranker = get_reranker()
-            docs = [c.text for c in candidate_chunks]
+            docs = _reranker_documents(db, candidate_chunks)
             with _retrieval_observation(
                 telemetry,
                 "retrieval.reranking",
                 {
                     "reranker_model": reranker.model_name,
                     "reranker_revision": getattr(reranker, "model_version", "unversioned"),
-                    "policy_revision": "top-evidence-v1",
+                    "policy_revision": _RERANKING_POLICY_REVISION,
                     "input_candidate_count": len(candidate_chunks),
                     "evidence_limit": self.top_evidence,
                 },
@@ -1079,6 +1138,12 @@ class HybridRetriever:
                     for rank, (index, score) in enumerate(reranked_order, 1):
                         chunk = candidate_chunks[index]
                         prefix, truncated = _trace_prefix(chunk.text)
+                        has_parent_context = docs[index] != chunk.text
+                        parent_context_prefix = None
+                        parent_context_truncated = False
+                        if has_parent_context:
+                            context = docs[index].partition("\n\nNearby source context:\n")[2]
+                            parent_context_prefix, parent_context_truncated = _trace_prefix(context)
                         reranked_trace.append(
                             {
                                 "chunk_id": str(chunk.id),
@@ -1091,23 +1156,38 @@ class HybridRetriever:
                                 "text_prefix": prefix,
                                 "text_truncated": truncated,
                                 "selected_for_evidence": index in selected_indices,
+                                "parent_context_included": has_parent_context,
+                                "parent_context_prefix": parent_context_prefix,
+                                "parent_context_truncated": parent_context_truncated,
                             }
                         )
+                    reranker_input_trace = []
+                    for rank, chunk in enumerate(candidate_chunks, 1):
+                        document = docs[rank - 1]
+                        candidate = _candidate_trace_item(
+                            chunk_id=chunk.id,
+                            paper_id=chunk.paper_id,
+                            text_value=document,
+                            rank=rank,
+                            score_name="not_scored_before_reranking",
+                            score=None,
+                        )
+                        candidate["child_text_prefix"] = _trace_prefix(chunk.text)[0]
+                        candidate["parent_context_included"] = document != chunk.text
+                        if document != chunk.text:
+                            context = document.partition("\n\nNearby source context:\n")[2]
+                            context_prefix, context_truncated = _trace_prefix(context)
+                            candidate["parent_context_prefix"] = context_prefix
+                            candidate["parent_context_truncated"] = context_truncated
+                        else:
+                            candidate["parent_context_prefix"] = None
+                            candidate["parent_context_truncated"] = False
+                        reranker_input_trace.append(candidate)
                     observation.update(
                         metadata={"ranked_candidate_count": len(reranked_order)},
                         input={
                             "question": query,
-                            "candidates": [
-                                _candidate_trace_item(
-                                    chunk_id=chunk.id,
-                                    paper_id=chunk.paper_id,
-                                    text_value=chunk.text,
-                                    rank=rank,
-                                    score_name="not_scored_before_reranking",
-                                    score=None,
-                                )
-                                for rank, chunk in enumerate(candidate_chunks, 1)
-                            ],
+                            "candidates": reranker_input_trace,
                         },
                         output={"candidates": reranked_trace},
                     )
@@ -1151,7 +1231,11 @@ class HybridRetriever:
                 if elem_ids
                 else None
             )
-            parent_context = parent_chunk.text if parent_chunk else chunk.text
+            parent_context = (
+                _parent_context_window(parent_chunk.text, chunk.text)
+                if parent_chunk
+                else chunk.text
+            )
 
             # Map page-specific bboxes and anchors with verbatim text span verification
             bboxes: list[BoundingBox] = []

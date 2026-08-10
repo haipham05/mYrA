@@ -109,6 +109,7 @@ def test_translation_request_is_idempotent_and_project_scoped(translation_client
 @pytest.mark.parametrize(
     ("error_code", "expected_status"),
     [
+        ("PROVIDER_INVALID_JSON", 200),
         ("PROVIDER_MARKER_MISMATCH", 200),
         ("PROVIDER_SCIENTIFIC_TOKEN_MISMATCH", 200),
         ("UNRECOGNIZED_FAILURE", 409),

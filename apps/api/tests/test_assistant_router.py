@@ -122,6 +122,31 @@ async def test_router_resolves_followup_with_bounded_history_and_paper_context()
 
 
 @pytest.mark.anyio
+async def test_router_uses_search_ready_question_without_replacing_original_request() -> None:
+    request = _request(
+        message=(
+            "According to this paper, how does the Transformer combine results from parallel "
+            "attention heads?"
+        )
+    )
+    search_question = "How are parallel attention-head outputs combined or concatenated?"
+    provider = _StubProvider(_decision(standalone_question=search_question))
+
+    result = await AssistantRouter(provider=provider).route(request)
+
+    assert result.decision.standalone_question == search_question
+    assert request.message == (
+        "According to this paper, how does the Transformer combine results from parallel "
+        "attention heads?"
+    )
+    prompt = provider.system_prompt.casefold()
+    assert "search-ready standalone_question" in prompt
+    assert "do not merely repeat" in prompt
+    assert "outputs" in prompt
+    assert "do not add speculative facts" in prompt
+
+
+@pytest.mark.anyio
 async def test_router_forces_requested_scope_even_if_model_returns_other_paper() -> None:
     request = _request()
     provider = _StubProvider(_decision(resolved_paper_ids=[str(uuid4())]))

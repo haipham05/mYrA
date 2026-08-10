@@ -1,0 +1,29 @@
+# Opt-in cloud data profile. Use after docker-compose.local.yml and
+# docker-compose.translation.yml so the corpus uses Supabase/GCS while the
+# provider-budget ledger remains on local PostgreSQL.
+services:
+  api:
+    environment:
+      MYRA_RUNTIME_PROFILE: cloud-data
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in the local environment}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:?Set GCS_BUCKET_NAME in the local environment}
+      GOOGLE_APPLICATION_CREDENTIALS: /root/.config/gcloud/application_default_credentials.json
+
+  worker:
+    environment:
+      MYRA_RUNTIME_PROFILE: cloud-data
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in the local environment}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:?Set GCS_BUCKET_NAME in the local environment}
+      GOOGLE_APPLICATION_CREDENTIALS: /root/.config/gcloud/application_default_credentials.json
+
+  translation-worker:
+    environment:
+      MYRA_RUNTIME_PROFILE: cloud-data
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in the local environment}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:?Set GCS_BUCKET_NAME in the local environment}
+      GOOGLE_APPLICATION_CREDENTIALS: /root/.config/gcloud/application_default_credentials.json
+    volumes:
+      - type: bind
+        source: ${HOME}/.config/gcloud
+        target: /root/.config/gcloud
+        read_only: true

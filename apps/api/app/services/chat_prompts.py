@@ -13,6 +13,9 @@ def build_chat_system_prompt(intent: GraphIntent, graph_notice: str | None = Non
         "separate paper statements from your explanation or interpretation. Use project memory "
         "only for the user's saved decisions and preferences, not as paper evidence. If the "
         "available sources do not answer the question, say that evidence is insufficient. "
+        "When a passage's subject depends on nearby context or a paraphrase may go beyond its "
+        "verified quote, answer with a concise exact quotation and its evidence ID instead of "
+        "guessing a paraphrase or abstaining when the quote directly answers the question. "
         "Be concise and include only relevant details."
     )
     if intent == GraphIntent.CONTRADICTION:
