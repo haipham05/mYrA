@@ -52,16 +52,47 @@ def test_only_verbatim_source_phrase_survives_an_unsupported_wrapper():
     )
     assert check_claim_support(wrapper, source) is False
     assert extract_verbatim_quoted_phrase(wrapper, source) == (
-        "Bidirectional Encoder Representations from Transformers"
+        "We introduce BERT, which stands for Bidirectional Encoder "
+        "Representations from Transformers."
     )
     assert (
         extract_verbatim_quoted_phrase(
             'It means "bidirectional encoder representations from transformers".', source
         )
-        == "Bidirectional Encoder Representations from Transformers"
+        == "We introduce BERT, which stands for Bidirectional Encoder "
+        "Representations from Transformers."
     )
     assert extract_verbatim_quoted_phrase('It means "Bidirectional Encoder".', source) is None
     assert extract_verbatim_quoted_phrase('It means "an unrelated model".', source) is None
+
+
+def test_quoted_fragment_expands_only_to_its_complete_source_sentence():
+    source = (
+        "output values. These are concatenated and once again projected, "
+        "resulting in the final values, as depicted in Figure 2. "
+        "Multi-head attention also permits joint attention across subspaces."
+    )
+    claim = '"are concatenated and once again projected, resulting in the final values" [E1]'
+
+    assert extract_verbatim_quoted_phrase(claim, source) == (
+        "These are concatenated and once again projected, resulting in the "
+        "final values, as depicted in Figure 2."
+    )
+
+    abbreviated_source = (
+        "Smith et al. show the operation in Fig. 2. The head outputs are "
+        "concatenated to form the result. A separate method is described next."
+    )
+    abbreviated_claim = '"outputs are concatenated to form the result" [E1]'
+    assert extract_verbatim_quoted_phrase(abbreviated_claim, abbreviated_source) == (
+        "The head outputs are concatenated to form the result."
+    )
+
+    title_source = "Dr. A. Smith found that the outputs are concatenated. Next sentence."
+    title_claim = '"outputs are concatenated" [E1]'
+    assert extract_verbatim_quoted_phrase(title_claim, title_source) == (
+        "Dr. A. Smith found that the outputs are concatenated."
+    )
 
 
 def test_oversized_pdf_upload():
@@ -329,7 +360,7 @@ async def test_chat_accepts_exact_quote_when_subject_needs_parent_context():
 
         async def generate(self, system_prompt: str, user_prompt: str) -> str:
             self.user_prompt = user_prompt
-            return f'"{quote}" [E1]'
+            return '"are concatenated and once again projected, resulting in the final values" [E1]'
 
     fake_llm = CapturingLLMProvider()
     set_llm_provider(fake_llm)
@@ -350,7 +381,10 @@ async def test_chat_accepts_exact_quote_when_subject_needs_parent_context():
     assert "outputs from parallel attention heads" in response.evidence[0].parent_context
     assert "Context:" in fake_llm.user_prompt
     assert "outputs from parallel attention heads" in fake_llm.user_prompt
-    assert "concatenated and once again projected" in response.content
+    assert (
+        "These are concatenated and once again projected, resulting in the final values."
+        in response.content
+    )
     assert len(response.citations) == 1
     assert response.citations[0].anchor_status == AnchorStatus.VERIFIED
     db.close()

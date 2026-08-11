@@ -1270,7 +1270,10 @@ async def _research(context: ToolContext, tool_input: AssistantToolInput) -> Ass
         "using only retrieved paper evidence. Cite factual claims. Clearly label interpretations, "
         "and say when the selected evidence does not answer a subquestion. Do not claim that a "
         "finding is novel or absent from literature beyond the selected evidence. Return a useful "
-        "draft, not hidden reasoning."
+        "draft, not hidden reasoning. Give a direct, readable answer before listing supporting "
+        "source facts. Avoid isolated quote fragments; when an exact quotation is needed, use a "
+        "complete sentence or self-contained clause. Include a limits section only when it has a "
+        "specific supported limitation, and never leave a heading without useful content."
     )
 
     with get_telemetry().stage(

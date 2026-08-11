@@ -243,7 +243,7 @@ def test_processor_reports_render_duration_only_when_engine_reports_render_progr
         ("PROVIDER_INVALID_JSON", True),
         ("PROVIDER_MARKER_MISMATCH", True),
         ("PROVIDER_SCIENTIFIC_TOKEN_MISMATCH", True),
-        ("ENGINE_PROTOCOL_ERROR", False),
+        ("ENGINE_PROTOCOL_ERROR", True),
     ],
 )
 def test_render_telemetry_failure_does_not_mask_engine_failure(

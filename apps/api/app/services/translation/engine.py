@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping
@@ -19,6 +20,45 @@ _SAFE_PROGRESS_STAGES = {
     "rendering",
     "finalizing",
 }
+_SAFE_SKIP_REASONS = frozenset(
+    {
+        "empty",
+        "below_engine_minimum",
+        "protected_scientific_content",
+        "placeholder_only",
+        "numeric_or_symbol_only",
+        "preserved_vertical_layout_content",
+        "preserved_embedded_figure_text",
+        "preserved_scientific_table_content",
+        "author_contact_metadata",
+        "preserved_fallback_layout_content",
+        "preserved_short_layout_label",
+        "preserved_split_footnote_layout_content",
+        "preserved_figure_or_citation_metadata",
+        "arxiv_version_stamp",
+    }
+)
+_SAFE_ENGINE_ERROR_CODES = frozenset(
+    {
+        "ENGINE_FAILURE",
+        "ENGINE_VERSION_MISMATCH",
+        "LAYOUT_MODEL_UNAVAILABLE",
+        "FONT_ASSETS_UNAVAILABLE",
+        "PROVIDER_REJECTED",
+        "PROVIDER_INVALID_RESPONSE",
+        "PROVIDER_INVALID_SCHEMA",
+        "PROVIDER_INVALID_JSON",
+        "PROVIDER_INVALID_OUTPUT",
+        "PROVIDER_MISSING_ITEM",
+        "PROVIDER_MARKER_MISMATCH",
+        "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_UNAVAILABLE",
+        "ENGINE_INCOMPLETE",
+        "INVALID_ENGINE_REQUEST",
+    }
+)
+logger = logging.getLogger("myra.translation.engine")
 
 
 class TranslationEngineError(RuntimeError):
@@ -155,21 +195,7 @@ def _safe_event(value: Any) -> dict[str, Any]:
             raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
         skip_reasons = value.get("skip_reasons", {})
         if not isinstance(skip_reasons, dict) or not all(
-            key
-            in {
-                "empty",
-                "below_engine_minimum",
-                "protected_scientific_content",
-                "placeholder_only",
-                "numeric_or_symbol_only",
-                "preserved_vertical_layout_content",
-                "author_contact_metadata",
-                "preserved_fallback_layout_content",
-                "preserved_short_layout_label",
-                "preserved_split_footnote_layout_content",
-            }
-            and isinstance(count, int)
-            and count >= 0
+            key in _SAFE_SKIP_REASONS and isinstance(count, int) and count >= 0
             for key, count in skip_reasons.items()
         ):
             raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
@@ -209,26 +235,8 @@ def _safe_event(value: Any) -> dict[str, Any]:
         }
     if event_type == "error":
         code = value.get("code")
-        allowed_codes = {
-            "ENGINE_FAILURE",
-            "ENGINE_VERSION_MISMATCH",
-            "LAYOUT_MODEL_UNAVAILABLE",
-            "FONT_ASSETS_UNAVAILABLE",
-            "PROVIDER_REJECTED",
-            "PROVIDER_INVALID_RESPONSE",
-            "PROVIDER_INVALID_SCHEMA",
-            "PROVIDER_INVALID_JSON",
-            "PROVIDER_INVALID_OUTPUT",
-            "PROVIDER_MISSING_ITEM",
-            "PROVIDER_MARKER_MISMATCH",
-            "PROVIDER_SCIENTIFIC_TOKEN_MISMATCH",
-            "PROVIDER_RATE_LIMITED",
-            "PROVIDER_UNAVAILABLE",
-            "ENGINE_INCOMPLETE",
-            "INVALID_ENGINE_REQUEST",
-        }
         raise TranslationEngineError(
-            code if isinstance(code, str) and code in allowed_codes else "ENGINE_FAILURE"
+            code if isinstance(code, str) and code in _SAFE_ENGINE_ERROR_CODES else "ENGINE_FAILURE"
         )
     raise TranslationEngineError("ENGINE_PROTOCOL_ERROR")
 
@@ -281,7 +289,69 @@ class TranslationEngineProcess:
                     raw = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise TranslationEngineError("ENGINE_PROTOCOL_ERROR") from exc
-                event = _safe_event(raw)
+                try:
+                    event = _safe_event(raw)
+                except TranslationEngineError:
+                    if (
+                        isinstance(raw, dict)
+                        and raw.get("type") == "error"
+                        and isinstance(raw.get("code"), str)
+                        and raw["code"] in _SAFE_ENGINE_ERROR_CODES
+                    ):
+                        raise
+                    if isinstance(raw, dict):
+                        event_type = raw.get("type")
+                        safe_event_fields = {
+                            "type",
+                            "code",
+                            "total",
+                            "completed",
+                            "skipped",
+                            "failed",
+                            "failure_reasons",
+                            "failure_causes",
+                            "skip_reasons",
+                            "failure_units",
+                        }
+                        event_fields = sorted(key for key in raw if key in safe_event_fields)
+                        skip_reasons = raw.get("skip_reasons")
+                    else:
+                        event_type = None
+                        event_fields = []
+                        skip_reasons = None
+                    logger.warning(
+                        "translation_engine_protocol_rejected",
+                        extra={
+                            "event_type": (
+                                event_type
+                                if isinstance(event_type, str)
+                                and event_type
+                                in {
+                                    "progress",
+                                    "checkpoint",
+                                    "segment_summary",
+                                    "complete",
+                                    "error",
+                                }
+                                else "unknown"
+                            ),
+                            "event_fields": event_fields,
+                            "unknown_error_code": (
+                                isinstance(raw, dict)
+                                and raw.get("type") == "error"
+                                and not (
+                                    isinstance(raw.get("code"), str)
+                                    and raw["code"] in _SAFE_ENGINE_ERROR_CODES
+                                )
+                            ),
+                            "unknown_skip_reason_count": (
+                                sum(key not in _SAFE_SKIP_REASONS for key in skip_reasons)
+                                if isinstance(skip_reasons, dict)
+                                else None
+                            ),
+                        },
+                    )
+                    raise
                 if event["type"] == "progress":
                     if on_progress:
                         await on_progress(event)

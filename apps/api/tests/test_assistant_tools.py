@@ -1160,6 +1160,10 @@ async def test_research_tool_runs_one_scoped_grounded_draft_without_saving(monke
     assert service.calls[0][3]["selected_paper_ids"] == [paper_id, other_paper_id]
     assert "What is the method?" in service.calls[0][3]["retrieval_question"]
     assert service.calls[0][3]["additional_evidence"] == [evidence]
+    assert "Avoid isolated quote fragments" in service.calls[0][3]["response_guidance"]
+    assert (
+        "never leave a heading without useful content" in service.calls[0][3]["response_guidance"]
+    )
     assert len(service.retriever.calls) == 4
     assert result.structured_payload["evidence_coverage"] == [
         {"paper_id": str(paper_id), "subquestion": "What is the method?", "has_evidence": True},

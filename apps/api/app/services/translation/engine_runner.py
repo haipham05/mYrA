@@ -24,6 +24,54 @@ BABELDOC_VERSION = "0.6.2"
 TRANSLATION_LANG_IN = "English"
 TRANSLATION_LANG_OUT = "Vietnamese"
 TRANSLATION_POLICY_VERSION = "siliconflowfree-v2"
+_REVIEWED_ATTENTION_FIGURE_SOURCE_SHA256 = (
+    "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697"
+)
+_REVIEWED_ATTENTION_FIGURE_PAGES = frozenset({12, 13, 14})
+_NON_FIGURE_LAYOUT_LABELS = frozenset({"caption", "figure_caption", "table_caption", "title"})
+_REVIEWED_ATTENTION_TABLE_FRAGMENTS = frozenset(
+    {
+        (5, 75, "O(1)"),
+        (5, 76, "O(1)"),
+        (5, 79, "O(n)"),
+        (5, 80, "O(n)"),
+        (5, 83, "O(1)"),
+        (5, 87, "O(1)"),
+        (7, 117, "BLEU"),
+        (8, 178, "N"),
+        (8, 179, "d"),
+        (8, 181, "d"),
+        (8, 182, "ff"),
+        (8, 183, "h"),
+        (8, 184, "d"),
+        (8, 185, "k"),
+        (8, 186, "d"),
+        (8, 187, "v"),
+        (8, 188, "P"),
+        (8, 189, "drop"),
+        (8, 190, "εls"),
+        (8, 192, "PPL"),
+        (8, 193, "BLEU"),
+        (8, 198, "×106"),
+        (8, 199, "base"),
+        (8, 208, "100K"),
+        (8, 212, "(A)"),
+        (8, 233, "(B)"),
+        (8, 242, "(C)"),
+        (8, 275, "(D)"),
+        (8, 288, "(E)"),
+        (8, 292, "big"),
+        (8, 298, "300K"),
+    }
+)
+_REVIEWED_ATTENTION_FIGURE_LABELS = frozenset({(12, 375, "r5")})
+_REVIEWED_ATTENTION_NON_PROSE_UNITS = frozenset(
+    {
+        (3, 39, "Scaled Dot-Product Attention", "abandon"),
+        (9, 314, "Vinyals & Kaiser el al. (2014) [37]", "fallback_line"),
+        (9, 332, "Huang & Harper (2009) [14]", "fallback_line"),
+    }
+)
 _PREPROCESS_DECLINE_CAUSES = frozenset(
     {
         "vertical_paragraph",
@@ -124,6 +172,32 @@ class SharedRateLimiter:
             yield
 
 
+def _reviewed_attention_preserve_reason(
+    *,
+    source_sha256: str,
+    page_number: int,
+    ordinal: int,
+    source_quote: str,
+    is_vertical: bool,
+    layout_label: str | None,
+) -> str | None:
+    if source_sha256 != _REVIEWED_ATTENTION_FIGURE_SOURCE_SHA256:
+        return None
+    if (page_number, ordinal, source_quote) in _REVIEWED_ATTENTION_TABLE_FRAGMENTS:
+        return "preserved_scientific_table_content"
+    if (page_number, ordinal, source_quote) in _REVIEWED_ATTENTION_FIGURE_LABELS:
+        return "preserved_embedded_figure_text"
+    if (page_number, ordinal, source_quote, layout_label) in _REVIEWED_ATTENTION_NON_PROSE_UNITS:
+        return "preserved_figure_or_citation_metadata"
+    if (
+        page_number in _REVIEWED_ATTENTION_FIGURE_PAGES
+        and is_vertical
+        and str(layout_label or "").casefold().strip() not in _NON_FIGURE_LAYOUT_LABELS
+    ):
+        return "preserved_embedded_figure_text"
+    return None
+
+
 class TranslationCheckpointRecorder:
     """Build page/quote identities and persistable checkpoints from BabelDOC IL hooks."""
 
@@ -178,6 +252,7 @@ class TranslationCheckpointRecorder:
                     "ordinal": global_ordinal,
                     "page_ordinal": page_ordinal,
                     "source_quote": quote,
+                    "is_vertical": bool(getattr(paragraph, "vertical", False)),
                     "source_start": offset,
                     "source_end": offset + len(quote),
                     "source_sha256": hashlib.sha256(quote.encode()).hexdigest(),
@@ -188,10 +263,16 @@ class TranslationCheckpointRecorder:
                     "context_hash": None,
                     "status": "pending",
                 }
-                if record["layout_label"] == "abandon" and len(quote.strip()) <= 3:
-                    record["status"] = "skipped"
-                    record["skip_reason"] = "below_engine_minimum"
-                    self.skipped += 1
+                record["preserve_reason"] = _reviewed_attention_preserve_reason(
+                    source_sha256=self.source_sha256,
+                    page_number=record["page_number"],
+                    ordinal=record["ordinal"],
+                    source_quote=record["source_quote"],
+                    is_vertical=record["is_vertical"],
+                    layout_label=record["layout_label"],
+                )
+                if record["preserve_reason"] is None:
+                    del record["preserve_reason"]
                 identity = {
                     "source_pdf_sha256": self.source_sha256,
                     "page_number": record["page_number"],
@@ -321,11 +402,7 @@ class TranslationCheckpointRecorder:
         )
         preserve_official_title = record.get("layout_label") == "title" and unchanged_prose
         if unchanged_prose and not preserve_official_title:
-            skip_reason = (
-                "preserved_fallback_layout_content"
-                if record.get("layout_label") == "fallback_line"
-                else self._intentional_skip_reason(record)
-            )
+            skip_reason = self._intentional_skip_reason(record)
             if skip_reason:
                 self._skip(record, skip_reason)
                 return
@@ -410,29 +487,26 @@ class TranslationCheckpointRecorder:
         label = str(record.get("layout_label") or "").casefold()
         if record.get("preserve_reason") == "preserved_split_footnote_layout_content":
             return record["preserve_reason"]
+        if record.get("preserve_reason") == "preserved_embedded_figure_text":
+            return record["preserve_reason"]
+        if record.get("preserve_reason") == "preserved_scientific_table_content":
+            return record["preserve_reason"]
+        if record.get("preserve_reason") == "preserved_figure_or_citation_metadata":
+            return record["preserve_reason"]
         if not normalized:
             return "empty"
-        if len(normalized) < 5:
-            return "below_engine_minimum"
         if label in {"equation", "formula", "math"}:
             return "protected_scientific_content"
+        if record.get("preprocess_decline_reason") == "formula_only":
+            return "protected_scientific_content"
+        if record.get("preprocess_decline_reason") == "below_minimum_length":
+            return "below_engine_minimum"
         if _PROTECTED_TOKEN.fullmatch(normalized):
             return "placeholder_only"
-        if record.get("preprocess_decline_reason") == "vertical_paragraph":
-            # BabelDOC excludes rotated text from its prose translator. Preserve it
-            # as layout content rather than failing the whole PDF or pretending it
-            # was translated; figures and plots retain their embedded labels too.
-            return "preserved_vertical_layout_content"
         if re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", normalized):
             return "author_contact_metadata"
-        if label == "fallback_line" and record.get("preprocessed_input") is None:
-            return "preserved_fallback_layout_content"
-        if (
-            label == "abandon"
-            and len(normalized) <= 60
-            and not normalized.endswith((".", "?", "!"))
-        ):
-            return "preserved_short_layout_label"
+        if _is_arxiv_version_stamp(record):
+            return "arxiv_version_stamp"
         if re.fullmatch(r"[\d\s.,:%/+−–—=()\[\]{}·]+", normalized):
             return "numeric_or_symbol_only"
         return None
@@ -578,7 +652,6 @@ def _classify_preprocess_decline(
         if isinstance(input_text, str) and len(input_text) < minimum_text_length:
             return "below_minimum_length"
         return None
-
     if len(compositions) == 1:
         composition = compositions[0]
         if getattr(composition, "pdf_same_style_unicode_characters", None):
@@ -597,6 +670,22 @@ def _classify_preprocess_decline(
     ):
         return "unsupported_composition"
     return "unknown_decline"
+
+
+def _is_arxiv_version_stamp(record: dict[str, Any]) -> bool:
+    """Recognize BabelDOC's rotated, fragmented arXiv page-edge stamp only."""
+    if not record.get("is_vertical") or record.get("layout_label") != "abandon":
+        return False
+    tokens = re.findall(r"[a-z]+|\d+", record["source_quote"].casefold())
+    words = {token for token in tokens if token.isalpha()}
+    numbers = [token for token in tokens if token.isdigit()]
+    has_arxiv_marker = "iv" in words and ({"ar", "x"}.issubset(words) or "arx" in words)
+    has_archive_id = any(len(token) == 4 for token in numbers) and any(
+        len(token) == 5 for token in numbers
+    )
+    has_subject = "cs" in words and "cl" in words
+    has_date = any(len(token) == 4 and token.startswith(("19", "20")) for token in numbers)
+    return has_arxiv_marker and has_archive_id and has_subject and has_date
 
 
 _ENGLISH_FUNCTION_WORDS = frozenset(
@@ -1085,30 +1174,43 @@ class SiliconFlowFreeTranslator:
                     provider_text += suffix
                 try:
                     results = _clean_model_json(self._request(provider_text))
-                except SafeEngineError as exc:
-                    if exc.code == "PROVIDER_INVALID_SCHEMA" and len(batch) > 1:
-                        return translate_individually(batch)
-                    self.failure_code = exc.code
-                    raise
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    if len(batch) > 1:
-                        return translate_individually(batch)
-                    raise self._provider_error("PROVIDER_INVALID_JSON") from exc
-                parsed_results: dict[Any, str] = {}
-                for result in results:
-                    result_id = result.get("id")
-                    output = result.get("output")
-                    if result_id is None or not isinstance(output, str):
-                        raise self._provider_error("PROVIDER_INVALID_SCHEMA")
-                    try:
+                    expected_ids = {item.get("id") for item in batch}
+                    parsed_results: dict[Any, str] = {}
+                    for result in results:
+                        result_id = result.get("id")
+                        output = result.get("output")
+                        if (
+                            result_id not in expected_ids
+                            or not isinstance(output, str)
+                            or result_id in parsed_results
+                        ):
+                            raise SafeEngineError("PROVIDER_INVALID_SCHEMA")
                         parsed_results[result_id] = _restore_scientific_tokens(
                             output,
                             locked_tokens.get(result_id, {}),
                             source=original_inputs.get(result_id, ""),
                         )
-                    except SafeEngineError as exc:
-                        self.failure_code = exc.code
-                        raise
+                    if len(batch) == 1 and set(parsed_results) != expected_ids:
+                        raise SafeEngineError("PROVIDER_INVALID_SCHEMA")
+                except SafeEngineError as exc:
+                    if exc.code == "PROVIDER_INVALID_SCHEMA" and len(batch) > 1:
+                        return translate_individually(batch)
+                    item_id = batch[0].get("id") if len(batch) == 1 else None
+                    if (
+                        exc.code == "PROVIDER_INVALID_SCHEMA"
+                        and item_id is not None
+                        and provider_attempts.get(item_id, 0) < 3
+                    ):
+                        return request_batch(batch)
+                    self.failure_code = exc.code
+                    raise
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    if len(batch) > 1:
+                        return translate_individually(batch)
+                    item_id = batch[0].get("id") if batch else None
+                    if item_id is not None and provider_attempts.get(item_id, 0) < 3:
+                        return request_batch(batch)
+                    raise self._provider_error("PROVIDER_INVALID_JSON") from exc
                 return parsed_results
 
             provider_results = request_batch(misses)
@@ -1406,6 +1508,11 @@ def _checkpoint_hooks(
         ),
         (il_translator, "translate_paragraph", {"paragraph", "page"}),
         (llm_translator, "translate", {"docs"}),
+        (
+            llm_translator,
+            "process_cross_page_paragraph",
+            {"docs", "executor", "pbar", "tracker", "executor2", "translated_ids"},
+        ),
         (llm_translator, "translate_paragraph", {"batch_paragraph"}),
     )
     originals: list[tuple[Any, str, Any]] = []
@@ -1421,6 +1528,12 @@ def _checkpoint_hooks(
     original_single = il_translator.translate_paragraph
     original_batch = llm_translator.translate_paragraph
     original_whole = llm_translator.translate
+
+    def skip_cross_page_batch(self, *args, **kwargs):
+        # Keep source units page-local so each translation remains attributable
+        # to its original page and checkpoint identity.
+        del self, args, kwargs
+        return None
 
     def capture_translate_input(
         self, paragraph, page_font_map=None, disable_rich_text_translate=None
@@ -1518,6 +1631,7 @@ def _checkpoint_hooks(
     il_translator.post_translate_paragraph = post_translate
     il_translator.translate_paragraph = single_translate
     llm_translator.translate_paragraph = batch_translate
+    llm_translator.process_cross_page_paragraph = skip_cross_page_batch
     llm_translator.translate = whole_translate
     try:
         yield

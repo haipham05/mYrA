@@ -17,6 +17,8 @@ _SAFE_EXTRA_FIELDS = frozenset(
         "duration_ms",
         "error_code",
         "event_id",
+        "event_fields",
+        "event_type",
         "evidence_count",
         "expected_heads",
         "failure_class",
@@ -43,6 +45,8 @@ _SAFE_EXTRA_FIELDS = frozenset(
         "completed_units",
         "skipped_units",
         "translation_id",
+        "unknown_skip_reason_count",
+        "unknown_error_code",
         "worker_id",
     }
 )

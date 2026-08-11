@@ -538,6 +538,28 @@ def extract_verbatim_quoted_phrase(claim_text: str, evidence_quote: str) -> str 
             continue
         source_phrase = source_match.group(0)
         if check_claim_support(source_phrase, evidence_quote):
+            # A model can quote only the middle of a source sentence (for example,
+            # "are concatenated ..."), which is accurate but unhelpful on its own.
+            # Expand only to sentence boundaries in this already-verified source
+            # text; never add generated wording or neighboring sentences.
+            sentence_start = 0
+            sentence_end = len(norm_evidence)
+            for boundary in re.finditer(r"[.!?](?:[\"'”’)]*)\s+(?=[A-Z])", norm_evidence):
+                preceding_text = norm_evidence[max(0, boundary.start() - 12) : boundary.start() + 1]
+                if re.search(
+                    r"\b(?:[a-z]|et\s+al|al|e\.g|i\.e|fig|eq|sec|ref|dr|prof|vs)\.$",
+                    preceding_text,
+                    re.I,
+                ):
+                    continue
+                if boundary.end() <= source_match.start():
+                    sentence_start = boundary.end()
+                elif boundary.start() >= source_match.end():
+                    sentence_end = boundary.start() + 1
+                    break
+            expanded_phrase = norm_evidence[sentence_start:sentence_end].strip()
+            if check_claim_support(expanded_phrase, evidence_quote):
+                return expanded_phrase
             return source_phrase
     return None
 
@@ -586,6 +608,14 @@ def matching_verified_anchor(evidence: EvidenceItem) -> CitationAnchor | None:
     )
 
 
+def _is_structural_response_line(line: str) -> bool:
+    clean_line = line.strip()
+    return (
+        clean_line.endswith(":")
+        or (clean_line.startswith(("#", "**")) and not clean_line.endswith((".", "!", "?")))
+    ) and len(clean_line) < 100
+
+
 def resolve_claim_anchor(
     db: Session,
     evidence: EvidenceItem,
@@ -614,14 +644,10 @@ def resolve_claim_anchor(
         verified_anchors.remove(primary)
         verified_anchors.insert(0, primary)
 
-    # 1. Direct monotonic claim support against verified anchors
-    for cand in verified_anchors:
-        if check_claim_support(clean_claim, cand.exact_quote):
-            return cand, None
-
-    # 2. Extract verbatim quoted phrases (e.g. model output wrapped in quotes)
+    # 1. Prefer a complete source sentence when a single-citation answer quotes
+    # only a fragment. The source text, not the model's wrapper, supplies the
+    # published wording.
     if cite_count == 1:
-        # Check if candidate quotes match any verified anchor
         for cand in verified_anchors:
             phrase = extract_verbatim_quoted_phrase(clean_claim, cand.exact_quote)
             if phrase is not None:
@@ -676,6 +702,13 @@ def resolve_claim_anchor(
                             update={"source_element_id": verified_anchors[0].source_element_id}
                         )
                     return new_anchor, cand_phrase
+
+    # 2. Direct monotonic claim support against verified anchors. Keep this after
+    # quoted extraction so ordered-token matching cannot retain a contextless
+    # fragment before the complete source sentence is considered.
+    for cand in verified_anchors:
+        if check_claim_support(clean_claim, cand.exact_quote):
+            return cand, None
 
     # 3. Check combined multi-element support for unquoted monotonic claims
     for i in range(len(verified_anchors) - 1):
@@ -1107,13 +1140,7 @@ class ChatService:
                 citation_validation["citation_markers"] += len(cite_matches_in_line)
 
                 # Retain section headers and transition/introductory lines
-                is_structure = (
-                    clean_line.endswith(":")
-                    or (
-                        clean_line.startswith(("#", "**"))
-                        and not clean_line.endswith((".", "!", "?"))
-                    )
-                ) and len(clean_line) < 100
+                is_structure = _is_structural_response_line(clean_line)
 
                 if is_structure and not cite_matches_in_line:
                     retained_lines.append(line)
@@ -1326,8 +1353,19 @@ class ChatService:
                             joined_sent = f"{bullet_prefix}{joined_sent}"
                     retained_lines.append(joined_sent)
 
+            while retained_lines and _is_structural_response_line(retained_lines[-1]):
+                retained_lines.pop()
             if retained_lines:
                 retained_paragraphs.append("\n".join(retained_lines))
+
+        # Citation filtering can remove every claim under a final heading. Do not
+        # publish that orphaned structure as though it were a complete section.
+        while retained_paragraphs and all(
+            _is_structural_response_line(line)
+            for line in retained_paragraphs[-1].splitlines()
+            if line.strip()
+        ):
+            retained_paragraphs.pop()
 
         if retained_paragraphs and (validated_citations or decision_preference_memories):
             formatted_answer = "\n\n".join(retained_paragraphs)

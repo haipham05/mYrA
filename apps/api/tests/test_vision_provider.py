@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 
 import httpx
 import pytest
@@ -152,6 +153,8 @@ def test_image_request_uses_inline_image_and_reports_provider_usage() -> None:
     assert result.reported_model == "deepseek-flash"
     assert client.payload["model"] == "deepseek-flash"
     assert client.payload["thinking"] == {"type": "disabled"}
+    assert client.payload["max_tokens"] == 512
+    assert "at most 3 short observations" in client.payload["messages"][0]["content"][0]["text"]
     image_part = client.payload["messages"][0]["content"][1]
     assert image_part["type"] == "image_url"
     assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
@@ -260,6 +263,25 @@ def test_malformed_structured_output_fails_with_safe_classification() -> None:
     assert "unexpected" not in str(error.value)
 
 
+def test_structured_output_enforces_compact_response_limits() -> None:
+    payload = {
+        "observations": [{"statement": f"Observation {index}"} for index in range(4)],
+        "readings": [],
+        "interpretation": "",
+        "uncertainty_notes": [],
+    }
+    client = _Client(_Response({"choices": [{"message": {"content": json.dumps(payload)}}]}))
+
+    with pytest.raises(VisionProviderError) as error:
+        asyncio.run(
+            _provider(client).analyze_structured(
+                VisionRequest(question="Describe this.", image_bytes=_png_bytes())
+            )
+        )
+
+    assert error.value.code == "INVALID_ANALYSIS"
+
+
 def test_visual_analysis_cache_reuses_only_matching_source_and_question() -> None:
     cache = JsonCache(_Redis())
     provider = _Vision()
@@ -308,6 +330,8 @@ def test_visual_cache_key_changes_when_prompt_version_changes(monkeypatch) -> No
     source = VisualSourceReference.from_source_metadata(_source_metadata(image))
     request = VisionRequest(question="Describe the curve.", image_bytes=image)
     original = _visual_cache_key(source=source, question=request.question, context=request.context)
+
+    assert vision.VISUAL_PROMPT_VERSION == "figure-analysis-v3"
 
     monkeypatch.setattr(vision, "VISUAL_PROMPT_VERSION", "figure-analysis-next")
 

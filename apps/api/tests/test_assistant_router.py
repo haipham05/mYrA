@@ -147,6 +147,78 @@ async def test_router_uses_search_ready_question_without_replacing_original_requ
 
 
 @pytest.mark.anyio
+async def test_router_uses_original_message_as_missing_research_goal() -> None:
+    request = _request(
+        message="Research how attention heads are combined and summarize reported results."
+    )
+    provider = _StubProvider(_decision("research"))
+
+    result = await AssistantRouter(provider=provider).route(request)
+
+    assert result.outcome is RouteOutcome.ROUTED
+    assert result.decision.intent is AssistantIntent.RESEARCH
+    assert result.decision.arguments == {"goal": request.message}
+    assert "research requires goal" in provider.system_prompt.casefold()
+
+
+@pytest.mark.anyio
+async def test_router_preserves_supplied_research_goal_and_subquestions() -> None:
+    request = _request(message="Prepare a literature brief.")
+    provider = _StubProvider(
+        _decision(
+            "research",
+            arguments={
+                "goal": "Compare reported attention mechanisms",
+                "subquestions": ["How are heads combined?", "What results are reported?"],
+            },
+        )
+    )
+
+    result = await AssistantRouter(provider=provider).route(request)
+
+    assert result.decision.arguments == {
+        "goal": "Compare reported attention mechanisms",
+        "subquestions": ["How are heads combined?", "What results are reported?"],
+    }
+
+
+@pytest.mark.anyio
+async def test_explicit_research_override_uses_short_message_as_goal() -> None:
+    request = _request(intent_override=AssistantIntent.RESEARCH)
+
+    result = await AssistantRouter(provider=_StubProvider("should not route")).route(request)
+
+    assert result.outcome is RouteOutcome.ROUTED
+    assert result.decision.arguments == {"goal": request.message}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("intent_override", [None, AssistantIntent.RESEARCH])
+async def test_research_goal_longer_than_tool_limit_requests_clarification(
+    intent_override: AssistantIntent | None,
+) -> None:
+    request = _request(message="x" * 2001, intent_override=intent_override)
+    provider = _StubProvider(_decision("research"))
+
+    result = await AssistantRouter(provider=provider).route(request)
+
+    assert result.outcome is RouteOutcome.NEEDS_CLARIFICATION
+    assert result.decision.intent is AssistantIntent.CLARIFY
+    assert result.decision.missing_information == ["research_goal_within_size_limit"]
+
+
+@pytest.mark.anyio
+async def test_research_goal_over_json_byte_limit_requests_clarification() -> None:
+    request = _request(message="研" * 1400, intent_override=AssistantIntent.RESEARCH)
+
+    result = await AssistantRouter(provider=_StubProvider("should not route")).route(request)
+
+    assert result.outcome is RouteOutcome.NEEDS_CLARIFICATION
+    assert result.decision.intent is AssistantIntent.CLARIFY
+    assert result.decision.missing_information == ["research_goal_within_size_limit"]
+
+
+@pytest.mark.anyio
 async def test_router_forces_requested_scope_even_if_model_returns_other_paper() -> None:
     request = _request()
     provider = _StubProvider(_decision(resolved_paper_ids=[str(uuid4())]))

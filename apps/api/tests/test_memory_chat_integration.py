@@ -674,7 +674,7 @@ async def test_chat_publishes_only_verified_quote_from_unsupported_wrapper(
     retriever = MagicMock()
     retriever.retrieve.return_value = [evidence]
     llm = AsyncMock()
-    llm.generate.return_value = f"{wrapped_claim} [E1]"
+    llm.generate.return_value = f"{wrapped_claim} [E1]\n## Limits of the supplied evidence"
     llm.model_name = "test-deepseek"
 
     with (
@@ -694,11 +694,12 @@ async def test_chat_publishes_only_verified_quote_from_unsupported_wrapper(
 
     assert "cures cancer" not in response.content
     assert "proves" not in response.content
-    assert f"“{quote.removesuffix('.')}” [1]" == response.content
+    assert "## Limits of the supplied evidence" not in response.content
+    assert f"“{quote}” [1]" == response.content
     assert len(response.citations) == 1
     assert retriever.retrieve.call_args.kwargs["query_embedding"] == [0.1, 0.2, 0.3]
     assert len(response.claim_supports) == 1
-    assert response.claim_supports[0].claim_text == quote.removesuffix(".")
+    assert response.claim_supports[0].claim_text == quote
     assert response.claim_supports[0].evidence_ids == ["E1"]
     assert "cures cancer" not in response.claim_supports[0].claim_text
     assert all(support.support_kind != "interpretation" for support in response.claim_supports)

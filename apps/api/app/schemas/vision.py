@@ -26,10 +26,10 @@ class VisualAnalysis(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    observations: list[VisualObservation] = Field(default_factory=list, max_length=20)
-    readings: list[VisualReading] = Field(default_factory=list, max_length=20)
-    interpretation: str = Field(default="", max_length=4000)
-    uncertainty_notes: list[str] = Field(default_factory=list, max_length=20)
+    observations: list[VisualObservation] = Field(default_factory=list, max_length=3)
+    readings: list[VisualReading] = Field(default_factory=list, max_length=2)
+    interpretation: str = Field(default="", max_length=1000)
+    uncertainty_notes: list[str] = Field(default_factory=list, max_length=2)
 
     @model_validator(mode="after")
     def require_analysis_content(self) -> "VisualAnalysis":

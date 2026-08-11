@@ -45,6 +45,13 @@ _ROUTER_SYSTEM_PROMPT = "\n".join(
         "user's selected scope.",
         "Keep arguments small and limited to simple JSON data needed by that intent. "
         "Do not include hidden reasoning.",
+        "Required tool arguments: research requires goal (the user's research objective) and may "
+        "include up to four subquestions; verify_claim requires claim; discover requires query; "
+        "experiment_plan requires objective; translate requires target_language='vi'; vision "
+        "requires question; graph may include action='query' or the explicitly requested "
+        "action='index'. Use the user's request text for its goal, claim, query, or objective "
+        "when it already states that content. Notes mutations require a clear action and target; "
+        "ask for clarification rather than guessing.",
         "Allowed intents: help, qa, read_paper, compare, verify_claim, discover, notes, report, "
         "research, gap_analysis, experiment_plan, translate, vision, graph, clarify.",
         "Required fields: intent, standalone_question, resolved_paper_ids, arguments, "
@@ -72,6 +79,36 @@ def _unavailable_decision() -> RouteDecision:
             "an action explicitly."
         ),
         action_summary="Clarify the requested action",
+    )
+
+
+def _research_arguments(message: str, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Fill an omitted research goal when bounded; otherwise ask for a shorter goal."""
+    normalized = dict(arguments)
+    goal = normalized.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        if len(message) > 2000:
+            return None
+        normalized["goal"] = message
+        goal = message
+    if len(goal) > 2000:
+        return None
+    try:
+        if len(json.dumps(normalized, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 4096:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return normalized
+
+
+def _research_goal_clarification() -> RouteDecision:
+    return RouteDecision(
+        intent=AssistantIntent.CLARIFY,
+        missing_information=["research_goal_within_size_limit"],
+        clarification=(
+            "Please shorten the research objective so it fits the supported request size."
+        ),
+        action_summary="Clarify the research objective",
     )
 
 
@@ -162,6 +199,14 @@ class AssistantRouter:
                 arguments = {"action": "query", "question": request.message}
             elif request.intent_override is AssistantIntent.VERIFY_CLAIM:
                 arguments = {"claim": request.message}
+            elif request.intent_override is AssistantIntent.RESEARCH:
+                normalized_arguments = _research_arguments(request.message, arguments)
+                if normalized_arguments is None:
+                    decision = _research_goal_clarification()
+                    return AssistantRouteResult(
+                        outcome=RouteOutcome.NEEDS_CLARIFICATION, decision=decision
+                    )
+                arguments = normalized_arguments
             decision = RouteDecision(
                 intent=request.intent_override,
                 resolved_paper_ids=selected_ids,
@@ -242,6 +287,13 @@ class AssistantRouter:
                         ),
                         action_summary="Clarify the paper reference",
                     )
+
+                if candidate.intent is AssistantIntent.RESEARCH:
+                    arguments = _research_arguments(request.message, candidate.arguments)
+                    if arguments is None:
+                        candidate = _research_goal_clarification()
+                    else:
+                        candidate.arguments = arguments
 
                 decision = candidate
                 outcome = (

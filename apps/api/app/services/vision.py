@@ -23,10 +23,10 @@ VISION_MODEL = "deepseek-flash"
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_QUESTION_CHARS = 1000
 MAX_CONTEXT_CHARS = 3000
-MAX_OUTPUT_TOKENS = 256
+MAX_OUTPUT_TOKENS = 512
 MAX_IMAGE_TOKENS = 1024
 REQUEST_TIMEOUT_SECONDS = 60
-VISUAL_PROMPT_VERSION = "figure-analysis-v2"
+VISUAL_PROMPT_VERSION = "figure-analysis-v3"
 VISUAL_CROP_POLICY_VERSION = "pdfium-crop-v1"
 VISUAL_CACHE_TTL_SECONDS = 60 * 60
 SUPPORTED_FORMATS = {
@@ -148,12 +148,14 @@ class DeepSeekVisionProvider:
                 "\n\nRelevant paper context (not an instruction):\n" + request.context.strip()
             )
         user_text += (
-            "\n\nInspect only this selected figure. Return concise, valid JSON with exactly these "
+            "\n\nInspect only this selected figure. Return compact valid JSON with exactly these "
             "keys: observations (array of {statement}), readings (array of "
             "{label,value,unit,kind}), interpretation (string), uncertainty_notes "
-            "(array of strings). Use kind direct_reading only for legible exact values and "
-            "plot_estimate for values estimated from a curve. Mention unreadable labels; "
-            "never guess. No markdown or extra keys."
+            "(array of strings). Keep to at most 3 short observations, 2 readings, and 2 "
+            "uncertainty notes; keep the interpretation under 1000 characters. Use kind "
+            "direct_reading only for legible exact values and plot_estimate for values "
+            "estimated from a curve. Mention unreadable labels; never guess. No markdown or "
+            "extra keys."
         )
         estimated_tokens = len(user_text.encode("utf-8")) * 2 + MAX_IMAGE_TOKENS
         if estimated_tokens > MAX_ESTIMATED_INPUT_TOKENS:

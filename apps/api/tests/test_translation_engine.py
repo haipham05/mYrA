@@ -4,14 +4,17 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import sys
 import types
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from app.logging import configure_logging
 from app.services.translation import engine_runner
 from app.services.translation.engine import (
     TranslationEngineError,
@@ -215,6 +218,51 @@ def test_protocol_accepts_split_footnote_preservation_reason() -> None:
     }
 
     assert _safe_event(event)["skip_reasons"] == {"preserved_split_footnote_layout_content": 3}
+
+
+def test_protocol_accepts_arxiv_stamp_skip_reason() -> None:
+    event = {
+        "type": "segment_summary",
+        "total": 1,
+        "completed": 0,
+        "skipped": 1,
+        "failed": 0,
+        "skip_reasons": {"arxiv_version_stamp": 1},
+    }
+
+    assert _safe_event(event)["skip_reasons"] == {"arxiv_version_stamp": 1}
+
+
+def test_protocol_accepts_reviewed_embedded_figure_skip_reason() -> None:
+    event = {
+        "type": "segment_summary",
+        "total": 1,
+        "completed": 0,
+        "skipped": 1,
+        "failed": 0,
+        "skip_reasons": {
+            "preserved_embedded_figure_text": 1,
+            "preserved_scientific_table_content": 1,
+        },
+    }
+
+    assert _safe_event(event)["skip_reasons"] == {
+        "preserved_embedded_figure_text": 1,
+        "preserved_scientific_table_content": 1,
+    }
+
+
+def test_protocol_accepts_reviewed_figure_and_citation_metadata_skip_reason() -> None:
+    event = {
+        "type": "segment_summary",
+        "total": 3,
+        "completed": 0,
+        "skipped": 3,
+        "failed": 0,
+        "skip_reasons": {"preserved_figure_or_citation_metadata": 3},
+    }
+
+    assert _safe_event(event)["skip_reasons"] == {"preserved_figure_or_citation_metadata": 3}
 
 
 def test_checkpoint_recorder_preserves_only_contiguous_split_footnotes() -> None:
@@ -632,6 +680,12 @@ def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
                     self.il_translator.translate_paragraph(paragraph, page)
             return docs
 
+        def process_cross_page_paragraph(
+            self, docs, executor, pbar, tracker, executor2, translated_ids
+        ):
+            del docs, executor, pbar, tracker, executor2, translated_ids
+            return None
+
         def translate_paragraph(self, batch_paragraph):
             results = []
             for paragraph in batch_paragraph:
@@ -689,6 +743,124 @@ def test_checkpoint_hooks_reconcile_fake_babeldoc_lifecycle_without_quote_leaks(
     assert prose.unicode in protocol_wire  # only the validated checkpoint carries its source span
     for paragraph in paragraphs[1:]:
         assert paragraph.unicode not in protocol_wire
+
+
+def test_checkpoint_hooks_keep_cross_page_paragraphs_in_page_local_batches(monkeypatch) -> None:
+    """The pinned engine's cross-page batch is bypassed without losing either unit."""
+    helper_name = "babeldoc.format.pdf.document_il.utils.paragraph_helper"
+    helper = types.ModuleType(helper_name)
+    helper.is_placeholder_only_paragraph = lambda _paragraph: False
+    helper.is_pure_numeric_paragraph = lambda _paragraph: False
+    monkeypatch.setitem(sys.modules, helper_name, helper)
+
+    paragraphs = [
+        _paragraph("The first paragraph appears at the end of page one.", "page-one"),
+        _paragraph("The second paragraph appears at the start of page two.", "page-two"),
+    ]
+    for paragraph in paragraphs:
+        paragraph.pdf_paragraph_composition = [SimpleNamespace(pdf_line=True)]
+    pages = [
+        SimpleNamespace(page_number=1, pdf_paragraph=[paragraphs[0]]),
+        SimpleNamespace(page_number=2, pdf_paragraph=[paragraphs[1]]),
+    ]
+    docs = SimpleNamespace(page=pages)
+    events: list[dict] = []
+    batches: list[list[int]] = []
+    monkeypatch.setattr(engine_runner, "_emit", events.append)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="b" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+
+    class FakeILTranslator:
+        def __init__(self, translation_config, llm_translator):
+            self.translation_config = translation_config
+            self.llm_translator = llm_translator
+            self.inputs: dict[int, str] = {}
+
+        def translate(self, docs):
+            return docs
+
+        def get_translate_input(self, paragraph, page_font_map, disable_rich_text_translate):
+            del page_font_map, disable_rich_text_translate
+            return paragraph.unicode
+
+        def pre_translate_paragraph(self, paragraph, tracker, page_font_map, xobj_font_map):
+            del xobj_font_map
+            value = self.get_translate_input(paragraph, page_font_map, False)
+            self.inputs[id(paragraph)] = value
+            return value, tracker
+
+        def post_translate_paragraph(self, paragraph, tracker, translate_input, translated_text):
+            del paragraph, tracker, translate_input
+            return translated_text
+
+        def translate_paragraph(self, paragraph, page):
+            del page
+            return self.llm_translator.translate_paragraph([paragraph])
+
+    class FakeLLMTranslator:
+        def __init__(self, translation_config, il_translator):
+            self.translation_config = translation_config
+            self.il_translator = il_translator
+            self.cross_page_calls = 0
+
+        def translate(self, docs):
+            self.process_cross_page_paragraph(docs, object(), None, object(), object(), set())
+            for page in docs.page:
+                for paragraph in page.pdf_paragraph:
+                    translate_input, tracker = self.il_translator.pre_translate_paragraph(
+                        paragraph, object(), None, None
+                    )
+                    if translate_input is not None:
+                        self.il_translator.translate_paragraph(paragraph, page)
+            return docs
+
+        def process_cross_page_paragraph(
+            self, docs, executor, pbar, tracker, executor2, translated_ids
+        ):
+            del docs, executor, pbar, tracker, executor2, translated_ids
+            self.cross_page_calls += 1
+
+        def translate_paragraph(self, batch_paragraph):
+            batches.append([id(paragraph) for paragraph in batch_paragraph])
+            return [
+                self.il_translator.post_translate_paragraph(
+                    paragraph,
+                    object(),
+                    self.il_translator.inputs[id(paragraph)],
+                    f"Bản dịch {index}",
+                )
+                for index, paragraph in enumerate(batch_paragraph, start=1)
+            ]
+
+    config = SimpleNamespace(min_text_length=5, glossaries=[])
+    il_translator = FakeILTranslator(config, None)
+    llm_translator = FakeLLMTranslator(config, il_translator)
+    il_translator.llm_translator = llm_translator
+    original_cross_page = llm_translator.process_cross_page_paragraph
+
+    with engine_runner._checkpoint_hooks(FakeILTranslator, FakeLLMTranslator, recorder):
+        assert llm_translator.process_cross_page_paragraph != original_cross_page
+        llm_translator.translate(docs)
+        counts = recorder.finish()
+
+    checkpoints = [event["segment"] for event in events if event["type"] == "checkpoint"]
+    assert llm_translator.cross_page_calls == 0
+    assert batches == [[id(paragraphs[0])], [id(paragraphs[1])]]
+    assert counts == {"total": 2, "completed": 2, "skipped": 0, "failed": 0}
+    assert [(item["page_number"], item["page_ordinal"]) for item in checkpoints] == [(1, 0), (2, 0)]
+    assert [item["source_quote"] for item in checkpoints] == [p.unicode for p in paragraphs]
+    assert len({item["source_sha256"] for item in checkpoints}) == 2
+    assert llm_translator.process_cross_page_paragraph == original_cross_page
+
+    with pytest.raises(RuntimeError, match="test exception"):
+        with engine_runner._checkpoint_hooks(FakeILTranslator, FakeLLMTranslator, recorder):
+            assert llm_translator.process_cross_page_paragraph != original_cross_page
+            raise RuntimeError("test exception")
+
+    assert llm_translator.process_cross_page_paragraph == original_cross_page
 
 
 def test_checkpoint_recorder_distinguishes_unselected_from_missing_checkpoint() -> None:
@@ -837,9 +1009,7 @@ def test_preprocess_decline_diagnostics_do_not_change_skip_or_completion_counts(
     }
 
 
-def test_checkpoint_recorder_preserves_vertical_layout_content_without_hiding_other_failures() -> (
-    None
-):
+def test_checkpoint_recorder_keeps_unclassified_vertical_text_unresolved() -> None:
     metadata = _paragraph("arXiv:1901.02860v3 [cs.LG] 2 Jun 2019")
     prose = _paragraph("A meaningful paragraph set vertically in the page margin.")
     recorder = engine_runner.TranslationCheckpointRecorder(
@@ -855,12 +1025,287 @@ def test_checkpoint_recorder_preserves_vertical_layout_content_without_hiding_ot
 
     counts = recorder.finish()
 
+    assert counts == {"total": 2, "completed": 0, "skipped": 0, "failed": 2}
+    assert recorder.skip_reasons() == {}
+    assert recorder.failure_causes() == {
+        "vertical_paragraph": 1,
+        "no_composition": 1,
+    }
+
+
+def test_checkpoint_recorder_preserves_vertical_text_only_on_reviewed_attention_pages() -> None:
+    source_hash = "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697"
+    embedded_pages = [
+        _paragraph(f"Embedded attention visualization labels on page {page_number}.")
+        for page_number in (12, 13, 14)
+    ]
+    for paragraph in embedded_pages:
+        paragraph.vertical = True
+    caption = _paragraph("Figure 3: Attention visualization.")
+    caption.vertical = True
+    caption.layout_label = "caption"
+    figure_caption = _paragraph("Figure 4: A second caption.")
+    figure_caption.vertical = True
+    figure_caption.layout_label = "figure_caption"
+    title = _paragraph("Attention Visualizations")
+    title.vertical = True
+    title.layout_label = "title"
+    outside = _paragraph("Vertical prose outside the reviewed pages.")
+    outside.vertical = True
+    body = _paragraph("Nonvertical prose on a reviewed page remains translatable.")
+
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256=source_hash,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(
+            page=[
+                SimpleNamespace(
+                    page_number=12,
+                    pdf_paragraph=[embedded_pages[0], caption, figure_caption, title, body],
+                ),
+                SimpleNamespace(page_number=13, pdf_paragraph=[embedded_pages[1]]),
+                SimpleNamespace(page_number=14, pdf_paragraph=[embedded_pages[2]]),
+                SimpleNamespace(page_number=11, pdf_paragraph=[outside]),
+            ]
+        )
+    )
+
+    assert all(
+        recorder.get(paragraph)["preserve_reason"] == "preserved_embedded_figure_text"
+        for paragraph in embedded_pages
+    )
+    assert "preserve_reason" not in recorder.get(caption)
+    assert "preserve_reason" not in recorder.get(figure_caption)
+    assert "preserve_reason" not in recorder.get(title)
+    assert "preserve_reason" not in recorder.get(outside)
+    assert "preserve_reason" not in recorder.get(body)
+
+    counts = recorder.finish()
+
+    assert counts == {"total": 8, "completed": 0, "skipped": 3, "failed": 5}
+    assert recorder.skip_reasons() == {"preserved_embedded_figure_text": 3}
+
+
+@pytest.mark.parametrize(
+    ("source_hash", "page_number"),
+    [
+        ("a" * 64, 12),
+        ("bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697", 11),
+        ("bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697", 15),
+    ],
+)
+def test_checkpoint_recorder_does_not_preserve_unreviewed_vertical_text(
+    source_hash: str, page_number: int
+) -> None:
+    paragraph = _paragraph("Meaningful vertical prose that must remain unresolved.")
+    paragraph.vertical = True
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256=source_hash,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=page_number, pdf_paragraph=[paragraph])])
+    )
+
+    assert "preserve_reason" not in recorder.get(paragraph)
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
+    assert recorder.failure_causes() == {"preprocessing_not_selected": 1}
+
+
+@pytest.mark.parametrize(
+    ("page_number", "ordinal", "quote", "expected", "layout_label"),
+    [
+        (5, 75, "O(1)", "preserved_scientific_table_content", "fallback_line"),
+        (7, 117, "BLEU", "preserved_scientific_table_content", "fallback_line"),
+        (8, 189, "drop", "preserved_scientific_table_content", "fallback_line"),
+        (12, 375, "r5", "preserved_embedded_figure_text", "fallback_line"),
+        (
+            3,
+            39,
+            "Scaled Dot-Product Attention",
+            "preserved_figure_or_citation_metadata",
+            "abandon",
+        ),
+        (
+            9,
+            314,
+            "Vinyals & Kaiser el al. (2014) [37]",
+            "preserved_figure_or_citation_metadata",
+            "fallback_line",
+        ),
+        (
+            9,
+            332,
+            "Huang & Harper (2009) [14]",
+            "preserved_figure_or_citation_metadata",
+            "fallback_line",
+        ),
+    ],
+)
+def test_reviewed_attention_preservation_matches_only_exact_source_units(
+    page_number: int, ordinal: int, quote: str, expected: str, layout_label: str
+) -> None:
+    assert (
+        engine_runner._reviewed_attention_preserve_reason(
+            source_sha256="bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+            page_number=page_number,
+            ordinal=ordinal,
+            source_quote=quote,
+            is_vertical=False,
+            layout_label=layout_label,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_hash", "page_number", "ordinal", "quote", "is_vertical", "label"),
+    [
+        ("a" * 64, 5, 75, "O(1)", False, "fallback_line"),
+        (
+            "bdfaa68d8984f0dc02beaca527b76f207d99b666d1d1da728ee0728182df697",
+            9,
+            350,
+            "incr",
+            False,
+            "fallback_line",
+        ),
+        (
+            "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+            5,
+            75,
+            "O(2)",
+            False,
+            "fallback_line",
+        ),
+        (
+            "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+            12,
+            448,
+            "Figure 3 caption",
+            True,
+            "caption",
+        ),
+        (
+            "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+            9,
+            314,
+            "Vinyals & Kaiser el al. (2014) [37]",
+            False,
+            "text",
+        ),
+        (
+            "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+            9,
+            314,
+            "Vinyals & Kaiser et al. (2014) [37]",
+            False,
+            "fallback_line",
+        ),
+    ],
+)
+def test_reviewed_attention_preservation_rejects_near_matches(
+    source_hash: str,
+    page_number: int,
+    ordinal: int,
+    quote: str,
+    is_vertical: bool,
+    label: str,
+) -> None:
+    assert (
+        engine_runner._reviewed_attention_preserve_reason(
+            source_sha256=source_hash,
+            page_number=page_number,
+            ordinal=ordinal,
+            source_quote=quote,
+            is_vertical=is_vertical,
+            layout_label=label,
+        )
+        is None
+    )
+
+
+def test_checkpoint_recorder_terminally_skips_formula_and_short_engine_declines() -> None:
+    formula = _paragraph("E = mc squared")
+    short = _paragraph("abc")
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[formula, short])])
+    )
+    recorder.get(formula)["preprocess_decline_reason"] = "formula_only"
+    recorder.get(short)["preprocess_decline_reason"] = "below_minimum_length"
+
+    counts = recorder.finish()
+    summary = _safe_event(
+        {
+            "type": "segment_summary",
+            **counts,
+            "skip_reasons": recorder.skip_reasons(),
+        }
+    )
+
+    assert counts == {"total": 2, "completed": 0, "skipped": 2, "failed": 0}
+    assert summary["skip_reasons"] == {
+        "protected_scientific_content": 1,
+        "below_engine_minimum": 1,
+    }
+
+
+def test_checkpoint_recorder_skips_only_recognized_rotated_arxiv_stamp() -> None:
+    stamp = _paragraph("2023 ug CL] 2 A 7 [cs. 03762v :1706. iv arX")
+    stamp.vertical = True
+    stamp.layout_label = "abandon"
+    prose = _paragraph("A meaningful paragraph set vertically in the page margin.")
+    prose.vertical = True
+    prose.layout_label = "abandon"
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[stamp, prose])])
+    )
+    recorder.get(prose)["preprocess_decline_reason"] = "vertical_paragraph"
+
+    counts = recorder.finish()
+
     assert counts == {"total": 2, "completed": 0, "skipped": 1, "failed": 1}
-    assert recorder.skip_reasons() == {"preserved_vertical_layout_content": 1}
-    assert recorder.failure_causes() == {"no_composition": 1}
+    assert recorder.skip_reasons() == {"arxiv_version_stamp": 1}
+    assert recorder.failure_causes() == {"vertical_paragraph": 1}
 
 
-def test_checkpoint_recorder_preserves_metadata_and_unselected_layout_fragments() -> None:
+@pytest.mark.parametrize(("vertical", "layout_label"), [(False, "abandon"), (True, "text")])
+def test_checkpoint_recorder_requires_vertical_abandon_arxiv_stamp(
+    vertical: bool, layout_label: str
+) -> None:
+    paragraph = _paragraph("2023 ug CL] 2 A 7 [cs. 03762v :1706. iv arX")
+    paragraph.vertical = vertical
+    paragraph.layout_label = layout_label
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+
+    counts = recorder.finish()
+
+    assert counts == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
+    assert recorder.skip_reasons() == {}
+
+
+def test_checkpoint_recorder_preserves_only_known_metadata_and_numeric_content() -> None:
     numeric = _paragraph("1.0 · 1020")
     reference = _paragraph("Vinyals & Kaiser el al. (2014) [37]")
     author_contact = _paragraph("Ashish Vaswani∗ Google Brain avaswani@google.com")
@@ -892,17 +1337,42 @@ def test_checkpoint_recorder_preserves_metadata_and_unselected_layout_fragments(
     recorder.complete(recorder.get(short_label), short_label.unicode)
     recorder.note_preprocessed(required, required.unicode)
 
-    assert recorder.finish() == {"total": 5, "completed": 0, "skipped": 4, "failed": 1}
+    assert recorder.finish() == {"total": 5, "completed": 0, "skipped": 2, "failed": 3}
     assert recorder.skip_reasons() == {
         "numeric_or_symbol_only": 1,
-        "preserved_fallback_layout_content": 1,
         "author_contact_metadata": 1,
-        "preserved_short_layout_label": 1,
     }
-    assert recorder.failure_causes() == {"missing_validated_checkpoint": 1}
+    assert recorder.failure_causes() == {
+        "preprocessing_not_selected": 1,
+        "unchanged_prose": 1,
+        "missing_validated_checkpoint": 1,
+    }
 
 
-def test_checkpoint_recorder_skips_only_short_unselected_content() -> None:
+def test_checkpoint_recorder_skips_exact_reviewed_attention_metadata() -> None:
+    source_hash = "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697"
+    paragraphs = [_paragraph(str(index)) for index in range(39)]
+    figure_heading = _paragraph("Scaled Dot-Product Attention")
+    figure_heading.layout_label = "abandon"
+    paragraphs.append(figure_heading)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256=source_hash,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(SimpleNamespace(page=[SimpleNamespace(page_number=3, pdf_paragraph=paragraphs)]))
+
+    assert recorder.get(figure_heading)["preserve_reason"] == (
+        "preserved_figure_or_citation_metadata"
+    )
+    recorder.note_preprocessed(figure_heading, None)
+
+    assert recorder.finish() == {"total": 40, "completed": 0, "skipped": 40, "failed": 0}
+    assert recorder.get(figure_heading)["skip_reason"] == ("preserved_figure_or_citation_metadata")
+    assert recorder.failure_causes() == {}
+
+
+def test_checkpoint_recorder_keeps_short_unclassified_text_unresolved() -> None:
     paragraph = _paragraph("abc")
     recorder = engine_runner.TranslationCheckpointRecorder(
         source_sha256="a" * 64,
@@ -913,8 +1383,9 @@ def test_checkpoint_recorder_skips_only_short_unselected_content() -> None:
         SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
     )
 
-    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
-    assert recorder.skip_reasons() == {"below_engine_minimum": 1}
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 0, "failed": 1}
+    assert recorder.skip_reasons() == {}
+    assert recorder.failure_causes() == {"preprocessing_not_selected": 1}
 
 
 def test_checkpoint_recorder_preserves_unchanged_official_title(monkeypatch) -> None:
@@ -966,7 +1437,7 @@ def test_checkpoint_recorder_allows_unchanged_equations_and_short_terms(
     assert recorder.finish()["failed"] == 0
 
 
-def test_checkpoint_recorder_skips_short_abandoned_layout_fragment() -> None:
+def test_checkpoint_recorder_skips_only_numeric_abandoned_layout_fragment() -> None:
     paragraph = _paragraph("1")
     paragraph.layout_label = "abandon"
     recorder = engine_runner.TranslationCheckpointRecorder(
@@ -978,7 +1449,7 @@ def test_checkpoint_recorder_skips_short_abandoned_layout_fragment() -> None:
         SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
     )
     assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
-    assert recorder.skip_reasons() == {"below_engine_minimum": 1}
+    assert recorder.skip_reasons() == {"numeric_or_symbol_only": 1}
 
 
 def test_checkpoint_recorder_rejects_unchanged_english_sentence_in_translated_prose(
@@ -1490,7 +1961,14 @@ def test_llm_batch_malformed_provider_json_sets_safe_failure_code(monkeypatch) -
     translator = engine_runner.SiliconFlowFreeTranslator(
         "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
     )
-    monkeypatch.setattr(translator, "_request", lambda _text: "not valid JSON")
+    attempts = 0
+
+    def invalid_json(_text: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        return "not valid JSON"
+
+    monkeypatch.setattr(translator, "_request", invalid_json)
     prefix = "instructions\n\n## Here is the input:\n\n"
     item = {"id": 0, "input": source, "layout_label": "text"}
 
@@ -1503,7 +1981,132 @@ def test_llm_batch_malformed_provider_json_sets_safe_failure_code(monkeypatch) -
         translator.llm_translate(prefix + json.dumps([item]))
 
     assert translator.failure_code == "PROVIDER_INVALID_JSON"
+    assert attempts == 3
     assert record["status"] == "pending"
+
+
+def test_llm_adapter_retries_transient_malformed_single_item_json(monkeypatch) -> None:
+    source = "The model improves the result for this task."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    responses = iter(
+        [
+            "not valid JSON",
+            json.dumps([{"id": 0, "output": "Mô hình cải thiện kết quả cho nhiệm vụ này."}]),
+        ]
+    )
+    attempts = 0
+
+    def request(_text: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        return next(responses)
+
+    monkeypatch.setattr(translator, "_request", request)
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    item = {"id": 0, "input": source, "layout_label": "text"}
+
+    with recorder.batch_scope():
+        recorder.note_preprocessed(paragraph, source)
+        result = json.loads(translator.llm_translate(prefix + json.dumps([item])))
+
+    assert result == [{"id": 0, "output": "Mô hình cải thiện kết quả cho nhiệm vụ này."}]
+    assert attempts == 2
+
+
+def test_llm_adapter_retries_single_item_with_invalid_result_schema(monkeypatch) -> None:
+    source = "The model improves the result for this task."
+    paragraph = _paragraph(source)
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    responses = iter(
+        [
+            json.dumps([{}]),
+            json.dumps([{"id": 0, "output": "Mô hình cải thiện kết quả cho nhiệm vụ này."}]),
+        ]
+    )
+    attempts = 0
+
+    def request(_text: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        return next(responses)
+
+    monkeypatch.setattr(translator, "_request", request)
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    item = {"id": 0, "input": source, "layout_label": "text"}
+
+    with recorder.batch_scope():
+        recorder.note_preprocessed(paragraph, source)
+        result = json.loads(translator.llm_translate(prefix + json.dumps([item])))
+
+    assert result == [{"id": 0, "output": "Mô hình cải thiện kết quả cho nhiệm vụ này."}]
+    assert attempts == 2
+
+
+def test_llm_adapter_splits_multi_item_invalid_result_schema(monkeypatch) -> None:
+    paragraphs = [
+        _paragraph("The first model improves the result.", "p-1"),
+        _paragraph("The second model improves the result.", "p-2"),
+    ]
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=paragraphs)]))
+    translator = engine_runner.SiliconFlowFreeTranslator(
+        "English", "Vietnamese", engine_runner.SharedRateLimiter(), recorder
+    )
+    responses = iter(
+        [
+            json.dumps([{}]),
+            json.dumps([{"id": 0, "output": "Mô hình thứ nhất cải thiện kết quả."}]),
+            json.dumps([{"id": 1, "output": "Mô hình thứ hai cải thiện kết quả."}]),
+        ]
+    )
+    prompts: list[str] = []
+
+    def request(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(translator, "_request", request)
+    prefix = "instructions\n\n## Here is the input:\n\n"
+    items = [
+        {"id": 0, "input": paragraphs[0].unicode, "layout_label": "text"},
+        {"id": 1, "input": paragraphs[1].unicode, "layout_label": "text"},
+    ]
+
+    with recorder.batch_scope():
+        for paragraph in paragraphs:
+            recorder.note_preprocessed(paragraph, paragraph.unicode)
+        result = json.loads(translator.llm_translate(prefix + json.dumps(items)))
+
+    assert [item["id"] for item in result] == [0, 1]
+    assert len(prompts) == 3
+    assert '"id": 0' in prompts[0] and '"id": 1' in prompts[0]
+    assert '"id": 0' in prompts[1] and '"id": 1' not in prompts[1]
+    assert '"id": 1' in prompts[2] and '"id": 0' not in prompts[2]
 
 
 def test_llm_adapter_keeps_normal_batch_response_on_single_request() -> None:
@@ -1842,6 +2445,96 @@ def test_subprocess_emits_progress_and_checkpoint_without_stderr(tmp_path: Path)
     assert seen_checkpoints[0]["source_quote"] == "q"
     assert completion["source_mapping"] == "available"
     assert completion["segment_counts"]["completed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("raw_event", "expected_error", "diagnostic", "unknown_error_code"),
+    [
+        (
+            {"type": "segment_summary", "skip_reasons": {"private event text": 1}},
+            "ENGINE_PROTOCOL_ERROR",
+            True,
+            False,
+        ),
+        ({"type": "error", "code": "ENGINE_INCOMPLETE"}, "ENGINE_INCOMPLETE", False, False),
+        ({"type": "error", "code": "private error message"}, "ENGINE_FAILURE", True, True),
+        ({"type": "error", "code": []}, "ENGINE_FAILURE", True, True),
+    ],
+)
+def test_subprocess_protocol_rejection_logs_metadata_without_event_content(
+    tmp_path: Path,
+    raw_event: dict,
+    expected_error: str,
+    diagnostic: bool,
+    unknown_error_code: bool,
+) -> None:
+    runner = tmp_path / "invalid_summary_runner.py"
+    encoded_event = json.dumps(raw_event, separators=(",", ":"))
+    runner.write_text(
+        f"import json, sys\nsys.stdin.readline()\nprint({encoded_event!r})\n",
+        encoding="utf-8",
+    )
+
+    async def run() -> None:
+        process = TranslationEngineProcess(
+            python=sys.executable,
+            runner=runner,
+            timeout_seconds=5,
+        )
+        await process.run({})
+
+    logger = logging.getLogger("myra")
+    engine_logger = logging.getLogger("myra.translation.engine")
+    original_handlers = logger.handlers
+    original_level = logger.level
+    original_propagate = logger.propagate
+    original_disabled = logger.disabled
+    original_engine_handlers = engine_logger.handlers
+    original_engine_level = engine_logger.level
+    original_engine_propagate = engine_logger.propagate
+    original_engine_disabled = engine_logger.disabled
+    original_engine_filters = engine_logger.filters
+    original_global_disable = logging.root.manager.disable
+    output = io.StringIO()
+    try:
+        with redirect_stderr(output):
+            logging.disable(logging.NOTSET)
+            logger.disabled = False
+            engine_logger.handlers = []
+            engine_logger.setLevel(logging.NOTSET)
+            engine_logger.propagate = True
+            engine_logger.disabled = False
+            engine_logger.filters = []
+            configure_logging("INFO")
+            with pytest.raises(TranslationEngineError, match=expected_error):
+                asyncio.run(run())
+    finally:
+        logger.handlers = original_handlers
+        logger.setLevel(original_level)
+        logger.propagate = original_propagate
+        logger.disabled = original_disabled
+        engine_logger.handlers = original_engine_handlers
+        engine_logger.setLevel(original_engine_level)
+        engine_logger.propagate = original_engine_propagate
+        engine_logger.disabled = original_engine_disabled
+        engine_logger.filters = original_engine_filters
+        logging.disable(original_global_disable)
+
+    output = output.getvalue()
+    records = [json.loads(line) for line in output.splitlines()]
+    diagnostics = [
+        record for record in records if record["message"] == "translation_engine_protocol_rejected"
+    ]
+    assert bool(diagnostics) is diagnostic
+    if diagnostic:
+        record = diagnostics[0]
+        assert record["event_type"] == raw_event["type"]
+        assert record["event_fields"] == sorted(raw_event)
+        assert record["unknown_error_code"] is unknown_error_code
+        if "skip_reasons" in raw_event:
+            assert record["unknown_skip_reason_count"] == 1
+    assert "private event text" not in output
+    assert "private error message" not in output
 
 
 async def _append(target: list, value: dict) -> None:
