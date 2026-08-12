@@ -3,7 +3,8 @@ import logging
 import re
 import time
 from collections import Counter
-from uuid import UUID
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
 
@@ -37,7 +38,7 @@ from app.services.graphrag.router import (
     retrieve_graph_evidence,
     route_query_intent,
 )
-from app.services.llm import generate_with_metadata, get_llm_provider
+from app.services.llm import GenerationOptions, generate_with_metadata, get_llm_provider
 from app.services.memory_service import (
     capture_conversation_memories,
     format_memories_for_prompt,
@@ -764,6 +765,10 @@ class ChatService:
         response_guidance: str | None = None,
         additional_evidence: list[EvidenceItem] | None = None,
         graph_lookup: bool | None = None,
+        persist_messages: bool = True,
+        query_embedding: list[float] | None = None,
+        retrieved_evidence: list[EvidenceItem] | None = None,
+        generation_options: GenerationOptions | None = None,
     ) -> MessageResponse:
         if assistant_run_id is not None:
             existing = (
@@ -805,6 +810,10 @@ class ChatService:
                 response_guidance,
                 additional_evidence,
                 graph_lookup,
+                persist_messages,
+                query_embedding,
+                retrieved_evidence,
+                generation_options,
             )
 
     async def _answer_question(
@@ -823,6 +832,10 @@ class ChatService:
         response_guidance: str | None = None,
         additional_evidence: list[EvidenceItem] | None = None,
         graph_lookup: bool | None = None,
+        persist_messages: bool = True,
+        supplied_query_embedding: list[float] | None = None,
+        retrieved_evidence: list[EvidenceItem] | None = None,
+        generation_options: GenerationOptions | None = None,
     ) -> MessageResponse:
         start_time = time.perf_counter()
         conv = get_conversation(db, conversation_id)
@@ -867,7 +880,9 @@ class ChatService:
             .order_by(Message.created_at.desc())
             .first()
         )
-        if not (last_msg and last_msg.role == MessageRole.USER and last_msg.content == question):
+        if persist_messages and not (
+            last_msg and last_msg.role == MessageRole.USER and last_msg.content == question
+        ):
             add_message(
                 db=db,
                 conversation_id=conversation_id,
@@ -877,32 +892,50 @@ class ChatService:
                 evidence=[],
             )
 
-        history_msgs = _recent_conversation_messages(db, conversation_id, question)
-        with telemetry.stage(
-            "chat.follow_up_resolution",
-            input={"question": question},
-            metadata={"history_message_count": len(history_msgs)},
-        ) as follow_up_observation:
-            retrieval_question, clarification = _resolve_follow_up_question(
-                db,
-                project_id,
-                question,
-                selected_paper_ids,
-                history_msgs,
-            )
-            if follow_up_observation is not None:
-                follow_up_observation.update(
-                    output={"retrieval_question": retrieval_question},
-                    metadata={
-                        "history_message_count": len(history_msgs),
-                        "outcome": "needs_clarification"
-                        if clarification
-                        else "resolved"
-                        if retrieval_question != question
-                        else "not_a_follow_up",
-                    },
+        history_msgs = (
+            _recent_conversation_messages(db, conversation_id, question) if persist_messages else []
+        )
+        if persist_messages:
+            with telemetry.stage(
+                "chat.follow_up_resolution",
+                input={"question": question},
+                metadata={"history_message_count": len(history_msgs)},
+            ) as follow_up_observation:
+                retrieval_question, clarification = _resolve_follow_up_question(
+                    db,
+                    project_id,
+                    question,
+                    selected_paper_ids,
+                    history_msgs,
                 )
+                if follow_up_observation is not None:
+                    follow_up_observation.update(
+                        output={"retrieval_question": retrieval_question},
+                        metadata={
+                            "history_message_count": len(history_msgs),
+                            "outcome": "needs_clarification"
+                            if clarification
+                            else "resolved"
+                            if retrieval_question != question
+                            else "not_a_follow_up",
+                        },
+                    )
+        else:
+            retrieval_question, clarification = question, None
         if clarification is not None:
+            if not persist_messages:
+                clarification = "Insufficient context to resolve this comparison question."
+                return MessageResponse(
+                    id=uuid4(),
+                    conversation_id=conversation_id,
+                    role=MessageRole.ASSISTANT,
+                    content=clarification,
+                    citations=[],
+                    evidence=[],
+                    model_name=None,
+                    token_count=None,
+                    created_at=datetime.now(UTC),
+                )
             clarification_message = add_message(
                 db=db,
                 conversation_id=conversation_id,
@@ -930,38 +963,46 @@ class ChatService:
         history_block = "\n".join(history_turns)
 
         # Share one query embedding between retrieval and semantic memory lookup.
-        query_embedding = None
-        try:
-            from app.services.embedding import get_embedding_provider
+        query_embedding = supplied_query_embedding
+        if query_embedding is None:
+            try:
+                from app.services.embedding import get_embedding_provider
 
-            embed_provider = get_embedding_provider()
-            query_embedding = await asyncio.to_thread(
-                embed_provider.embed_query, retrieval_question
-            )
-        except Exception:
-            # Retrieval retains its existing behavior and computes the vector itself
-            # if a memory-specific embedding attempt is unavailable.
-            query_embedding = None
+                embed_provider = get_embedding_provider()
+                query_embedding = await asyncio.to_thread(
+                    embed_provider.embed_query, retrieval_question
+                )
+            except Exception:
+                # Retrieval retains its existing behavior if embedding is unavailable.
+                query_embedding = None
 
         # 2a. Retrieve evidence
-        evidence_items: list[EvidenceItem] = self.retriever.retrieve(
-            db=db,
-            project_id=project_id,
-            query=retrieval_question,
-            query_embedding=query_embedding,
-            selected_paper_ids=selected_paper_ids,
+        evidence_items: list[EvidenceItem] = (
+            list(retrieved_evidence)
+            if retrieved_evidence is not None
+            else self.retriever.retrieve(
+                db=db,
+                project_id=project_id,
+                query=retrieval_question,
+                query_embedding=query_embedding,
+                selected_paper_ids=selected_paper_ids,
+            )
         )
         supplementary_evidence: list[EvidenceItem] = []
 
         # 2b. Retrieve active project memories with semantic scoring if available
-        raw_project_memories = retrieve_project_memories(
-            db=db,
-            project_id=project_id,
-            query=retrieval_question,
-            limit=5,
-            record_access=True,
-            query_embedding=query_embedding,
-            selected_paper_ids=selected_paper_ids,
+        raw_project_memories = (
+            retrieve_project_memories(
+                db=db,
+                project_id=project_id,
+                query=retrieval_question,
+                limit=5,
+                record_access=True,
+                query_embedding=query_embedding,
+                selected_paper_ids=selected_paper_ids,
+            )
+            if persist_messages
+            else []
         )
 
         decision_preference_memories: list[Memory] = []
@@ -1082,7 +1123,10 @@ class ChatService:
             metadata={"attempt": 1},
         ) as generation_observation:
             generation = await generate_with_metadata(
-                llm, system_prompt=system_prompt, user_prompt=user_prompt
+                llm,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                options=generation_options,
             )
             generation_usage = (
                 {
@@ -1439,26 +1483,29 @@ class ChatService:
             ):
                 raise AssistantRunCancelled
         token_count_estimate = max(1, len(formatted_answer.split()))
-        assistant_msg: Message = add_message(
-            db=db,
-            conversation_id=conversation_id,
-            role=MessageRole.ASSISTANT,
-            content=formatted_answer,
-            citations=[c.model_dump(mode="json") for c in validated_citations],
-            evidence=[e.model_dump(mode="json") for e in evidence_items],
-            model_name=model_name,
-            token_count=token_count_estimate,
-            assistant_run_id=assistant_run_id,
-            provider_usage=provider_usage,
-        )
+        assistant_msg: Message | None = None
+        if persist_messages:
+            assistant_msg = add_message(
+                db=db,
+                conversation_id=conversation_id,
+                role=MessageRole.ASSISTANT,
+                content=formatted_answer,
+                citations=[c.model_dump(mode="json") for c in validated_citations],
+                evidence=[e.model_dump(mode="json") for e in evidence_items],
+                model_name=model_name,
+                token_count=token_count_estimate,
+                assistant_run_id=assistant_run_id,
+                provider_usage=provider_usage,
+            )
 
         # 7. Post-turn memory capture (extract decisions/preferences from turns)
-        try:
-            capture_conversation_memories(
-                db=db, project_id=project_id, conversation_id=conversation_id
-            )
-        except Exception as e:
-            logger.warning("Failed to capture conversation memories: %s", e)
+        if persist_messages:
+            try:
+                capture_conversation_memories(
+                    db=db, project_id=project_id, conversation_id=conversation_id
+                )
+            except Exception as e:
+                logger.warning("Failed to capture conversation memories: %s", e)
 
         latency_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
@@ -1486,17 +1533,17 @@ class ChatService:
         )
 
         return MessageResponse(
-            id=assistant_msg.id,
+            id=assistant_msg.id if assistant_msg else uuid4(),
             conversation_id=conversation_id,
             role=MessageRole.ASSISTANT,
             content=formatted_answer,
             citations=validated_citations,
             claim_supports=validated_claim_supports,
             evidence=evidence_items,
-            model_name=assistant_msg.model_name,
-            token_count=assistant_msg.token_count,
-            provider_usage=assistant_msg.provider_usage,
-            created_at=assistant_msg.created_at,
+            model_name=assistant_msg.model_name if assistant_msg else model_name,
+            token_count=assistant_msg.token_count if assistant_msg else token_count_estimate,
+            provider_usage=assistant_msg.provider_usage if assistant_msg else provider_usage,
+            created_at=assistant_msg.created_at if assistant_msg else datetime.now(UTC),
         )
 
     answer = answer_question

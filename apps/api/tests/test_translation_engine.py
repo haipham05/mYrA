@@ -233,6 +233,21 @@ def test_protocol_accepts_arxiv_stamp_skip_reason() -> None:
     assert _safe_event(event)["skip_reasons"] == {"arxiv_version_stamp": 1}
 
 
+def test_protocol_accepts_short_fallback_omission_reason() -> None:
+    event = {
+        "type": "segment_summary",
+        "total": 1,
+        "completed": 0,
+        "skipped": 1,
+        "failed": 0,
+        "failure_reasons": {},
+        "skip_reasons": {"untranslated_short_fallback": 1},
+        "failure_units": [],
+    }
+
+    assert _safe_event(event)["skip_reasons"] == {"untranslated_short_fallback": 1}
+
+
 def test_protocol_accepts_reviewed_embedded_figure_skip_reason() -> None:
     event = {
         "type": "segment_summary",
@@ -1347,6 +1362,22 @@ def test_checkpoint_recorder_preserves_only_known_metadata_and_numeric_content()
         "unchanged_prose": 1,
         "missing_validated_checkpoint": 1,
     }
+
+
+def test_checkpoint_recorder_allows_short_unselected_fallback_line_as_visible_omission() -> None:
+    paragraph = _paragraph("from right to left")
+    paragraph.layout_label = "fallback_line"
+    recorder = engine_runner.TranslationCheckpointRecorder(
+        source_sha256="a" * 64,
+        glossary=[],
+        checkpoint_results=[],
+    )
+    recorder.begin(
+        SimpleNamespace(page=[SimpleNamespace(page_number=1, pdf_paragraph=[paragraph])])
+    )
+
+    assert recorder.finish() == {"total": 1, "completed": 0, "skipped": 1, "failed": 0}
+    assert recorder.skip_reasons() == {"untranslated_short_fallback": 1}
 
 
 def test_checkpoint_recorder_skips_exact_reviewed_attention_metadata() -> None:

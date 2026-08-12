@@ -18,12 +18,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+_APP_ROOT = Path(__file__).resolve().parents[3]
+if str(_APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_APP_ROOT))
+
 PROTOCOL_VERSION = 1
 PDF2ZH_VERSION = "2.9.0"
 BABELDOC_VERSION = "0.6.2"
 TRANSLATION_LANG_IN = "English"
 TRANSLATION_LANG_OUT = "Vietnamese"
-TRANSLATION_POLICY_VERSION = "siliconflowfree-v2"
+TRANSLATION_POLICY_VERSION = "nllb-local-v1-f8d333a0"
+NLLB_MODEL_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
 _REVIEWED_ATTENTION_FIGURE_SOURCE_SHA256 = (
     "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697"
 )
@@ -207,11 +212,13 @@ class TranslationCheckpointRecorder:
         source_sha256: str,
         glossary: list[dict[str, str]],
         checkpoint_results: list[dict[str, str]],
+        allow_untranslated_units: bool = False,
     ) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
             raise SafeEngineError("INVALID_ENGINE_REQUEST")
         self.source_sha256 = source_sha256
         self.glossary = glossary
+        self.allow_untranslated_units = allow_untranslated_units
         glossary_wire = json.dumps(
             glossary, sort_keys=True, ensure_ascii=False, separators=(",", ":")
         )
@@ -401,6 +408,9 @@ class TranslationCheckpointRecorder:
             validation_source, translated_text, layout_label=record.get("layout_label")
         )
         preserve_official_title = record.get("layout_label") == "title" and unchanged_prose
+        if unchanged_prose and not preserve_official_title and self.allow_untranslated_units:
+            self._skip(record, "local_model_unchanged")
+            return
         if unchanged_prose and not preserve_official_title:
             skip_reason = self._intentional_skip_reason(record)
             if skip_reason:
@@ -501,6 +511,11 @@ class TranslationCheckpointRecorder:
             return "protected_scientific_content"
         if record.get("preprocess_decline_reason") == "below_minimum_length":
             return "below_engine_minimum"
+        # BabelDOC may leave short fallback fragments outside its selectable
+        # translation batches. Keep them in English as explicit omissions rather
+        # than calling them engine-minimum skips or failing the partial PDF.
+        if label == "fallback_line" and len(normalized) <= 22:
+            return "untranslated_short_fallback"
         if _PROTECTED_TOKEN.fullmatch(normalized):
             return "placeholder_only"
         if re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", normalized):
@@ -1358,6 +1373,11 @@ async def _translate(request: dict[str, Any]) -> None:
         raise SafeEngineError("INVALID_ENGINE_REQUEST")
     output_dir.mkdir(parents=True, exist_ok=True)
     working_dir.mkdir(parents=True, exist_ok=True)
+    # BabelDOC creates its SQLite translation cache during import. Keep that
+    # cache writable and attempt-local instead of under the read-only asset mount.
+    engine_home = working_dir / "engine-home"
+    engine_home.mkdir(parents=True, exist_ok=True)
+    os.environ["HOME"] = str(engine_home)
     _preflight_offline_assets(layout_model)
 
     from babeldoc.docvision.doclayout import OnnxModel
@@ -1367,18 +1387,46 @@ async def _translate(request: dict[str, Any]) -> None:
     from babeldoc.format.pdf.translation_config import TranslationConfig
     from babeldoc.glossary import Glossary, GlossaryEntry
 
+    from app.services.translation.local_nllb import LocalNllbTranslator
+
     _install_no_download_asset_guards(high_level)
 
     recorder = TranslationCheckpointRecorder(
         source_sha256=request["source_pdf_sha256"],
         glossary=request.get("glossary", []),
         checkpoint_results=request.get("checkpoint_results", []),
+        allow_untranslated_units=True,
     )
     _ACTIVE_RECORDER = recorder
-    limiter = SharedRateLimiter(2)
-    translator = SiliconFlowFreeTranslator(
-        TRANSLATION_LANG_IN, TRANSLATION_LANG_OUT, limiter, recorder
-    )
+
+    class CheckpointedNllbTranslator(LocalNllbTranslator):
+        def translate(self, text: str, ignore_cache: bool = False, rate_limit_params=None) -> str:
+            del ignore_cache, rate_limit_params
+            record = getattr(recorder.local, "paragraph", None)
+            context_hash = hashlib.sha256(text.encode()).hexdigest()
+            if record:
+                key = recorder.key_for(record, context_hash)
+                cached = recorder.checkpoints.get(key)
+                if cached is not None and _checkpoint_is_usable(
+                    text, cached, record.get("layout_label")
+                ):
+                    return cached
+            protected_input, replacements = _lock_scientific_tokens(text)
+            translated = super().translate(protected_input)
+            translated = _restore_scientific_tokens(
+                translated, replacements, source=protected_input
+            )
+            if record:
+                if _protected_tokens(text) != _protected_tokens(translated):
+                    raise SafeEngineError("PROVIDER_MARKER_MISMATCH")
+                record["context_hash"] = context_hash
+            return translated
+
+    translator = CheckpointedNllbTranslator(revision=NLLB_MODEL_REVISION)
+    try:
+        translator._load()
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise SafeEngineError("MODEL_ASSETS_UNAVAILABLE") from exc
     glossary_entries = [
         GlossaryEntry(item["source"], item["target"]) for item in request.get("glossary", [])
     ]
@@ -1393,9 +1441,9 @@ async def _translate(request: dict[str, Any]) -> None:
         working_dir=working_dir,
         no_dual=True,
         no_mono=False,
-        qps=2,
-        pool_max_workers=2,
-        term_pool_max_workers=2,
+        qps=1,
+        pool_max_workers=1,
+        term_pool_max_workers=1,
         glossaries=glossaries,
         auto_extract_glossary=False,
         debug=False,
@@ -1427,9 +1475,7 @@ async def _translate(request: dict[str, Any]) -> None:
                     and resolved_output.is_file()
                 ):
                     counts = recorder.finish()
-                    if translator.failure_code:
-                        raise SafeEngineError(translator.failure_code)
-                    if counts["failed"] > 0 or (counts["total"] > 0 and counts["completed"] == 0):
+                    if counts["total"] > 0 and counts["completed"] == 0:
                         raise SafeEngineError("ENGINE_INCOMPLETE")
                     completion = {
                         "type": "complete",
@@ -1526,6 +1572,7 @@ def _checkpoint_hooks(
     original_pre = il_translator.pre_translate_paragraph
     original_post = il_translator.post_translate_paragraph
     original_single = il_translator.translate_paragraph
+    original_standard = il_translator.translate
     original_batch = llm_translator.translate_paragraph
     original_whole = llm_translator.translate
 
@@ -1593,6 +1640,13 @@ def _checkpoint_hooks(
         with recorder.paragraph_scope(paragraph):
             return original_single(self, paragraph, *args, **kwargs)
 
+    def standard_translate(self, docs):
+        recorder.begin(docs)
+        try:
+            return original_standard(self, docs)
+        finally:
+            recorder.emit_summary()
+
     def batch_translate(self, batch_paragraph, *args, **kwargs):
         with recorder.batch_scope():
             return original_batch(self, batch_paragraph, *args, **kwargs)
@@ -1629,6 +1683,7 @@ def _checkpoint_hooks(
     il_translator.get_translate_input = capture_translate_input
     il_translator.pre_translate_paragraph = pre_translate
     il_translator.post_translate_paragraph = post_translate
+    il_translator.translate = standard_translate
     il_translator.translate_paragraph = single_translate
     llm_translator.translate_paragraph = batch_translate
     llm_translator.process_cross_page_paragraph = skip_cross_page_batch

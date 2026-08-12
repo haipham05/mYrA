@@ -20,7 +20,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.crud.assistant_run import get_valid_approved_assistant_action
+from app.crud.assistant_run import (
+    assistant_run_cancel_requested,
+    get_valid_approved_assistant_action,
+)
 from app.crud.memory import (
     MemoryVersionConflictError,
     create_memory,
@@ -28,7 +31,11 @@ from app.crud.memory import (
     list_memories,
     update_memory,
 )
-from app.crud.translation import TranslationConflict, create_translation
+from app.crud.translation import (
+    LOCAL_TRANSLATION_POLICY_VERSION,
+    TranslationConflict,
+    create_translation,
+)
 from app.db.models import (
     AssistantApprovalAction,
     AssistantRun,
@@ -40,11 +47,6 @@ from app.db.models import (
 )
 from app.observability.telemetry import get_telemetry
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
-from app.schemas.comparison import (
-    DEFAULT_COMPARISON_DIMENSIONS,
-    ComparisonDimension,
-    ComparisonRequest,
-)
 from app.schemas.discovery import CatalogSearchResult
 from app.schemas.evidence import Citation, EvidenceItem
 from app.schemas.memory import (
@@ -59,13 +61,7 @@ from app.services.budget import BudgetDeniedError
 from app.services.cache import get_cache
 from app.services.chat_service import ChatService
 from app.services.claim_verification import ClaimAssessment, ClaimSource, verify_claim
-from app.services.comparison_matrix import build_comparison_matrix
 from app.services.comparison_retrieval import ComparisonEvidenceRetriever
-from app.services.comparison_synthesis import (
-    ComparisonSynthesis,
-    FindingKind,
-    synthesize_comparison,
-)
 from app.services.discovery.catalogs import CatalogSearchError, search_arxiv, search_openalex
 from app.services.discovery.deduplicate import deduplicate_candidates
 from app.services.graphrag.indexing import enqueue_existing_papers_for_graph
@@ -115,7 +111,9 @@ class ReadPaperArguments(ToolArguments):
 
 
 class CompareArguments(ToolArguments):
-    dimensions: list[ComparisonDimension] = Field(default_factory=list, max_length=7)
+    # Accepted for compatibility with already-persisted router decisions; never
+    # expands the comparison into multiple retrieval passes.
+    dimensions: list[str] = Field(default_factory=list, max_length=7)
 
 
 class VerifyClaimArguments(ToolArguments):
@@ -331,9 +329,9 @@ class ToolContext:
 
 ToolHandler = Callable[[ToolContext, AssistantToolInput], Awaitable[AssistantToolResult]]
 
-TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE = (
-    "The selected paper's text will be sent through PDFMathTranslate-next and its "
-    "SiliconFlowFree external proxy for translation. Translation is not local-only."
+TRANSLATION_LOCAL_DISCLOSURE = (
+    "The selected paper will be translated locally with facebook/nllb-200-distilled-600M. "
+    "Model files must be downloaded once during setup."
 )
 
 
@@ -368,7 +366,8 @@ def _translation_proposal_details(
         "source_sha256": paper.document_sha256,
         "target_language": "vi",
         "output_format": "translated_pdf_only",
-        "external_processing_disclosure": TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE,
+        "translation_policy": LOCAL_TRANSLATION_POLICY_VERSION,
+        "processing_disclosure": TRANSLATION_LOCAL_DISCLOSURE,
         "glossary_snapshot_identity": glossary_identity,
         "glossary_entry_count": len(glossary),
     }
@@ -553,7 +552,7 @@ async def _translate(context: ToolContext, tool_input: AssistantToolInput) -> As
             project_id=tool_input.request.project_id,
             paper_id=paper_ids[0],
             idempotency_key=f"assistant:{context.assistant_run_id}:{action.id}",
-            acknowledge_external_processing=True,
+            acknowledge_external_processing=False,
         )
     except (TranslationConflict, ValueError) as exc:
         return AssistantToolResult(
@@ -662,7 +661,7 @@ def _translation_job_result(
         status=ToolStatus.SUCCEEDED,
         result_type="translation_job",
         display_text=(
-            "The English-to-Vietnamese translation job is queued. "
+            "The local English-to-Vietnamese translation job is queued. "
             "You can check its status or download the translated-only PDF when it is ready."
         ),
         structured_payload={
@@ -725,12 +724,23 @@ def recover_approved_translation(
     if (
         translation is None
         or translation.source_sha256 != approved_snapshot.get("source_sha256")
-        or not translation.acknowledge_external_processing
         or approved_snapshot.get("target_language") != "vi"
         or approved_snapshot.get("output_format") != "translated_pdf_only"
-        or approved_snapshot.get("external_processing_disclosure")
-        != TRANSLATION_EXTERNAL_PROCESSING_DISCLOSURE
         or len(translation.glossary_snapshot) != approved_snapshot.get("glossary_entry_count")
+    ):
+        return None
+    if translation.provider_policy_version == LOCAL_TRANSLATION_POLICY_VERSION:
+        if (
+            translation.acknowledge_external_processing
+            or approved_snapshot.get("translation_policy") != LOCAL_TRANSLATION_POLICY_VERSION
+            or approved_snapshot.get("processing_disclosure") != TRANSLATION_LOCAL_DISCLOSURE
+        ):
+            return None
+    elif (
+        not translation.acknowledge_external_processing
+        or approved_snapshot.get("external_processing_disclosure")
+        != "The selected paper's text will be sent through PDFMathTranslate-next and its "
+        "SiliconFlowFree external proxy for translation. Translation is not local-only."
     ):
         return None
     glossary_identity = hashlib.sha256(
@@ -1680,25 +1690,29 @@ async def _compare(context: ToolContext, tool_input: AssistantToolInput) -> Assi
         raise TypeError("comparison arguments were not validated")
 
     paper_ids = tool_input.decision.resolved_paper_ids or tool_input.request.selected_paper_ids
-    request = ComparisonRequest(
-        project_id=tool_input.request.project_id,
-        paper_ids=paper_ids,
-        question=tool_input.request.message,
-        dimensions=arguments.dimensions or list(DEFAULT_COMPARISON_DIMENSIONS),
-    )
+    project_id = tool_input.request.project_id
+    question = tool_input.request.message
+    if len(paper_ids) < 2 or len(paper_ids) > 6 or len(set(paper_ids)) != len(paper_ids):
+        return AssistantToolResult(
+            status=ToolStatus.NEEDS_INPUT,
+            result_type="comparison_scope_unavailable",
+            display_text=(
+                "Select 2–6 different READY papers from this project before comparing them."
+            ),
+        )
     ready_ids = {
         row[0]
         for row in (
             context.db.query(Paper.id)
             .filter(
-                Paper.id.in_(request.paper_ids),
-                Paper.project_id == request.project_id,
+                Paper.id.in_(paper_ids),
+                Paper.project_id == project_id,
                 Paper.status == "READY",
             )
             .all()
         )
     }
-    if ready_ids != set(request.paper_ids):
+    if ready_ids != set(paper_ids):
         return AssistantToolResult(
             status=ToolStatus.NEEDS_INPUT,
             result_type="comparison_scope_unavailable",
@@ -1707,144 +1721,160 @@ async def _compare(context: ToolContext, tool_input: AssistantToolInput) -> Assi
 
     with get_telemetry().stage(
         "comparison.scope",
-        input={"question": request.question},
+        input={"question": question},
         metadata={
-            "paper_count": len(request.paper_ids),
-            "dimensions": [dimension.value for dimension in request.dimensions],
+            "paper_count": len(paper_ids),
             "scope": "explicit_selected_papers",
         },
     ) as observation:
         if observation is not None:
             observation.update(metadata={"outcome": "scoped"})
 
-    with get_telemetry().stage(
-        "comparison.retrieve",
-        input={"question": request.question},
-        metadata={"paper_count": len(request.paper_ids), "cache": "existing_retriever_policy"},
-    ) as observation:
-        retrieved = ComparisonEvidenceRetriever(context.chat_service.retriever).retrieve(
-            context.db,
-            request.project_id,
-            request.paper_ids,
-            [dimension.value for dimension in request.dimensions],
-            comparison_question=request.question,
-        )
+    from app.services.embedding import get_embedding_provider
 
-    with get_telemetry().stage(
-        "comparison.matrix",
-        metadata={"requested_cells": len(request.paper_ids) * len(request.dimensions)},
-    ) as observation:
-        matrix = build_comparison_matrix(request, retrieved)
-        if observation is not None:
-            observation.update(
-                metadata={
-                    "outcome": "scoped",
-                    "cell_count": len(matrix.cells),
-                    "candidate_excerpt_count": sum(len(cell.excerpts) for cell in matrix.cells),
+    shared_embedding = await asyncio.to_thread(get_embedding_provider().embed_query, question)
+    retrieved = ComparisonEvidenceRetriever(context.chat_service.retriever).retrieve(
+        context.db,
+        project_id,
+        paper_ids,
+        question,
+        query_embedding=shared_embedding,
+    )
+    paper_rows = {
+        row.id: row for row in context.db.query(Paper).filter(Paper.id.in_(paper_ids)).all()
+    }
+    provider = get_llm_provider()
+    options = (
+        GenerationOptions(max_output_tokens=512)
+        if isinstance(provider, DeepSeekLLMProvider)
+        else None
+    )
+    findings: list[dict[str, Any]] = []
+    citations: list[Citation] = []
+    evidence_payload: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    display_parts: list[str] = []
+    usage_totals: dict[str, int | None] | None = None
+    for index, paper_result in enumerate(retrieved, start=1):
+        if context.assistant_run_id is not None:
+            if context.worker_id is None or context.attempt_count is None:
+                raise ValueError("Comparison run requires its worker lease context")
+            if assistant_run_cancel_requested(
+                context.db,
+                context.assistant_run_id,
+                worker_id=context.worker_id,
+                attempt_count=context.attempt_count,
+            ):
+                from app.services.chat_service import AssistantRunCancelled
+
+                raise AssistantRunCancelled
+        paper = paper_rows[paper_result.paper_id]
+        if not paper_result.evidence:
+            summary = "Insufficient evidence found in this paper for the question."
+            findings.append(
+                {
+                    "paper_id": str(paper.id),
+                    "title": paper.title or paper.filename,
+                    "summary": summary,
+                    "evidence_available": False,
+                    "citations": [],
+                    "limitations": ["No relevant passages were retrieved."],
                 }
             )
-
-    try:
+            display_parts.append(f"### {paper.title or paper.filename}\n\n{summary}")
+            continue
         with get_telemetry().stage(
-            "comparison.synthesize",
-            input={"question": request.question},
-            metadata={
-                "candidate_excerpt_count": sum(len(cell.excerpts) for cell in matrix.cells),
-                "cache": "none",
-            },
+            "comparison.paper_qa",
+            input={"question": question, "paper_title": paper.title or paper.filename},
+            metadata={"paper_index": index, "paper_count": len(retrieved)},
         ) as observation:
-            synthesis = await synthesize_comparison(matrix, provider=get_llm_provider())
-            if observation is not None:
-                observation.update(
-                    metadata={
-                        "outcome": synthesis.outcome,
-                        "finding_count": len(synthesis.findings),
-                        "requested_model": synthesis.requested_model,
-                        "reported_model": synthesis.reported_model,
-                        "provider_usage": (
-                            asdict(synthesis.usage) if synthesis.usage is not None else None
+            response = await context.chat_service.answer_question(
+                context.db,
+                tool_input.request.conversation_id,
+                question,
+                retrieval_question=question,
+                paper_scope="paper",
+                selected_paper_ids=[paper.id],
+                response_guidance=(
+                    "Answer only from the supplied evidence in the selected paper. "
+                    "Be concise. Cite each factual claim using its evidence ID. If the evidence "
+                    "does not answer the question, say so."
+                ),
+                graph_lookup=False,
+                persist_messages=False,
+                query_embedding=shared_embedding,
+                retrieved_evidence=paper_result.evidence,
+                generation_options=options,
+            )
+            paper_citations: list[dict[str, Any]] = []
+            citation_index_map: dict[int, int] = {}
+            evidence_id_map = {item.id: f"P{index}_{item.id}" for item in response.evidence}
+            for citation in response.citations:
+                new_index = len(citations) + 1
+                citation_index_map[citation.citation_index] = new_index
+                copied = citation.model_copy(
+                    update={
+                        "citation_index": new_index,
+                        "evidence_id": evidence_id_map.get(
+                            citation.evidence_id, f"P{index}_{citation.evidence_id}"
                         ),
                     }
                 )
-    except Exception:
-        synthesis = ComparisonSynthesis(
-            outcome="failed",
-            warnings=["Comparison synthesis is unavailable; source excerpts are still available."],
-        )
-    with get_telemetry().stage(
-        "comparison.compatibility",
-        metadata={
-            "directly_comparable_count": sum(
-                item.comparability.status.value == "directly_comparable"
-                for item in synthesis.benchmark_comparisons
-            ),
-            "not_comparable_count": sum(
-                item.comparability.status.value == "not directly comparable"
-                for item in synthesis.benchmark_comparisons
-            ),
-        },
-    ) as observation:
-        if observation is not None:
-            observation.update(metadata={"outcome": "evaluated"})
-    citation_by_id = {
-        excerpt.evidence.id: excerpt.citation for cell in matrix.cells for excerpt in cell.excerpts
-    }
-    title_by_paper = {
-        excerpt.evidence.paper_id: excerpt.evidence.paper_title
-        for cell in matrix.cells
-        for excerpt in cell.excerpts
-        if excerpt.evidence.paper_title
-    }
-    rendered_findings: list[str] = []
-    for finding in synthesis.findings:
-        citation_indexes = [
-            citation_by_id[evidence_id].citation_index
-            for evidence_id in finding.evidence_ids
-            if evidence_id in citation_by_id
-        ]
-        if not citation_indexes:
-            continue
-        label = "Interpretation: " if finding.kind is FindingKind.INTERPRETATION else ""
-        citations_text = " ".join(f"[C{index}]" for index in citation_indexes)
-        rendered_findings.append(f"- {label}{finding.text} {citations_text}")
-    for comparison in synthesis.benchmark_comparisons:
-        citation_indexes = [
-            citation_by_id[evidence_id].citation_index
-            for evidence_id in comparison.evidence_ids
-            if evidence_id in citation_by_id
-        ]
-        citations_text = " ".join(f"[C{index}]" for index in citation_indexes)
-        left_title = title_by_paper.get(comparison.left_paper_id, "Paper A")
-        right_title = title_by_paper.get(comparison.right_paper_id, "Paper B")
-        status = (
-            "reported under matching conditions"
-            if comparison.comparability.status.value == "directly_comparable"
-            else "not directly comparable"
-        )
-        rendered_findings.append(
-            f"- Reported results: {left_title} — {comparison.left_result}; "
-            f"{right_title} — {comparison.right_result} ({status}). {citations_text}"
-        )
-
-    display_text = (
-        "\n".join(rendered_findings)
-        if rendered_findings
-        else (
-            "I found candidate passages but could not validate a concise comparison. "
-            "Review the source excerpts and evidence gaps below."
-        )
-    )
+                citations.append(copied)
+                paper_citations.append(copied.model_dump(mode="json"))
+            remapped_summary = re.sub(
+                r"\[(\d+)\]",
+                lambda match: (
+                    f"[{citation_index_map.get(int(match.group(1)), int(match.group(1)))}]"
+                ),
+                response.content,
+            )
+            evidence_payload.extend(
+                item.model_copy(update={"id": evidence_id_map.get(item.id, item.id)}).model_dump(
+                    mode="json"
+                )
+                for item in response.evidence
+            )
+            findings.append(
+                {
+                    "paper_id": str(paper.id),
+                    "title": paper.title or paper.filename,
+                    "summary": remapped_summary,
+                    "evidence_available": True,
+                    "citations": paper_citations,
+                    "limitations": [],
+                }
+            )
+            display_parts.append(f"### {paper.title or paper.filename}\n\n{remapped_summary}")
+            if response.provider_usage:
+                usage_totals = usage_totals or {}
+                for key, value in response.provider_usage.items():
+                    if value is not None:
+                        usage_totals[key] = (usage_totals.get(key) or 0) + value
+            if observation is not None:
+                observation.update(
+                    output={"answer": remapped_summary},
+                    metadata={
+                        "outcome": "answered" if response.citations else "insufficient_evidence",
+                        "citation_count": len(response.citations),
+                        "requested_model": response.model_name,
+                        "provider_usage": response.provider_usage,
+                    },
+                )
+    display_text = "\n\n".join(display_parts)
     return AssistantToolResult(
         status=ToolStatus.SUCCEEDED,
         result_type="comparison",
         display_text=display_text,
         structured_payload={
-            "matrix": matrix.model_dump(mode="json"),
-            "synthesis": synthesis.model_dump(mode="json"),
+            "version": 2,
+            "question": question,
+            "paper_findings": findings,
         },
-        citations=list(citation_by_id.values()),
-        warnings=[matrix.interpretation_notice, *synthesis.warnings],
-        usage=asdict(synthesis.usage) if synthesis.usage is not None else None,
+        citations=citations,
+        evidence=evidence_payload,
+        warnings=warnings,
+        usage=usage_totals,
     )
 
 

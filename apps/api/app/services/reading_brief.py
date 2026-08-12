@@ -28,6 +28,7 @@ limitations, or evaluation details from general knowledge."""
 
 _HEADING = re.compile(r"^\s{0,3}(?:#{1,3}\s+(.+?)|\*\*(.+?)\*\*:?|(.+?):)\s*$")
 _CITATION = re.compile(r"\[(\d+)\]")
+_QUOTED_SOURCE_TEXT = re.compile(r"“[^”]*”|\"[^\"]*\"")
 
 
 def parse_reading_brief_sections(content: str) -> list[dict[str, object]]:
@@ -63,7 +64,10 @@ def parse_reading_brief_sections(content: str) -> list[dict[str, object]]:
                 "title": title,
                 "content": text,
                 "citation_indexes": sorted(
-                    {int(match.group(1)) for match in _CITATION.finditer(text)}
+                    {
+                        int(match.group(1))
+                        for match in _CITATION.finditer(_QUOTED_SOURCE_TEXT.sub("", text))
+                    }
                 ),
             }
         )

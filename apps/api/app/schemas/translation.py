@@ -6,7 +6,9 @@ from pydantic import BaseModel, Field
 
 class TranslationCreate(BaseModel):
     project_id: UUID
-    acknowledge_external_processing: bool
+    # Accepted for clients carrying an older request shape; new local jobs do
+    # not send the document to an external translation service.
+    acknowledge_external_processing: bool = False
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 

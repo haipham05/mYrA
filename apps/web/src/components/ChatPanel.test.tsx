@@ -318,6 +318,56 @@ describe("ChatPanel", () => {
     expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
   });
 
+  it("renders per-paper comparison findings and their citations", () => {
+    const onCitationClick = vi.fn();
+    const result: AssistantRunResult = {
+      ...comparisonResult,
+      display_text: "Per-paper findings",
+      structured_payload: {
+        version: 2,
+        question: "What method is used?",
+        paper_findings: [
+          {
+            paper_id: "paper-123",
+            title: "Transformer Paper",
+            summary: "The paper uses attention. [1]",
+            evidence_available: true,
+            citations: [mockCitation],
+            limitations: [],
+          },
+        ],
+      },
+    };
+    const message: Message = {
+      id: "simple-comparison",
+      conversation_id: "conv-1",
+      role: "ASSISTANT",
+      content: result.display_text,
+      citations: [mockCitation],
+      evidence: [],
+      assistantResult: result,
+      created_at: new Date().toISOString(),
+    };
+
+    render(
+      <ChatPanel
+        messages={[message]}
+        isLoading={false}
+        onSendMessage={vi.fn()}
+        onCitationClick={onCitationClick}
+        activeCitation={null}
+        disabled={false}
+      />,
+    );
+
+    expect(
+      screen.getByRole("region", { name: "Paper comparison" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("The paper uses attention.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "[1]" }));
+    expect(onCitationClick).toHaveBeenCalledWith(mockCitation);
+  });
+
   it("shows benchmark comparability and opens sources from both papers", () => {
     const secondCitation: Citation = {
       ...mockCitation,

@@ -7,7 +7,19 @@ dependencies = [
     "pdf2zh-next==2.9.0",
     "babeldoc==0.6.2",
     "httpx>=0.27,<1.0",
+    "huggingface-hub==0.30.2",
+    "sentencepiece==0.2.0",
+    "torch==2.6.0+cpu",
+    "transformers==4.49.0",
 ]
 
 [tool.uv]
 package = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

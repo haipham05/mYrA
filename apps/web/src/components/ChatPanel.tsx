@@ -53,6 +53,13 @@ interface BenchmarkComparisonView {
   evidenceIds: string[];
 }
 
+interface PaperFindingView {
+  paperId: string;
+  title: string;
+  summary: string;
+  evidenceAvailable: boolean;
+}
+
 interface DiscoveryCandidateView {
   catalog: "openalex" | "arxiv";
   title: string;
@@ -562,6 +569,56 @@ export default function ChatPanel({
   const renderComparison = (message: Message) => {
     const result = message.assistantResult;
     if (result?.result_type !== "comparison") return null;
+    if (
+      isRecord(result.structured_payload) &&
+      Array.isArray(result.structured_payload.paper_findings)
+    ) {
+      const findings = result.structured_payload.paper_findings.flatMap(
+        (value): PaperFindingView[] =>
+          isRecord(value) &&
+          typeof value.title === "string" &&
+          typeof value.summary === "string" &&
+          typeof value.evidence_available === "boolean"
+            ? [
+                {
+                  paperId:
+                    typeof value.paper_id === "string"
+                      ? value.paper_id
+                      : value.title,
+                  title: value.title,
+                  summary: value.summary,
+                  evidenceAvailable: value.evidence_available,
+                },
+              ]
+            : [],
+      );
+      if (findings.length > 0) {
+        return (
+          <div
+            className="space-y-3"
+            aria-label="Paper comparison"
+            role="region"
+          >
+            {findings.map((finding) => (
+              <section
+                key={finding.paperId}
+                className="rounded border border-zinc-200 p-3"
+              >
+                <h3 className="text-sm font-semibold">{finding.title}</h3>
+                {!finding.evidenceAvailable && (
+                  <p className="text-xs text-zinc-500">
+                    No relevant evidence found.
+                  </p>
+                )}
+                <div className="mt-2 text-sm">
+                  {renderContent(finding.summary, result.citations)}
+                </div>
+              </section>
+            ))}
+          </div>
+        );
+      }
+    }
     const matrix = readComparisonMatrix(result.structured_payload);
     if (!matrix) return null;
     const benchmarkComparisons = readBenchmarkComparisons(

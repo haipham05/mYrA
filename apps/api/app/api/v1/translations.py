@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.crud.translation import (
+    LOCAL_TRANSLATION_POLICY_VERSION,
     TranslationConflict,
     cancel_translation,
     create_translation,
@@ -111,7 +112,7 @@ def submit_translation(
         metadata={
             "test_run": test_run,
             "language_pair": "en-vi",
-            "provider_policy": "siliconflowfree-v2",
+            "provider_policy": LOCAL_TRANSLATION_POLICY_VERSION,
         },
     ) as observation:
         try:

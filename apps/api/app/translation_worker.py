@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.crud.translation import (
+    LOCAL_TRANSLATION_POLICY_VERSION,
     claim_next_translation,
     complete_translation,
     fail_translation,
@@ -35,7 +36,7 @@ from app.observability.telemetry import get_telemetry
 logger = logging.getLogger("myra.translation_worker")
 LEASE_SECONDS = 300
 HEARTBEAT_SECONDS = 60
-MAX_JOB_SECONDS = 30 * 60
+MAX_JOB_SECONDS = 3 * 60 * 60
 
 _STAGE_MAP = {
     "SOURCE_DOWNLOAD": "SOURCE_DOWNLOAD",
@@ -64,6 +65,7 @@ class TranslationJob:
     worker_id: str
     attempt_token: str
     attempt_count: int
+    provider_policy_version: str = LOCAL_TRANSLATION_POLICY_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +127,7 @@ def _snapshot(translation: TranslationDocument, *, worker_id: str) -> Translatio
         worker_id=worker_id,
         attempt_token=translation.attempt_token,
         attempt_count=translation.attempt_count,
+        provider_policy_version=translation.provider_policy_version,
     )
 
 
@@ -144,7 +147,7 @@ class TranslationWorker:
         if poll_interval < 0 or heartbeat_interval <= 0:
             raise ValueError("poll_interval must be nonnegative and heartbeat positive")
         if not 0 < job_timeout <= MAX_JOB_SECONDS:
-            raise ValueError("job_timeout must be between 0 and 1800 seconds")
+            raise ValueError("job_timeout must be between 0 and 10800 seconds")
         if processor is None:
             from app.services.translation.processor import BabelDocTranslationProcessor
 
@@ -278,7 +281,7 @@ class TranslationWorker:
             self._fail(
                 job,
                 code="TRANSLATION_DEADLINE_EXCEEDED",
-                message="Translation exceeded the 30-minute processing limit.",
+                message="Translation exceeded the 3-hour processing limit.",
                 retryable=True,
             )
             logger.warning("translation_deadline_exceeded", extra={"translation_id": str(job.id)})

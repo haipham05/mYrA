@@ -19,7 +19,7 @@ from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.crud.translation import save_translation_segment
+from app.crud.translation import LOCAL_TRANSLATION_POLICY_VERSION, save_translation_segment
 from app.db.models import Paper, TranslationSegment
 from app.db.session import SessionLocal
 from app.observability.telemetry import get_telemetry
@@ -291,6 +291,13 @@ class BabelDocTranslationProcessor:
         *,
         on_progress: Callable[..., None],
     ) -> TranslationResult:
+        is_local_nllb = job.provider_policy_version == LOCAL_TRANSLATION_POLICY_VERSION
+        if not is_local_nllb:
+            raise TranslationProcessingError(
+                "TRANSLATION_POLICY_UNSUPPORTED",
+                "This job uses an older engine; its history and existing PDF remain available.",
+                retryable=False,
+            )
         storage = self.storage or get_storage()
         telemetry = get_telemetry()
         artifact_key: str | None = None
@@ -467,8 +474,9 @@ class BabelDocTranslationProcessor:
                     translation_id=str(job.id),
                     engine_version="2.9.0",
                     babeldoc_version="0.6.2",
-                    provider_policy="siliconflowfree-v2",
-                    documented_model="THUDM/GLM-4-9B-0414",
+                    provider_policy=job.provider_policy_version,
+                    model="facebook/nllb-200-distilled-600M",
+                    model_revision="f8d333a098d19b4fd9a8b18f94170487ad3f821d",
                     provider_reported_model=None,
                     provider_usage=None,
                     checkpoint_hits=len(checkpoints),
@@ -488,7 +496,7 @@ class BabelDocTranslationProcessor:
                         )
                     raise TranslationProcessingError(
                         exc.code,
-                        "Translation provider or engine did not complete this request.",
+                        "The local translation model or PDF engine did not complete this request.",
                         retryable=exc.code
                         in {
                             "ENGINE_PROTOCOL_ERROR",
@@ -505,10 +513,9 @@ class BabelDocTranslationProcessor:
             counts = completion.get("segment_counts", {})
             if (
                 completion.get("failure_code")
-                or counts.get("failed", 0) != 0
-                or counts.get("completed", 0) + counts.get("skipped", 0) != counts.get("total")
+                or counts.get("completed", 0) + counts.get("skipped", 0) + counts.get("failed", 0)
+                != counts.get("total")
                 or counts.get("completed", 0) == 0
-                or rejected_prose_units
             ):
                 failure_count = max(counts.get("failed", 0), len(rejected_prose_units))
                 failure_units = rejected_prose_units[:20]
@@ -519,7 +526,7 @@ class BabelDocTranslationProcessor:
                         "total_units": counts.get("total"),
                         "completed_units": counts.get("completed"),
                         "skipped_units": counts.get("skipped"),
-                        "failure_count": failure_count,
+                        "failure_count": failure_count + counts.get("failed", 0),
                         "failure_reasons": (
                             {"unchanged_prose": len(rejected_prose_units)}
                             if rejected_prose_units

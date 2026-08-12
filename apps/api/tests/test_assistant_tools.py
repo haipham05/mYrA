@@ -1,5 +1,6 @@
 import hashlib
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -10,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.base import Base
 from app.db.models import Memory, Message, Paper, PaperPage, Project
 from app.schemas.assistant import AssistantIntent, AssistantRunRequest, RouteDecision
+from app.schemas.chat import MessageResponse, MessageRole
 from app.schemas.evidence import AnchorStatus, Citation, EvidenceItem
 from app.services import assistant_tools
 from app.services.assistant_tools import (
@@ -382,7 +384,9 @@ def test_persisted_research_recovery_preserves_grounded_results(
 
 
 @pytest.mark.anyio
-async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp_path, monkeypatch):
+async def test_compare_tool_reuses_embedding_and_answers_each_paper_without_reranking(
+    tmp_path, monkeypatch
+):
     engine = create_engine(f"sqlite:///{tmp_path / 'compare.db'}")
     Base.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
@@ -402,26 +406,60 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
         db.add_all(papers)
         db.commit()
 
-        quote = (
-            "Image classification on ImageNet validation reports 90 percent top-1 accuracy "
-            "under single crop 224px."
-        )
+        quote = "The method uses image classification on ImageNet."
+        evidence_by_paper = {
+            paper.id: EvidenceItem(
+                id="E1",
+                paper_id=paper.id,
+                paper_title=paper.filename,
+                chunk_id=uuid4(),
+                quote=quote,
+                page_number=1,
+            )
+            for paper in papers
+        }
+        retrieval_calls = []
 
         class FakeRetriever:
-            def retrieve(self, _db, _project_id, _query, *, selected_paper_ids):
-                assert len(selected_paper_ids) == 1
-                return [
-                    EvidenceItem(
-                        id="E1",
-                        paper_id=selected_paper_ids[0],
-                        chunk_id=uuid4(),
-                        quote=quote,
-                        page_number=1,
-                    )
-                ]
+            def retrieve(
+                self,
+                _db,
+                _project_id,
+                query,
+                *,
+                query_embedding,
+                selected_paper_ids,
+                strategy,
+            ):
+                retrieval_calls.append((query, query_embedding, selected_paper_ids, strategy))
+                return [evidence_by_paper[selected_paper_ids[0]]]
 
         class FakeChatService:
             retriever = FakeRetriever()
+            calls = []
+
+            async def answer_question(self, _db, _conversation_id, question, **kwargs):
+                self.calls.append((question, kwargs))
+                item = kwargs["retrieved_evidence"][0]
+                citation = Citation(
+                    citation_index=1,
+                    evidence_id=item.id,
+                    paper_id=item.paper_id,
+                    page_number=item.page_number,
+                    quote=item.quote,
+                    anchor_status=AnchorStatus.VERIFIED,
+                )
+                return MessageResponse(
+                    id=uuid4(),
+                    conversation_id=request.conversation_id,
+                    role=MessageRole.ASSISTANT,
+                    content=f"“{quote}” [1]",
+                    citations=[citation],
+                    evidence=[item],
+                    model_name="test-model",
+                    provider_usage={"total_tokens": 8},
+                    created_at=datetime.now(UTC),
+                )
 
         class FakeProvider(LLMProvider):
             @property
@@ -429,27 +467,7 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
                 return "test"
 
             async def generate(self, _system_prompt, _user_prompt):
-                return (
-                    '{"findings":[{"text":"' + quote + '","kind":"direct","evidence_ids":["C1"]}],'
-                    '"benchmark_comparisons":[{"left_paper_id":"'
-                    + str(papers[0].id)
-                    + '","right_paper_id":"'
-                    + str(papers[1].id)
-                    + '","left_context":{"task":"image classification","dataset":"ImageNet",'
-                    '"split":"validation","metric":"top-1 accuracy","unit":"percent",'
-                    '"comparison_condition":"single crop 224px"},"right_context":{"task":"image '
-                    'classification","dataset":"ImageNet","split":"validation",'
-                    '"metric":"top-1 accuracy","unit":"percent","comparison_condition":"single '
-                    'crop 224px"},"left_result":"90 percent","right_result":"90 percent",'
-                    '"left_context_quote":"' + quote + '","right_context_quote":"' + quote + '",'
-                    '"left_evidence_ids":["C1"],"right_evidence_ids":["C2"]}]}'
-                )
-
-            async def generate_result(self, system_prompt, user_prompt):
-                return GenerationResult(
-                    content=await self.generate(system_prompt, user_prompt),
-                    usage=GenerationUsage(prompt_tokens=12, completion_tokens=4, total_tokens=16),
-                )
+                return "unused"
 
         telemetry_events = []
 
@@ -465,6 +483,14 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
 
         monkeypatch.setattr(assistant_tools, "get_llm_provider", lambda: FakeProvider())
         monkeypatch.setattr(assistant_tools, "get_telemetry", lambda: FakeTelemetry())
+        embedding = [0.1, 0.2]
+        from app.services import embedding as embedding_service
+
+        monkeypatch.setattr(
+            embedding_service,
+            "get_embedding_provider",
+            lambda: type("Embedding", (), {"embed_query": lambda _self, _query: embedding})(),
+        )
         request = AssistantRunRequest(
             message="Compare the selected methods",
             conversation_id=uuid4(),
@@ -486,35 +512,25 @@ async def test_compare_tool_returns_scoped_citations_and_validated_synthesis(tmp
             validate_tool_input(definition, request, decision),
         )
 
-        matrix = result.structured_payload["matrix"]
         assert result.status is ToolStatus.SUCCEEDED
         assert result.result_type == "comparison"
-        assert len(matrix["cells"]) == 2
-        synthesis = result.structured_payload["synthesis"]
-        assert synthesis["benchmark_comparisons"][0]["comparability"]["status"] == (
-            "directly_comparable"
-        )
-        assert "Reported results:" in result.display_text
-        assert {event.get("stage") for event in telemetry_events} >= {
-            "comparison.synthesize",
-            "comparison.compatibility",
-        }
+        assert len(result.structured_payload["paper_findings"]) == 2
+        assert "matrix" not in result.structured_payload
+        assert len(retrieval_calls) == 2
+        assert all(call[0] == request.message for call in retrieval_calls)
+        assert all(call[1] is embedding for call in retrieval_calls)
+        assert all(call[2][0] in request.selected_paper_ids for call in retrieval_calls)
+        assert all(call[3] == "hybrid-unreranked" for call in retrieval_calls)
+        assert len(FakeChatService.calls) == 2
+        assert all(not call[1]["persist_messages"] for call in FakeChatService.calls)
+        assert {event.get("stage") for event in telemetry_events} >= {"comparison.paper_qa"}
         assert [citation.paper_id for citation in result.citations] == [
             papers[0].id,
             papers[1].id,
         ]
-        assert result.usage == {
-            "prompt_tokens": 12,
-            "completion_tokens": 4,
-            "total_tokens": 16,
-            "prompt_cache_hit_tokens": None,
-            "prompt_cache_miss_tokens": None,
-        }
-        assert any(
-            event.get("metadata", {}).get("provider_usage", {}).get("total_tokens") == 16
-            for event in telemetry_events
-        )
-        assert "[C1]" in result.display_text
+        assert result.usage == {"total_tokens": 16}
+        assert result.display_text.count("[1]") == 1
+        assert result.display_text.count("[2]") == 1
     finally:
         db.close()
         Base.metadata.drop_all(engine)

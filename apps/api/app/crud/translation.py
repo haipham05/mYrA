@@ -12,6 +12,8 @@ from app.db.models import (
     TranslationSegment,
 )
 
+LOCAL_TRANSLATION_POLICY_VERSION = "nllb-local-v1-f8d333a0"
+
 _RETRYABLE_TRANSLATION_ERROR_CODES = {
     "ENGINE_DEADLINE_EXCEEDED",
     "ENGINE_INCOMPLETE",
@@ -44,8 +46,7 @@ def create_translation(
     idempotency_key: str,
     acknowledge_external_processing: bool,
 ) -> tuple[TranslationDocument, bool]:
-    if not acknowledge_external_processing:
-        raise TranslationConflict("External text processing must be acknowledged")
+    del acknowledge_external_processing
     project = db.get(Project, project_id)
     paper = db.get(Paper, paper_id)
     if not project or not paper or paper.project_id != project_id:
@@ -78,11 +79,12 @@ def create_translation(
         status="PENDING",
         stage="QUEUED",
         idempotency_key=idempotency_key,
-        acknowledge_external_processing=True,
+        acknowledge_external_processing=False,
         source_sha256=paper.document_sha256,
         source_storage_path=paper.storage_path,
         source_filename=paper.filename,
         source_page_count=paper.page_count,
+        provider_policy_version=LOCAL_TRANSLATION_POLICY_VERSION,
         glossary_snapshot=[
             {"source_term": entry.source_term, "preferred_translation": entry.preferred_translation}
             for entry in glossary

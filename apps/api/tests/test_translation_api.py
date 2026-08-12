@@ -8,7 +8,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.crud.translation import claim_next_translation, save_translation_segment
+from app.crud.translation import (
+    LOCAL_TRANSLATION_POLICY_VERSION,
+    claim_next_translation,
+    save_translation_segment,
+)
 from app.db.base import Base
 from app.db.models import Paper, PaperPage, Project, TranslationDocument
 from app.db.session import get_db
@@ -57,10 +61,12 @@ def translation_client(tmp_path):
         engine.dispose()
 
 
-def test_translation_requires_external_disclosure_and_project_ready_paper(translation_client):
+def test_local_translation_needs_no_external_disclosure_and_requires_ready_paper(
+    translation_client,
+):
     client, project_id, paper_id, foreign_project_id, session_factory = translation_client
     payload = {"project_id": str(project_id), "acknowledge_external_processing": False}
-    assert client.post(f"/api/v1/papers/{paper_id}/translations", json=payload).status_code == 409
+    assert client.post(f"/api/v1/papers/{paper_id}/translations", json=payload).status_code == 202
 
     payload["acknowledge_external_processing"] = True
     payload["idempotency_key"] = "test-request"
@@ -79,7 +85,7 @@ def test_translation_request_is_idempotent_and_project_scoped(translation_client
     client, project_id, paper_id, foreign_project_id, session_factory = translation_client
     payload = {
         "project_id": str(project_id),
-        "acknowledge_external_processing": True,
+        "acknowledge_external_processing": False,
         "idempotency_key": "same-request",
     }
     first = client.post(f"/api/v1/papers/{paper_id}/translations", json=payload)
@@ -91,7 +97,7 @@ def test_translation_request_is_idempotent_and_project_scoped(translation_client
     with session_factory() as db:
         saved = db.get(TranslationDocument, UUID(first.json()["id"]))
         assert saved is not None
-        assert saved.provider_policy_version == "siliconflowfree-v2"
+        assert saved.provider_policy_version == LOCAL_TRANSLATION_POLICY_VERSION
 
     assert (
         client.get(
@@ -164,12 +170,12 @@ def test_translation_request_marks_deliberate_live_validation(translation_client
     response = client.post(
         f"/api/v1/papers/{paper_id}/translations",
         headers={"X-MyRA-Test-Run": "true"},
-        json={"project_id": str(project_id), "acknowledge_external_processing": True},
+        json={"project_id": str(project_id), "acknowledge_external_processing": False},
     )
     assert response.status_code == 202
     assert observations[0]["name"] == "translation.request"
     assert observations[0]["metadata"]["test_run"] is True
-    assert observations[0]["metadata"]["provider_policy"] == "siliconflowfree-v2"
+    assert observations[0]["metadata"]["provider_policy"] == LOCAL_TRANSLATION_POLICY_VERSION
     assert observations[0]["input"] == {
         "project_id": str(project_id),
         "paper_id": str(paper_id),

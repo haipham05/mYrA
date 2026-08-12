@@ -8,7 +8,8 @@ services:
       context: .
       dockerfile: infrastructure/translation/Dockerfile
       args:
-        BASE_API_IMAGE: myra-api:latest
+        BASE_TRANSLATION_IMAGE: ${BASE_TRANSLATION_IMAGE:-myra-api:latest}
+        REUSE_TRANSLATION_ENV: ${REUSE_TRANSLATION_ENV:-0}
     restart: unless-stopped
     env_file:
       - path: .local/runtime/local-app.env
@@ -19,6 +20,7 @@ services:
       MYRA_RUNTIME_PROFILE: local
       MYRA_OBSERVABILITY_ENABLED: "true"
       MYRA_TRANSLATION_TEST_RUN: ${MYRA_TRANSLATION_TEST_RUN:-false}
+      MYRA_TRANSLATION_MODEL_PATH: /opt/myra-translation/nllb
       LANGFUSE_BASE_URL: http://langfuse-web:3000
       MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
     depends_on:
@@ -34,6 +36,12 @@ services:
       - type: bind
         source: ./.local/translation/babeldoc
         target: /tmp/.cache/babeldoc
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.local/translation/nllb
+        target: /opt/myra-translation/nllb
         read_only: true
         bind:
           create_host_path: false

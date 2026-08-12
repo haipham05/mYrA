@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from app.schemas.evidence import EvidenceItem
 from app.services.comparison_retrieval import ComparisonEvidenceRetriever
+from app.services.retrieval import HybridRetriever
 
 
 def _evidence(paper_id):
@@ -19,53 +20,42 @@ class FakeRetriever:
         self.responses = responses or {}
         self.calls = []
 
-    def retrieve(self, db, project_id, query, *, selected_paper_ids):
-        self.calls.append((db, project_id, query, selected_paper_ids))
+    def retrieve(self, db, project_id, query, *, query_embedding, selected_paper_ids, strategy):
+        self.calls.append((db, project_id, query, query_embedding, selected_paper_ids, strategy))
         return self.responses.get(selected_paper_ids[0], [])
 
 
-def test_retrieves_each_paper_and_dimension_with_exact_single_paper_scope():
+def test_comparison_uses_one_question_and_unreranked_search_per_paper():
     paper_a, paper_b = uuid4(), uuid4()
     evidence_a, evidence_b = _evidence(paper_a), _evidence(paper_b)
     retriever = FakeRetriever({paper_a: [evidence_a], paper_b: [evidence_b]})
-    db, project_id = object(), uuid4()
+    db, project_id, embedding = object(), uuid4(), [0.25, 0.75]
 
     results = ComparisonEvidenceRetriever(retriever).retrieve(
         db,
         project_id,
         [paper_a, paper_b],
-        ["method", "results"],
-        comparison_question="Compare their performance",
+        "How do the methods compare?",
+        query_embedding=embedding,
     )
 
-    assert [(item.paper_id, item.dimension) for item in results] == [
-        (paper_a, "method"),
-        (paper_a, "results"),
-        (paper_b, "method"),
-        (paper_b, "results"),
+    assert [result.evidence for result in results] == [[evidence_a], [evidence_b]]
+    assert len(retriever.calls) == 2
+    assert [call[2] for call in retriever.calls] == [
+        "How do the methods compare?",
+        "How do the methods compare?",
     ]
-    assert all(call[0] is db and call[1] == project_id for call in retriever.calls)
-    assert [call[3] for call in retriever.calls] == [
-        [paper_a],
-        [paper_a],
-        [paper_b],
-        [paper_b],
-    ]
-    assert results[0].evidence == [evidence_a]
-    assert results[2].evidence == [evidence_b]
-    assert all("Compare their performance" in item.query for item in results)
+    assert all(call[3] is embedding for call in retriever.calls)
+    assert [call[4] for call in retriever.calls] == [[paper_a], [paper_b]]
+    assert all(call[5] == "hybrid-unreranked" for call in retriever.calls)
 
 
-def test_empty_retrieval_is_kept_as_an_explicit_empty_cell():
-    paper_id = uuid4()
-    result = ComparisonEvidenceRetriever(FakeRetriever()).retrieve(
-        object(), uuid4(), [paper_id], ["limitations"]
-    )
+def test_comparison_search_defaults_are_bounded_to_twelve_and_four():
+    retriever = ComparisonEvidenceRetriever()
 
-    assert len(result) == 1
-    assert result[0].paper_id == paper_id
-    assert result[0].dimension == "limitations"
-    assert result[0].evidence == []
+    assert isinstance(retriever._retriever, HybridRetriever)
+    assert retriever._retriever.top_candidates == 12
+    assert retriever._retriever.top_evidence == 4
 
 
 def test_foreign_evidence_is_dropped_at_service_boundary():
@@ -73,22 +63,8 @@ def test_foreign_evidence_is_dropped_at_service_boundary():
     retriever = FakeRetriever({requested_paper: [_evidence(foreign_paper)]})
 
     result = ComparisonEvidenceRetriever(retriever).retrieve(
-        object(), uuid4(), [requested_paper], ["dataset"]
+        object(), uuid4(), [requested_paper], "What is the method?"
     )
 
+    assert result[0].paper_id == requested_paper
     assert result[0].evidence == []
-
-
-def test_query_is_deterministic_whitespace_normalized_and_bounded():
-    paper_id = uuid4()
-    retriever = FakeRetriever()
-    result = ComparisonEvidenceRetriever(retriever).retrieve(
-        object(),
-        uuid4(),
-        [paper_id],
-        ["  method   and architecture  "],
-        comparison_question="  How   does it work?  ",
-    )
-
-    assert result[0].query == ("How does it work?\nComparison dimension: method and architecture")
-    assert len(result[0].query) <= 2 * 240 + len("\nComparison dimension: ")

@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = 1
-MAX_JOB_SECONDS = 30 * 60
+# A full scientific PDF may need more than 30 minutes on CPU-only NLLB.
+# Heartbeats and per-unit checkpoints keep longer jobs recoverable/cancellable.
+MAX_JOB_SECONDS = 3 * 60 * 60
 _SAFE_PROGRESS_STAGES = {
     "layout_analysis",
     "term_extraction",
@@ -24,6 +26,7 @@ _SAFE_SKIP_REASONS = frozenset(
     {
         "empty",
         "below_engine_minimum",
+        "untranslated_short_fallback",
         "protected_scientific_content",
         "placeholder_only",
         "numeric_or_symbol_only",
@@ -36,6 +39,7 @@ _SAFE_SKIP_REASONS = frozenset(
         "preserved_split_footnote_layout_content",
         "preserved_figure_or_citation_metadata",
         "arxiv_version_stamp",
+        "local_model_unchanged",
     }
 )
 _SAFE_ENGINE_ERROR_CODES = frozenset(
@@ -55,6 +59,7 @@ _SAFE_ENGINE_ERROR_CODES = frozenset(
         "PROVIDER_RATE_LIMITED",
         "PROVIDER_UNAVAILABLE",
         "ENGINE_INCOMPLETE",
+        "MODEL_ASSETS_UNAVAILABLE",
         "INVALID_ENGINE_REQUEST",
     }
 )
@@ -83,6 +88,7 @@ def _minimal_environment(extra: Mapping[str, str] | None = None) -> dict[str, st
         "LC_ALL",
         "HF_HOME",
         "MYRA_TRANSLATION_ASSET_DIR",
+        "MYRA_TRANSLATION_MODEL_PATH",
     }
     source = dict(os.environ)
     if extra:
@@ -253,7 +259,7 @@ class TranslationEngineProcess:
         timeout_seconds: int = MAX_JOB_SECONDS,
     ) -> None:
         if not 1 <= timeout_seconds <= MAX_JOB_SECONDS:
-            raise ValueError("timeout_seconds must be between 1 and 1800")
+            raise ValueError("timeout_seconds must be between 1 and 10800")
         self.python = str(python)
         self.runner = str(runner)
         self.env = _minimal_environment(env)
