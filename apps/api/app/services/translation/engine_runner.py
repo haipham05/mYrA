@@ -1384,7 +1384,7 @@ async def _translate(request: dict[str, Any]) -> None:
     from babeldoc.format.pdf import high_level
     from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
     from babeldoc.format.pdf.document_il.midend.il_translator_llm_only import ILTranslatorLLMOnly
-    from babeldoc.format.pdf.translation_config import TranslationConfig
+    from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
     from babeldoc.glossary import Glossary, GlossaryEntry
 
     from app.services.translation.local_nllb import LocalNllbTranslator
@@ -1446,6 +1446,7 @@ async def _translate(request: dict[str, Any]) -> None:
         term_pool_max_workers=1,
         glossaries=glossaries,
         auto_extract_glossary=False,
+        watermark_output_mode=WatermarkOutputMode.NoWatermark,
         debug=False,
         use_rich_pbar=False,
     )

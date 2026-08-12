@@ -345,6 +345,56 @@ def test_restarted_processor_loads_only_integrity_checked_checkpoints(database):
     ]
 
 
+def test_new_translation_version_reuses_same_source_completed_checkpoints(database):
+    source = FIXTURE_PDF.read_bytes()
+    job = _create_processing_job(database, source)
+    translated_text = "Nguồn đã dịch được kiểm tra và lưu lại."
+    key = hashlib.sha256(b"version-independent checkpoint identity").hexdigest()
+    translated_hash = hashlib.sha256(translated_text.encode()).hexdigest()
+
+    with database() as db:
+        original = db.get(TranslationDocument, job.id)
+        previous = TranslationDocument(
+            project_id=job.project_id,
+            paper_id=job.paper_id,
+            status="COMPLETED",
+            stage="COMPLETED",
+            idempotency_key="previous-completed-version",
+            acknowledge_external_processing=True,
+            source_sha256=job.source_sha256,
+            source_storage_path=original.source_storage_path,
+            source_filename=original.source_filename,
+            source_page_count=original.source_page_count,
+            glossary_snapshot=list(job.glossary_snapshot),
+            provider_policy_version=job.provider_policy_version,
+        )
+        db.add(previous)
+        db.flush()
+        db.add(
+            TranslationSegment(
+                translation_id=previous.id,
+                engine_checkpoint_key=key,
+                ordinal=0,
+                source_page_number=1,
+                source_text_hash=hashlib.sha256(b"original sentence").hexdigest(),
+                source_quote="Original sentence",
+                translated_text=translated_text,
+                translated_text_hash=translated_hash,
+                status="VALIDATED",
+            )
+        )
+        db.commit()
+
+    processor = BabelDocTranslationProcessor(session_factory=database)
+    assert processor._existing_checkpoints(job) == [
+        {
+            "segment_key": key,
+            "translated_text": translated_text,
+            "translated_sha256": translated_hash,
+        }
+    ]
+
+
 def test_processor_rejects_incomplete_engine_output(database, tmp_path):
     source = FIXTURE_PDF.read_bytes()
     job = _create_processing_job(database, source)

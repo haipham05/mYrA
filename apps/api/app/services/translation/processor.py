@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from pypdf import PdfReader
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.crud.translation import LOCAL_TRANSLATION_POLICY_VERSION, save_translation_segment
-from app.db.models import Paper, TranslationSegment
+from app.db.models import Paper, TranslationDocument, TranslationSegment
 from app.db.session import SessionLocal
 from app.observability.telemetry import get_telemetry
 from app.services.translation.engine import TranslationEngineError, TranslationEngineProcess
@@ -143,8 +143,20 @@ class BabelDocTranslationProcessor:
     def _existing_checkpoints(self, job: TranslationJob) -> list[dict[str, str]]:
         with self.session_factory() as db:
             rows = db.scalars(
-                select(TranslationSegment).where(
-                    TranslationSegment.translation_id == job.id,
+                select(TranslationSegment)
+                .join(
+                    TranslationDocument,
+                    TranslationDocument.id == TranslationSegment.translation_id,
+                )
+                .where(
+                    TranslationDocument.project_id == job.project_id,
+                    TranslationDocument.paper_id == job.paper_id,
+                    TranslationDocument.source_sha256 == job.source_sha256,
+                    TranslationDocument.provider_policy_version == job.provider_policy_version,
+                    or_(
+                        TranslationDocument.id == job.id,
+                        TranslationDocument.status == "COMPLETED",
+                    ),
                     TranslationSegment.status.in_(["VALIDATED", "PRESERVED"]),
                     TranslationSegment.engine_checkpoint_key.is_not(None),
                 )
@@ -516,6 +528,8 @@ class BabelDocTranslationProcessor:
                 or counts.get("completed", 0) + counts.get("skipped", 0) + counts.get("failed", 0)
                 != counts.get("total")
                 or counts.get("completed", 0) == 0
+                or counts.get("failed", 0) > 0
+                or bool(rejected_prose_units)
             ):
                 failure_count = max(counts.get("failed", 0), len(rejected_prose_units))
                 failure_units = rejected_prose_units[:20]
