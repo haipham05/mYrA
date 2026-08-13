@@ -1,0 +1,9 @@
+services:
+  api:
+    gpus: all
+
+  worker:
+    gpus: all
+
+  translation-worker:
+    gpus: all

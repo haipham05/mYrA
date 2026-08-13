@@ -171,10 +171,14 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
     def _load_model(self):
         if self._model is None:
             try:
+                import torch
                 from sentence_transformers import SentenceTransformer
 
                 self._model = SentenceTransformer(
-                    self.model_name, revision=self.model_version, local_files_only=True
+                    self.model_name,
+                    revision=self.model_version,
+                    local_files_only=True,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
                 )
             except Exception as err:
                 raise RuntimeError(

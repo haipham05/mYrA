@@ -26,7 +26,7 @@ class TranslationInputTooLongError(ValueError):
 
 
 class LocalNllbTranslator:
-    """Translate text using only a locally cached NLLB model on CPU.
+    """Translate text using the locally cached NLLB model on CUDA when available.
 
     Model and tokenizer loading are lazy, so importing this module does not
     affect normal API/RAG startup. ``revision`` should be pinned by the caller
@@ -44,6 +44,7 @@ class LocalNllbTranslator:
         self._tokenizer: Any | None = None
         self._model: Any | None = None
         self._target_token_id: int | None = None
+        self._device = "cpu"
 
     def translate(self, text: str) -> str:
         """Translate prose, retaining protected markers and original spacing."""
@@ -67,6 +68,9 @@ class LocalNllbTranslator:
     def _load(self) -> None:
         if self._model is not None:
             return
+        import torch
+
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
         if self._loader is not None:
             self._tokenizer, self._model = self._loader(
                 MODEL_ID,
@@ -87,7 +91,7 @@ class LocalNllbTranslator:
             )
             self._model = AutoModelForSeq2SeqLM.from_pretrained(model_source, **kwargs)
 
-        self._model.to("cpu")
+        self._model.to(self._device)
         self._model.eval()
         self._target_token_id = self._tokenizer.convert_tokens_to_ids(TARGET_LANGUAGE)
 
@@ -144,6 +148,7 @@ class LocalNllbTranslator:
             truncation=False,
             return_tensors="pt",
         )
+        inputs = inputs.to(self._device)
         input_ids = inputs["input_ids"]
         if input_ids.shape[-1] > MAX_INPUT_TOKENS:
             raise TranslationInputTooLongError("NLLB input exceeds its token limit.")

@@ -9,7 +9,7 @@ dependencies = [
     "httpx>=0.27,<1.0",
     "huggingface-hub==0.30.2",
     "sentencepiece==0.2.0",
-    "torch==2.6.0+cpu",
+    "torch==2.14.1+cu126",
     "transformers==4.49.0",
 ]
 
@@ -17,9 +17,9 @@ dependencies = [
 package = false
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+torch = { index = "pytorch-cu126" }

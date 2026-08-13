@@ -7,13 +7,13 @@ COPY apps/api/translation-engine/requirements.txt /opt/myra-translation/requirem
 COPY apps/api/translation-engine/nllb-requirements.txt /opt/myra-translation/nllb-requirements.txt
 RUN if [ "$REUSE_TRANSLATION_ENV" = "1" ] && [ -x /opt/myra-translation/.venv/bin/pip ]; then \
         /opt/myra-translation/.venv/bin/pip install --timeout 120 \
-            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://download.pytorch.org/whl/cu126 \
             --require-hashes --no-deps --no-cache-dir \
             -r /opt/myra-translation/nllb-requirements.txt; \
     else \
         python -m venv /opt/myra-translation/.venv \
         && /opt/myra-translation/.venv/bin/pip install --timeout 120 \
-            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://download.pytorch.org/whl/cu126 \
             --require-hashes --no-cache-dir \
             -r /opt/myra-translation/requirements.txt; \
     fi

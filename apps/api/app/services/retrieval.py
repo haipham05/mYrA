@@ -413,10 +413,14 @@ class BGERerankerProvider(RerankerProvider):
     def _load_model(self):
         if self._model is None:
             try:
+                import torch
                 from sentence_transformers import CrossEncoder
 
                 self._model = CrossEncoder(
-                    self._model_name, revision=self.model_version, local_files_only=True
+                    self._model_name,
+                    revision=self.model_version,
+                    local_files_only=True,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
                 )
             except Exception as err:
                 raise RuntimeError(

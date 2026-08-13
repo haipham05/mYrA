@@ -18,6 +18,14 @@ from app.services.translation.local_nllb import (
 
 
 class FakeIds(list):
+    def __init__(self, values: list[list[int]]) -> None:
+        super().__init__(values)
+        self.device = "cpu"
+
+    def to(self, device: str) -> FakeIds:
+        self.device = device
+        return self
+
     @property
     def shape(self) -> tuple[int, int]:
         return (1, len(self[0]))
@@ -27,6 +35,7 @@ class FakeTokenizer:
     def __init__(self) -> None:
         self.inputs: list[str] = []
         self.generation_inputs: list[str] = []
+        self.last_batch: FakeBatchEncoding | None = None
 
     def convert_tokens_to_ids(self, token: str) -> int:
         assert token == TARGET_LANGUAGE
@@ -48,19 +57,29 @@ class FakeTokenizer:
         # One token per non-whitespace chunk and two special tokens.
         token_count = len(text.split()) + 2
         ids = list(range(token_count))
-        return {"input_ids": FakeIds([ids]) if return_tensors else ids}
+        if return_tensors:
+            self.last_batch = FakeBatchEncoding(input_ids=FakeIds([ids]))
+            return self.last_batch
+        return {"input_ids": ids}
 
     def decode(self, _tokens: Any, *, skip_special_tokens: bool) -> str:
         assert skip_special_tokens is True
         return "đã dịch"
 
 
+class FakeBatchEncoding(dict):
+    def to(self, device: str) -> FakeBatchEncoding:
+        self["input_ids"].to(device)
+        return self
+
+
 class FakeModel:
     def __init__(self) -> None:
         self.generate_calls: list[dict[str, Any]] = []
+        self.device: str | None = None
 
     def to(self, device: str) -> FakeModel:
-        assert device == "cpu"
+        self.device = device
         return self
 
     def eval(self) -> FakeModel:
@@ -73,9 +92,12 @@ class FakeModel:
 
 def _translator(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    cuda_available: bool = False,
 ) -> tuple[LocalNllbTranslator, FakeTokenizer, FakeModel, list[dict[str, Any]]]:
     torch_module = ModuleType("torch")
     torch_module.inference_mode = nullcontext  # type: ignore[attr-defined]
+    torch_module.cuda = type("Cuda", (), {"is_available": lambda _self: cuda_available})()  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "torch", torch_module)
     tokenizer = FakeTokenizer()
     model = FakeModel()
@@ -109,10 +131,22 @@ def test_nllb_loads_lazily_and_preserves_protected_markers(
         "source_language": SOURCE_LANGUAGE,
     }
     assert len(model.generate_calls) == 4
+    assert model.device == "cpu"
+    assert tokenizer.last_batch["input_ids"].device == "cpu"
     assert all(call["do_sample"] is False for call in model.generate_calls)
     assert all(call["num_beams"] == 1 for call in model.generate_calls)
     assert all(call["forced_bos_token_id"] == 7 for call in model.generate_calls)
     assert all(len(text.split()) + 2 <= MAX_INPUT_TOKENS for text in tokenizer.generation_inputs)
+
+
+def test_nllb_moves_model_and_inputs_to_cuda_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    translator, tokenizer, model, _ = _translator(monkeypatch, cuda_available=True)
+
+    assert translator.translate("A short sentence.") == "đã dịch"
+    assert model.device == "cuda"
+    assert tokenizer.last_batch["input_ids"].device == "cuda"
 
 
 def test_nllb_splits_long_text_without_truncation(monkeypatch: pytest.MonkeyPatch) -> None:

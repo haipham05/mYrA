@@ -550,8 +550,12 @@ def test_demo_reranker_normalizes_question_words_and_plural_forms():
     )
 
 
-def test_production_providers_are_explicit_and_pinned(monkeypatch):
+@pytest.mark.parametrize("cuda_available, expected_device", [(False, "cpu"), (True, "cuda")])
+def test_production_providers_are_explicit_and_pinned(
+    monkeypatch, cuda_available: bool, expected_device: str
+):
     import sentence_transformers
+    import torch
 
     selected = []
 
@@ -575,6 +579,7 @@ def test_production_providers_are_explicit_and_pinned(monkeypatch):
 
     monkeypatch.setattr(sentence_transformers, "SentenceTransformer", FakeSentenceTransformer)
     monkeypatch.setattr(sentence_transformers, "CrossEncoder", FakeCrossEncoder)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
     monkeypatch.setenv("MYRA_EMBEDDING_PROVIDER", "bge-m3")
     monkeypatch.setenv("MYRA_RERANKER_PROVIDER", "bge")
     set_embedding_provider(None)
@@ -590,10 +595,12 @@ def test_production_providers_are_explicit_and_pinned(monkeypatch):
         assert selected[0][1] == {
             "revision": embedder.model_version,
             "local_files_only": True,
+            "device": expected_device,
         }
         assert selected[1][1] == {
             "revision": reranker.model_version,
             "local_files_only": True,
+            "device": expected_device,
         }
     finally:
         set_embedding_provider(None)

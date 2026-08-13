@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --require-hashes \
-    --extra-index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://download.pytorch.org/whl/cu126 \
     -r requirements.txt
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
