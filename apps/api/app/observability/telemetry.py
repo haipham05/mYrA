@@ -11,13 +11,10 @@ import base64
 import json
 import logging
 import os
-import re
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
@@ -25,12 +22,6 @@ from app.observability.context import OperationContext, get_operation_context, u
 from app.observability.policy import MAX_OBSERVATION_BYTES, sanitize_observation, sanitize_text
 
 logger = logging.getLogger(__name__)
-_TEXT_METADATA_KEY = re.compile(
-    r"(?:input|output|prompt|answer|question|evidence|document|paper[_-]?text|source[_-]?text|"
-    r"content|citation|quote|excerpt|passage|chunk[_-]?text|raw[_-]?text|context)",
-    re.IGNORECASE,
-)
-_OMIT_METADATA = object()
 
 
 class Observation(Protocol):
@@ -150,60 +141,6 @@ def _encoded_size(value: Mapping[str, Any]) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-def _metadata_without_text(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Retain operational metadata while removing known content-bearing fields."""
-
-    def clean(item: Any) -> Any:
-        if isinstance(item, Mapping):
-            return _metadata_without_text(item)
-        if isinstance(item, list):
-            return [cleaned for entry in item if (cleaned := clean(entry)) is not _OMIT_METADATA]
-        if isinstance(item, str) and len(item) > 256:
-            return _OMIT_METADATA
-        return item
-
-    safe: dict[str, Any] = {}
-    for key, item in value.items():
-        if _TEXT_METADATA_KEY.search(str(key)):
-            continue
-        cleaned = clean(item)
-        if cleaned is not _OMIT_METADATA:
-            safe[str(key)] = cleaned
-    return safe
-
-
-def _retention_state_allows_text(path: Path) -> bool:
-    """Require fresh verified cleanup state for the personal Langfuse project."""
-    try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
-            return False
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return False
-    if (
-        not isinstance(state, dict)
-        or state.get("format_version") != 1
-        or not isinstance(state.get("projects"), dict)
-    ):
-        return False
-
-    now = datetime.now(UTC)
-    project = state["projects"].get("personal")
-    if not isinstance(project, dict) or project.get("last_failure_at") is not None:
-        return False
-    timestamp = project.get("last_success_at")
-    if not isinstance(timestamp, str):
-        return False
-    try:
-        success_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if success_at.tzinfo is None or success_at.utcoffset() is None:
-        return False
-    age = now - success_at.astimezone(UTC)
-    return timedelta(0) <= age <= timedelta(hours=2)
-
-
 class _ObservationPayloadBudget:
     """Count initial and incremental content against one observation limit."""
 
@@ -237,12 +174,10 @@ class _BoundedObservation:
         observation: Observation,
         budget: _ObservationPayloadBudget,
         *,
-        allow_text: bool,
         on_update_failure: Callable[[BaseException], None],
     ) -> None:
         self._observation = observation
         self._budget = budget
-        self._allow_text = allow_text
         self._on_update_failure = on_update_failure
 
     @property
@@ -258,11 +193,6 @@ class _BoundedObservation:
         return getattr(self._observation, "_otel_span", None)
 
     def update(self, **kwargs: Any) -> Any:
-        if not self._allow_text:
-            kwargs = {key: value for key, value in kwargs.items() if key not in {"input", "output"}}
-            metadata = kwargs.get("metadata")
-            if isinstance(metadata, Mapping):
-                kwargs["metadata"] = _metadata_without_text(metadata)
         safe = self._budget.fit(kwargs)
         if safe:
             try:
@@ -376,10 +306,6 @@ class TelemetryAdapter:
         self._client = client
         self._dropped = 0
         self._export_drops = _AtomicDropCount()
-        retention_path = os.getenv("MYRA_RETENTION_STATE_PATH", "").strip()
-        self._retention_state_path = (
-            Path(retention_path).expanduser() if self._config.enabled and retention_path else None
-        )
         if self._client is None and self._config.ready:
             try:
                 if client_factory is _build_client:
@@ -398,10 +324,6 @@ class TelemetryAdapter:
     @property
     def dropped_count(self) -> int:
         return self._dropped + self._export_drops.value
-
-    def _text_export_allowed(self) -> bool:
-        path = self._retention_state_path
-        return path is None or _retention_state_allows_text(path)
 
     def _record_export_failure(self) -> None:
         self._export_drops.increment()
@@ -470,17 +392,14 @@ class TelemetryAdapter:
             return
 
         context = get_operation_context()
-        allow_text = self._text_export_allowed()
         raw_fields: dict[str, Any] = {}
         if metadata is not None:
-            raw_fields["metadata"] = (
-                dict(metadata) if allow_text else _metadata_without_text(metadata)
-            )
+            raw_fields["metadata"] = dict(metadata)
         elif context.correlation_id:
             raw_fields["metadata"] = {}
         if context.correlation_id:
             raw_fields["metadata"]["correlation_id"] = context.correlation_id
-        if input is not None and allow_text:
+        if input is not None:
             raw_fields["input"] = input
         safe_fields = sanitize_observation(raw_fields)
         safe_metadata = safe_fields.get("metadata", {})
@@ -504,7 +423,7 @@ class TelemetryAdapter:
             "metadata": safe_metadata or None,
         }
         safe_input = safe_fields.get("input")
-        if safe_input is not None and allow_text:
+        if safe_input is not None:
             kwargs["input"] = safe_input
         if trace_context:
             kwargs["trace_context"] = trace_context
@@ -538,7 +457,6 @@ class TelemetryAdapter:
                 bounded_observation = _BoundedObservation(
                     observation,
                     _ObservationPayloadBudget(initial_payload),
-                    allow_text=allow_text,
                     on_update_failure=lambda exc: self._drop("observation_update", exc),
                 )
                 with use_operation_context(active_context):
@@ -593,7 +511,6 @@ class TelemetryAdapter:
         if context.trace_id and not context.sampled:
             # Do not turn an explicitly unsampled persisted job into a new trace.
             return
-        allow_text = self._text_export_allowed()
         trace_context: dict[str, str] = {}
         if context.trace_id and context.sampled:
             trace_context = {"trace_id": context.trace_id}
@@ -601,16 +518,14 @@ class TelemetryAdapter:
                 trace_context["parent_span_id"] = context.span_id
         raw_fields: dict[str, Any] = {}
         if metadata is not None:
-            raw_fields["metadata"] = (
-                dict(metadata) if allow_text else _metadata_without_text(metadata)
-            )
+            raw_fields["metadata"] = dict(metadata)
         elif context.correlation_id:
             raw_fields["metadata"] = {}
         if context.correlation_id:
             raw_fields["metadata"]["correlation_id"] = context.correlation_id
-        if input is not None and allow_text:
+        if input is not None:
             raw_fields["input"] = input
-        if output is not None and allow_text:
+        if output is not None:
             raw_fields["output"] = output
         safe_fields = sanitize_observation(raw_fields)
         safe_metadata = safe_fields.get("metadata", {})
@@ -620,8 +535,8 @@ class TelemetryAdapter:
             client.create_event(
                 name=self._safe_name(name),
                 metadata=safe_metadata or None,
-                input=safe_fields.get("input") if allow_text else None,
-                output=safe_fields.get("output") if allow_text else None,
+                input=safe_fields.get("input"),
+                output=safe_fields.get("output"),
                 trace_context=trace_context or None,
             )
         except Exception as exc:

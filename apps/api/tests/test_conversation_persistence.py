@@ -398,6 +398,10 @@ async def test_chat_service_records_selected_text_generation_and_citation_outcom
     )
     operation = next(call for call in telemetry.calls if call[1] == "chat.answer")
     assert operation[2]["input"] == {"question": "Explain attention"}
+    scope = next(call for call in telemetry.calls if call[1] == "scope.resolve")
+    assert scope[2]["input"]["question"] == "Explain attention"
+    assert scope[2]["input"]["scope"] == "project"
+    assert scope[3].updates[0]["output"]["project_wide"] is True
     generation = next(call for call in telemetry.calls if call[1] == "chat.generation")
     assert generation[2]["generation"] is True
     assert "Explain attention" in generation[2]["input"]["user_prompt"]

@@ -5,7 +5,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -105,39 +104,6 @@ def reset_default_telemetry(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def write_retention_state(
-    path,
-    *,
-    failure: str | None = None,
-    stale: str | None = None,
-    personal_failure: bool = False,
-) -> None:
-    personal_success = (
-        (datetime.now(UTC) - (timedelta(hours=3) if stale == "personal" else timedelta(minutes=5)))
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    path.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "projects": {
-                    "personal": {
-                        "last_success_at": personal_success,
-                        "last_failure_at": failure if personal_failure else None,
-                    },
-                    # Legacy synthetic state must be ignored by the new gate.
-                    "synthetic": {
-                        "last_success_at": (datetime.now(UTC) - timedelta(hours=3)).isoformat(),
-                        "last_failure_at": failure,
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
 def test_disabled_adapter_does_not_initialize_client_or_make_network_attempt() -> None:
     attempts = 0
 
@@ -220,95 +186,44 @@ def test_incomplete_configuration_stays_noop() -> None:
     assert adapter.dropped_count == 0
 
 
-def test_retention_gate_is_opt_in_and_fresh_state_allows_text(monkeypatch, tmp_path) -> None:
-    monkeypatch.delenv("MYRA_RETENTION_STATE_PATH", raising=False)
-    client = FakeClient()
-    adapter = TelemetryAdapter(client, config=configured())
-    with adapter.stage("without-gate", input={"question": "allowed"}):
-        pass
-    assert client.calls[0]["input"] == {"question": "allowed"}
-
-    state_path = tmp_path / "retention-state.json"
-    write_retention_state(state_path)
-    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
-    client = FakeClient()
-    adapter = TelemetryAdapter(client, config=configured())
-    with adapter.stage("with-fresh-gate", input={"question": "allowed"}):
-        pass
-    assert client.calls[0]["input"] == {"question": "allowed"}
-
-
-@pytest.mark.parametrize("state_mode", ["missing", "invalid"])
-def test_missing_or_invalid_retention_state_drops_text_but_keeps_metadata(
+@pytest.mark.parametrize("state_mode", ["missing", "invalid", "stale", "failed"])
+def test_cleanup_state_never_suppresses_sanitized_trace_content(
     monkeypatch, tmp_path, state_mode
 ) -> None:
     state_path = tmp_path / "retention-state.json"
-    if state_mode == "invalid":
-        state_path.write_text("not-json", encoding="utf-8")
+    if state_mode != "missing":
+        state_path.write_text(
+            "not-json"
+            if state_mode == "invalid"
+            else json.dumps(
+                {
+                    "format_version": 1,
+                    "projects": {
+                        "personal": {
+                            "last_success_at": "2000-01-01T00:00:00Z",
+                            "last_failure_at": "failure" if state_mode == "failed" else None,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    # A leftover setting from an older deployment must have no effect.
     monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
     client = FakeClient()
     adapter = TelemetryAdapter(client, config=configured())
-
-    with adapter.stage(
-        "paper.answer",
-        input={"question": "private question"},
-        metadata={"outcome": "success", "evidence": "private quote", "attempt": 1},
-        generation=True,
-    ) as span:
+    with adapter.stage("chat.answer", input={"question": "Explain attention"}) as span:
         assert span is not None
-        adapter.generation_metadata(
-            span,
-            model="deepseek-chat",
-            usage={"input": 12, "output": 3},
-            output="private answer",
-        )
+        span.update(output={"answer": "Attention uses weighted values"})
     adapter.event(
         "answer.completed",
-        input={"question": "private question"},
-        output={"answer": "private answer"},
-        metadata={"outcome": "success", "citation_text": "private quote"},
+        input={"question": "Explain attention"},
+        output={"answer": "Attention uses weighted values"},
     )
-
-    assert "input" not in client.calls[0]
-    assert client.calls[0]["metadata"] == {"outcome": "success", "attempt": 1}
-    assert "output" not in client.observation.updates[0]
-    assert client.observation.updates[0]["usage_details"] == {"input": 12, "output": 3}
-    assert client.events[0]["input"] is None
-    assert client.events[0]["output"] is None
-    assert client.events[0]["metadata"] == {"outcome": "success"}
-
-
-@pytest.mark.parametrize("problem", ["personal_failure", "personal_stale"])
-def test_retention_gate_requires_recent_failure_free_personal_project(
-    monkeypatch, tmp_path, problem
-) -> None:
-    state_path = tmp_path / "retention-state.json"
-    if problem == "personal_stale":
-        write_retention_state(state_path, stale="personal")
-    else:
-        write_retention_state(
-            state_path,
-            failure=datetime.now(UTC).isoformat(),
-            personal_failure=True,
-        )
-    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
-    client = FakeClient()
-    adapter = TelemetryAdapter(client, config=configured())
-    with adapter.stage("must-not-send-text", input={"question": "private"}, metadata={"count": 2}):
-        pass
-    assert "input" not in client.calls[0]
-    assert client.calls[0]["metadata"] == {"count": 2}
-
-
-def test_legacy_synthetic_failure_does_not_block_personal_text(monkeypatch, tmp_path) -> None:
-    state_path = tmp_path / "retention-state.json"
-    write_retention_state(state_path, failure="legacy-synthetic-failure")
-    monkeypatch.setenv("MYRA_RETENTION_STATE_PATH", str(state_path))
-    client = FakeClient()
-    adapter = TelemetryAdapter(client, config=configured())
-    with adapter.stage("personal-only-gate", input={"question": "visible"}):
-        pass
-    assert client.calls[0]["input"] == {"question": "visible"}
+    assert client.calls[0]["input"] == {"question": "Explain attention"}
+    assert client.observation.updates[0]["output"] == {"answer": "Attention uses weighted values"}
+    assert client.events[0]["input"] == {"question": "Explain attention"}
+    assert client.events[0]["output"] == {"answer": "Attention uses weighted values"}
 
 
 def test_stage_sanitizes_explicit_payload_and_propagates_valid_context() -> None:

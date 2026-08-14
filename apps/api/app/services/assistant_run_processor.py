@@ -396,7 +396,15 @@ class AssistantRunProcessor:
                         return
                     with self._telemetry.stage(
                         "assistant.tool",
-                        input={"intent": decision.intent.value},
+                        input={
+                            "intent": decision.intent.value,
+                            "question": request.message,
+                            "retrieval_question": decision.standalone_question,
+                            "scope": request.scope,
+                            "selected_paper_ids": [
+                                str(paper_id) for paper_id in decision.resolved_paper_ids
+                            ],
+                        },
                         metadata={"run_id": str(run_id), "outcome": "started"},
                     ) as observation:
                         try:
@@ -469,7 +477,12 @@ class AssistantRunProcessor:
                         )
                         if observation is not None:
                             observation.update(
-                                output={"status": tool_status.value},
+                                output={
+                                    "status": tool_status.value,
+                                    "result_type": tool_result_payload.get("result_type"),
+                                    "answer": tool_result_payload.get("display_text"),
+                                    "citation_count": len(tool_result_payload.get("citations", [])),
+                                },
                                 metadata={"outcome": tool_status.value.lower()},
                             )
 

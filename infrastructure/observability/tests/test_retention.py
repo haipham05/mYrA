@@ -9,7 +9,7 @@ from infrastructure.observability.retention import (
     EPOCH,
     ProjectCredentials,
     cleanup,
-    text_export_permitted,
+    cleanup_healthy,
 )
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -153,20 +153,20 @@ def test_cleanup_deletes_only_traces_with_start_before_fixed_72h_cutoff(
     ).replace("+00:00", "Z")
 
 
-def test_exports_fail_closed_until_personal_project_has_recent_verified_cleanup() -> None:
-    assert not text_export_permitted({"projects": {}}, NOW)
+def test_cleanup_health_requires_recent_verified_personal_cleanup() -> None:
+    assert not cleanup_healthy({"projects": {}}, NOW)
     fresh = {
         "projects": {"personal": {"last_success_at": (NOW - timedelta(minutes=30)).isoformat()}}
     }
-    assert text_export_permitted(fresh, NOW)
+    assert cleanup_healthy(fresh, NOW)
     fresh["projects"]["personal"]["last_success_at"] = (
         NOW - timedelta(hours=2, seconds=1)
     ).isoformat()
-    assert not text_export_permitted(fresh, NOW)
-    # Legacy state for the old synthetic project must not affect personal capture.
+    assert not cleanup_healthy(fresh, NOW)
+    # Legacy state for the old synthetic project must not affect cleanup health.
     fresh["projects"]["personal"]["last_success_at"] = (NOW - timedelta(minutes=30)).isoformat()
     fresh["projects"]["synthetic"] = {"last_failure_at": "legacy", "last_success_at": "bad"}
-    assert text_export_permitted(fresh, NOW)
+    assert cleanup_healthy(fresh, NOW)
 
 
 def test_failed_cleanup_revokes_an_otherwise_fresh_success() -> None:
@@ -178,10 +178,10 @@ def test_failed_cleanup_revokes_an_otherwise_fresh_success() -> None:
             }
         }
     }
-    assert text_export_permitted(state, NOW)
+    assert cleanup_healthy(state, NOW)
 
     state["projects"]["personal"]["last_failure_at"] = (NOW - timedelta(minutes=1)).isoformat()
-    assert not text_export_permitted(state, NOW)
+    assert not cleanup_healthy(state, NOW)
 
 
 def test_api_acceptance_is_not_reported_as_verified_deletion(tmp_path: Path) -> None:

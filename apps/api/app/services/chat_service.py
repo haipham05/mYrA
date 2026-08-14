@@ -858,6 +858,11 @@ class ChatService:
             selected_paper_ids = None
         with telemetry.stage(
             "scope.resolve",
+            input={
+                "question": question,
+                "scope": paper_scope or conv.paper_scope,
+                "selected_paper_ids": [str(paper_id) for paper_id in selected_paper_ids or []],
+            },
             metadata={
                 "scope": effective_scope,
                 "selected_paper_count": len(selected_paper_ids or []),

@@ -7,16 +7,8 @@ services:
         required: true
     environment:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
-      MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
       MYRA_OBSERVABILITY_ENABLED: "true"
       MYRA_CACHE_ENABLED: "true"
-    volumes:
-      - type: bind
-        source: ./.local/observability/retention
-        target: /run/myra-retention
-        read_only: true
-        bind:
-          create_host_path: false
     networks:
       - default
       - myra-cache-internal
@@ -27,16 +19,8 @@ services:
         required: true
     environment:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
-      MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
       MYRA_OBSERVABILITY_ENABLED: "true"
       MYRA_CACHE_ENABLED: "true"
-    volumes:
-      - type: bind
-        source: ./.local/observability/retention
-        target: /run/myra-retention
-        read_only: true
-        bind:
-          create_host_path: false
     networks:
       - default
       - myra-cache-internal
@@ -49,7 +33,10 @@ services:
       LANGFUSE_BASE_URL: http://langfuse-web:3000
     entrypoint: ["/bin/sh", "-ec"]
     command:
-      - while true; do python /app/infrastructure/observability/retention.py --credentials-dir /run/observability --state-dir /run/myra-retention || true; sleep 3600; done
+      - while true; do if python /app/infrastructure/observability/retention.py --credentials-dir /run/observability --state-dir /run/myra-retention; then sleep 3600; else sleep 60; fi; done
+    depends_on:
+      langfuse-web:
+        condition: service_healthy
     volumes:
       - ./infrastructure/observability:/app/infrastructure/observability:ro
       - ./.local/observability:/run/observability:ro

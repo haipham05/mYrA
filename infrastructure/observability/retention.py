@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_DIR = ROOT / ".local" / "observability"
 STATE_NAME = "retention-state.json"
 RETENTION_AGE = timedelta(hours=72)
-EXPORT_GRACE = timedelta(hours=2)
+CLEANUP_HEALTH_WINDOW = timedelta(hours=2)
 HTTP_TIMEOUT_SECONDS = 10
 PAGE_LIMIT = 100
 DELETE_BATCH_SIZE = 500
@@ -230,7 +230,7 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
             temporary.unlink()
 
 
-def text_export_permitted(state: dict[str, Any], now: datetime) -> bool:
+def cleanup_healthy(state: dict[str, Any], now: datetime) -> bool:
     """Return true only when the personal project has a recent verified cleanup."""
     now = _utc(now)
     projects = state.get("projects")
@@ -249,7 +249,7 @@ def text_export_permitted(state: dict[str, Any], now: datetime) -> bool:
         success = _utc(datetime.fromisoformat(raw_success.replace("Z", "+00:00")))
     except (ValueError, TypeError):
         return False
-    return success <= now and now - success <= EXPORT_GRACE
+    return success <= now and now - success <= CLEANUP_HEALTH_WINDOW
 
 
 def _fetch_page(
@@ -539,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
         f"pending={item.get('last_pending_count', 0)} pages={item.get('last_pages', 0)} "
         f"batches={item.get('last_delete_batches', 0)}"
     )
-    print(f"text_export_permitted={text_export_permitted(state, datetime.now(timezone.utc))}")
+    print(f"cleanup_healthy={cleanup_healthy(state, datetime.now(timezone.utc))}")
     return 0 if success else 1
 
 

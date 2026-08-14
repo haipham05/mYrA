@@ -22,7 +22,6 @@ services:
       MYRA_TRANSLATION_TEST_RUN: ${MYRA_TRANSLATION_TEST_RUN:-false}
       MYRA_TRANSLATION_MODEL_PATH: /opt/myra-translation/nllb
       LANGFUSE_BASE_URL: http://langfuse-web:3000
-      MYRA_RETENTION_STATE_PATH: /run/myra-retention/retention-state.json
     depends_on:
       myra-local-postgres:
         condition: service_healthy
@@ -42,12 +41,6 @@ services:
       - type: bind
         source: ./.local/translation/nllb
         target: /opt/myra-translation/nllb
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./.local/observability/retention
-        target: /run/myra-retention
         read_only: true
         bind:
           create_host_path: false
